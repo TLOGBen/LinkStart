@@ -55,6 +55,7 @@ def main():
             help_result = json.loads(cli("help","--json"))
             assert set(["attach","register","launch","monitor","ack","feedback"]).issubset(help_result["operations"])
             assert help_result["operations"]["launch"]["requiredFields"][-1] == "page.htmlPath"
+            assert set(["redeem","events","stream","originSemantics","launchFragment"]).issubset(help_result["appProtocol"])
             smoke = "".join([json.dumps(help_result), cli("status","--json","--state-dir",state), cli("ps","--json","--state-dir",state), cli("doctor","--json","--state-dir",state)])
             assert ccap not in smoke and grant not in smoke
             print("browser_acceptance: PASS")

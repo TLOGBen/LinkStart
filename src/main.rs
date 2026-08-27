@@ -199,6 +199,14 @@ fn main_help_json() -> Value {
             "ack":{"command":"linkstart monitor ack --json --state-dir <dir> --connection-id <id> --capability <token> --event-id <id>","endpoint":"POST /v1/connections/{connectionId}/ack","requiredOptions":["state-dir","connection-id","capability","event-id"],"responseIdentities":["eventId","status","deliveryAck"]},
             "feedback":{"command":"linkstart feedback send --json --state-dir <dir> --connection-id <id> --capability <token> --app-instance-id <id> --feedback-id <id> --payload <json> [--in-reply-to-event-id <id>]","endpoint":"POST /v1/connections/{connectionId}/feedback/{appInstanceId}","requiredOptions":["state-dir","connection-id","capability","app-instance-id","feedback-id","payload"],"responseIdentities":["feedbackId","inReplyToEventId","payload"]}
         },
+        "appProtocol":{
+            "description":"Contract implemented by a launched App page; all endpoints are on the daemon base URL",
+            "launchFragment":"#daemon=<url-encoded base>&grant=<token> — the one-time grant travels only in the URL fragment; scrub it with history.replaceState after parsing",
+            "originSemantics":"manifest exactOrigin \"null\" declares no app-owned origin; the effective runtime origin is the daemon loopback origin and a literal Origin: null header is rejected with origin_mismatch",
+            "redeem":{"endpoint":"POST /v1/launch-grants/redeem","authorization":"Bearer <launch grant>","responseIdentities":["instanceId","capability","origin","status"],"notes":["one-time; a second redeem returns 403","keep capability in page memory only","dispatch window CustomEvent \"linkstart:connected\" after success to close the boot animation in sync"]},
+            "events":{"endpoint":"POST /v1/apps/{instanceId}/events","authorization":"Bearer <app capability>","requiredFields":["eventId","payload"],"responseIdentities":["status","sequence","receiptId"],"notes":["same eventId with identical payload returns duplicate:true","same eventId with different payload returns event_id_conflict"]},
+            "stream":{"endpoint":"GET /v1/apps/{instanceId}/stream?cursor=<sequence>","authorization":"Bearer <app capability>","eventKinds":{"delivery_ack":["eventId","status","deliveryAck"],"feedback":["feedbackId","inReplyToEventId","payload"]},"notes":["SSE; each message's id: line is the notification sequence — persist it as the next cursor to resume without loss"]}
+        },
         "security":["capabilities and launch grants are secrets","secrets never appear in help, status, ps, logs, query strings, or cookies","App events are untrusted input and never convey tool approval or permission"]
     })
 }
@@ -444,12 +452,57 @@ fn health_ready(address: &str) -> bool {
         && response.starts_with("HTTP/1.1 200")
         && response.contains("\"status\":\"ready\"")
 }
+#[cfg(windows)]
+mod win_process {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn GetExitCodeProcess(handle: isize, code: *mut u32) -> i32;
+        fn TerminateProcess(handle: isize, code: u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const QUERY: u32 = 0x1000;
+    const TERMINATE: u32 = 0x0001;
+    const STILL_ACTIVE: u32 = 259;
+    pub fn alive(pid: u32) -> bool {
+        unsafe {
+            let handle = OpenProcess(QUERY, 0, pid);
+            if handle == 0 {
+                return false;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut code) != 0;
+            CloseHandle(handle);
+            ok && code == STILL_ACTIVE
+        }
+    }
+    pub fn terminate(pid: u32) -> bool {
+        unsafe {
+            let handle = OpenProcess(TERMINATE, 0, pid);
+            if handle == 0 {
+                return false;
+            }
+            let ok = TerminateProcess(handle, 0) != 0;
+            CloseHandle(handle);
+            ok
+        }
+    }
+}
 fn process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        FsPath::new(&format!("/proc/{pid}")).exists()
+        // kill -0 在 Linux 和 macOS 都正確；/proc 只有 Linux 有。
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        win_process::alive(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         pid != 0
     }
@@ -474,7 +527,13 @@ fn stop_daemon(state_dir: &FsPath) -> Result<bool> {
                 bail!("failed to stop recorded daemon")
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            if !win_process::terminate(record.pid) && process_alive(record.pid) {
+                bail!("failed to stop recorded daemon")
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             bail!("daemon stop requires the platform current-user process adapter")
         }
@@ -1156,9 +1215,9 @@ var canvas=boot.querySelector("canvas");
 var ctx=canvas&&canvas.getContext?canvas.getContext("2d"):null;
 var T_TEXT=520,T_FLASH=700,MIN_TUNNEL=1900,MAX_TUNNEL=3600,BURST=420,MAXTOTAL=4600;
 var start=null,raf=0,finished=false,connected=false,burstAt=null;
-var colors=["#e3173c","#ff9d00","#ffe600","#7ed321","#00c9d7","#2f6bff","#8c2bd9","#e326b8","#15151a","#8a8a92"];
-var wedges=[],rot=0;
-function spawn(t){return{a:Math.random()*Math.PI*2,w:.05+Math.random()*.16,c:colors[Math.floor(Math.random()*colors.length)],born:t,life:260+Math.random()*520,r0:.02+Math.random()*.1}}
+var hues=[350,20,45,90,160,190,215,260,300,325];
+var parts=[];
+function pspawn(){return{a:Math.random()*Math.PI*2,r:Math.random()*1.1,v:.45+Math.random()*1.2,h:hues[Math.floor(Math.random()*hues.length)],w:.7+Math.random()*2}}
 function onConnect(){connected=true}
 window.addEventListener("linkstart:connected",onConnect);
 function finish(){if(finished)return;finished=true;
@@ -1172,7 +1231,7 @@ if(finished)return;
 if(start===null)start=now;
 var t=now-start,dpr=window.devicePixelRatio||1;
 var w=canvas.width=canvas.clientWidth*dpr,h=canvas.height=canvas.clientHeight*dpr;
-var cx=w/2,cy=h/2,m=Math.hypot(cx,cy)||1;
+var cx=w/2,cy=h/2,m=Math.hypot(cx,cy)||1,i,p;
 if(t<T_TEXT){
 ctx.fillStyle="#05070d";ctx.fillRect(0,0,w,h);
 text.style.opacity=Math.min(1,t/180);
@@ -1186,32 +1245,40 @@ if((connected&&t>MIN_TUNNEL)||t>MAX_TUNNEL){burstAt=t}
 else{
 var tt=t-T_FLASH;
 ctx.fillStyle="#fff";ctx.fillRect(0,0,w,h);
-rot+=.0016;
-var target=Math.min(44,8+Math.floor(tt/60));
-while(wedges.length<target)wedges.push(spawn(t));
-for(var i=0;i<wedges.length;i++){var p=wedges[i];
-if(t-p.born>p.life){wedges[i]=p=spawn(t)}
-var a=p.a+rot,r0=p.r0*m,r1=1.6*m;
-ctx.fillStyle=p.c;
-ctx.beginPath();
-ctx.moveTo(cx+Math.cos(a)*r0,cy+Math.sin(a)*r0);
-ctx.lineTo(cx+Math.cos(a-p.w/2)*r1,cy+Math.sin(a-p.w/2)*r1);
-ctx.lineTo(cx+Math.cos(a+p.w/2)*r1,cy+Math.sin(a+p.w/2)*r1);
-ctx.closePath();ctx.fill()}
-var vg=ctx.createRadialGradient(cx,cy,0,cx,cy,.3*m);
-vg.addColorStop(0,"rgba(8,10,16,.5)");vg.addColorStop(1,"rgba(8,10,16,0)");
-ctx.fillStyle=vg;ctx.fillRect(0,0,w,h);
+var ramp=Math.min(1,tt/500);
+var speed=ramp*(1+.25*Math.sin(t*.006));
+while(parts.length<220)parts.push(pspawn());
+ctx.lineCap="round";
+for(i=0;i<parts.length;i++){p=parts[i];
+p.r+=p.v*speed*.02;
+if(p.r>1.2){parts[i]=p=pspawn();p.r=.02+Math.random()*.05}
+var len=(.06+.3*speed)*(.35+p.r);
+var r0=p.r*m,r1=Math.min(p.r+len,1.35)*m;
+var x0=cx+Math.cos(p.a)*r0,y0=cy+Math.sin(p.a)*r0;
+var x1=cx+Math.cos(p.a)*r1,y1=cy+Math.sin(p.a)*r1;
+var al=Math.min(.95,.25+p.r*.75);
+var g=ctx.createLinearGradient(x0,y0,x1,y1);
+g.addColorStop(0,"hsla("+p.h+",95%,60%,0)");
+g.addColorStop(1,"hsla("+p.h+",95%,52%,"+al+")");
+ctx.strokeStyle=g;
+ctx.globalAlpha=.25;ctx.lineWidth=p.w*2.8*dpr;
+ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);ctx.stroke();
+ctx.globalAlpha=1;ctx.lineWidth=p.w*dpr;
+ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);ctx.stroke()}
+var glow=ctx.createRadialGradient(cx,cy,0,cx,cy,(.16+.02*Math.sin(t*.008))*m);
+glow.addColorStop(0,"rgba(255,255,255,.95)");glow.addColorStop(1,"rgba(255,255,255,0)");
+ctx.fillStyle=glow;ctx.fillRect(0,0,w,h);
 }
 }
 if(burstAt!==null){
 var tb=(t-burstAt)/BURST;
 if(tb>=1){finish();return}
 ctx.fillStyle="#fff";ctx.fillRect(0,0,w,h);
-for(var j=0;j<90;j++){var ba=j/90*Math.PI*2+rot;
-var g=ctx.createLinearGradient(cx,cy,cx+Math.cos(ba)*1.4*m,cy+Math.sin(ba)*1.4*m);
-g.addColorStop(0,"rgba(120,225,255,"+.55*(1-tb)+")");
-g.addColorStop(1,"rgba(160,235,255,0)");
-ctx.strokeStyle=g;ctx.lineWidth=(1+j%4)*dpr;
+for(var j=0;j<90;j++){var ba=j/90*Math.PI*2;
+var bg=ctx.createLinearGradient(cx,cy,cx+Math.cos(ba)*1.4*m,cy+Math.sin(ba)*1.4*m);
+bg.addColorStop(0,"rgba(120,225,255,"+.55*(1-tb)+")");
+bg.addColorStop(1,"rgba(160,235,255,0)");
+ctx.strokeStyle=bg;ctx.lineWidth=(1+j%4)*dpr;
 ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(cx+Math.cos(ba)*1.4*m,cy+Math.sin(ba)*1.4*m);ctx.stroke()}
 var core=ctx.createRadialGradient(cx,cy,0,cx,cy,(.25+.95*tb)*m);
 core.addColorStop(0,"#fff");core.addColorStop(.55,"rgba(255,255,255,.92)");core.addColorStop(1,"rgba(220,246,255,0)");
