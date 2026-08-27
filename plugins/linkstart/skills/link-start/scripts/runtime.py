@@ -29,6 +29,16 @@ TARGET_FILES = {
 }
 
 
+# Windows 主控台/管線預設 cp950，會把 Runtime 的 UTF-8 中文輸出解成亂碼或 UnicodeDecodeError。
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if _reconfigure is not None:
+        try:
+            _reconfigure(encoding="utf-8")
+        except OSError:
+            pass
+
+
 class RuntimeErrorCode(Exception):
     def __init__(self, code: str, detail: str):
         super().__init__(detail)
@@ -139,6 +149,8 @@ def verify(root: Path | None = None) -> dict:
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
         version = json.loads(proc.stdout)
@@ -300,6 +312,8 @@ def run_runtime_json(context: dict, arguments: list[str], *, timeout: int) -> di
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:

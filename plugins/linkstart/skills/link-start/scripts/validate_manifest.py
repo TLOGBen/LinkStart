@@ -7,7 +7,17 @@ import argparse
 import json
 from pathlib import Path
 import re
+import sys
 from urllib.parse import urlparse
+
+# Windows 主控台/管線預設 cp950，會把 UTF-8 中文輸出（displayName、錯誤訊息）解成亂碼。
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if _reconfigure is not None:
+        try:
+            _reconfigure(encoding="utf-8")
+        except OSError:
+            pass
 
 
 FIELDS = {
