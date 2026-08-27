@@ -1,0 +1,251 @@
+name: build-and-release
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  LINKSTART_VERSION: 0.1.0
+  LINKSTART_PROTOCOL_MAJOR: v1
+  RUST_VERSION: 1.88.0
+
+jobs:
+  linux-x64-musl:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install musl target and linker
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal --component rustfmt
+          rustup default "${RUST_VERSION}"
+          rustup target add x86_64-unknown-linux-musl --toolchain "${RUST_VERSION}"
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Test and build static runtime
+        run: |
+          cargo fmt --check
+          python3 -m unittest -v scripts/release/test_release.py
+          cargo test --locked --all-targets
+          cargo build --locked --release --target x86_64-unknown-linux-musl
+          target/x86_64-unknown-linux-musl/release/linkstart version --json > version.json
+      - name: Validate native output and record provenance
+        shell: bash
+        run: |
+          source_tag=""
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then source_tag="${GITHUB_REF_NAME}"; fi
+          python3 scripts/release/release.py bundle \
+            --binary target/x86_64-unknown-linux-musl/release/linkstart \
+            --target linux-x64-musl \
+            --output release-bundle/linux-x64-musl \
+            --version "${LINKSTART_VERSION}" \
+            --protocol-major "${LINKSTART_PROTOCOL_MAJOR}" \
+            --version-json version.json \
+            --source-commit "${GITHUB_SHA}" \
+            --source-tag "${source_tag}" \
+            --source-repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --workflow-run "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            --runner-os "${RUNNER_OS}" \
+            --runner-arch "${RUNNER_ARCH}" \
+            --rustc-version "$(rustc --version)" \
+            --rust-target x86_64-unknown-linux-musl
+          file release-bundle/linux-x64-musl/linkstart
+          if ldd release-bundle/linux-x64-musl/linkstart 2>&1 | grep -q '=>'; then
+            echo 'Linux release binary must be static' >&2
+            exit 1
+          fi
+      - name: Upload Linux bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linkstart-linux-x64-musl
+          path: release-bundle/linux-x64-musl/
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-x64:
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Windows target
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal --component rustfmt
+          rustup default $env:RUST_VERSION
+          rustup target add x86_64-pc-windows-msvc --toolchain $env:RUST_VERSION
+      - name: Compile tests and build native runtime
+        shell: pwsh
+        run: |
+          cargo fmt --check
+          cargo test --locked --all-targets --no-run
+          cargo build --locked --release --target x86_64-pc-windows-msvc
+          & target\x86_64-pc-windows-msvc\release\linkstart.exe version --json | Out-File -Encoding utf8 version.json
+      - name: Validate native output and record provenance
+        shell: pwsh
+        run: |
+          $sourceTag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { '' }
+          $rustcVersion = rustc --version
+          python scripts/release/release.py bundle `
+            --binary target\x86_64-pc-windows-msvc\release\linkstart.exe `
+            --target windows-x64 `
+            --output release-bundle\windows-x64 `
+            --version $env:LINKSTART_VERSION `
+            --protocol-major $env:LINKSTART_PROTOCOL_MAJOR `
+            --version-json version.json `
+            --source-commit $env:GITHUB_SHA `
+            --source-tag $sourceTag `
+            --source-repository "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY" `
+            --workflow-run "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/attempts/$env:GITHUB_RUN_ATTEMPT" `
+            --runner-os $env:RUNNER_OS `
+            --runner-arch $env:RUNNER_ARCH `
+            --rustc-version $rustcVersion `
+            --rust-target x86_64-pc-windows-msvc
+      - name: Upload Windows bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linkstart-windows-x64
+          path: release-bundle/windows-x64/
+          if-no-files-found: error
+          retention-days: 14
+
+  macos-universal:
+    runs-on: macos-14
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install both macOS targets
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal --component rustfmt
+          rustup default "${RUST_VERSION}"
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin --toolchain "${RUST_VERSION}"
+      - name: Compile tests and build universal runtime
+        shell: bash
+        run: |
+          cargo fmt --check
+          cargo test --locked --all-targets --no-run
+          cargo build --locked --release --target x86_64-apple-darwin
+          cargo build --locked --release --target aarch64-apple-darwin
+          mkdir -p target/macos-universal/release
+          lipo -create \
+            target/x86_64-apple-darwin/release/linkstart \
+            target/aarch64-apple-darwin/release/linkstart \
+            -output target/macos-universal/release/linkstart
+          chmod 755 target/macos-universal/release/linkstart
+          lipo -verify_arch x86_64 arm64 target/macos-universal/release/linkstart
+          target/macos-universal/release/linkstart version --json > version.json
+      - name: Validate native output and record provenance
+        shell: bash
+        run: |
+          source_tag=""
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then source_tag="${GITHUB_REF_NAME}"; fi
+          python3 scripts/release/release.py bundle \
+            --binary target/macos-universal/release/linkstart \
+            --target macos-universal \
+            --output release-bundle/macos-universal \
+            --version "${LINKSTART_VERSION}" \
+            --protocol-major "${LINKSTART_PROTOCOL_MAJOR}" \
+            --version-json version.json \
+            --source-commit "${GITHUB_SHA}" \
+            --source-tag "${source_tag}" \
+            --source-repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --workflow-run "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            --runner-os "${RUNNER_OS}" \
+            --runner-arch "${RUNNER_ARCH}" \
+            --rustc-version "$(rustc --version)" \
+            --rust-target x86_64-apple-darwin \
+            --rust-target aarch64-apple-darwin
+      - name: Upload macOS bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linkstart-macos-universal
+          path: release-bundle/macos-universal/
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble:
+    if: github.ref_type == 'tag' && github.ref == 'refs/tags/v0.1.0'
+    needs: [linux-x64-musl, windows-x64, macos-universal]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Download Linux bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linkstart-linux-x64-musl
+          path: incoming/linux-x64-musl
+      - name: Download Windows bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linkstart-windows-x64
+          path: incoming/windows-x64
+      - name: Download macOS bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linkstart-macos-universal
+          path: incoming/macos-universal
+      - name: Assemble and verify exact plugin layout
+        shell: bash
+        run: |
+          source_tag=""
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then source_tag="${GITHUB_REF_NAME}"; fi
+          python3 scripts/release/release.py assemble \
+            --input incoming \
+            --output dist/plugin \
+            --version "${LINKSTART_VERSION}" \
+            --protocol-major "${LINKSTART_PROTOCOL_MAJOR}" \
+            --source-commit "${GITHUB_SHA}" \
+            --source-tag "${source_tag}" \
+            --source-repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --workflow-run "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+          python3 scripts/release/release.py validate \
+            --manifest dist/plugin/assets/checksums.json
+          python3 scripts/release/release.py archive \
+            --root dist/plugin \
+            --output "dist/linkstart-v${LINKSTART_VERSION}-plugin-assets.zip"
+      - name: Upload assembled plugin assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linkstart-plugin-assets
+          path: |
+            dist/plugin/
+            dist/linkstart-v${{ env.LINKSTART_VERSION }}-plugin-assets.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag' && github.ref == 'refs/tags/v0.1.0'
+    needs: [assemble]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Download gated release payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linkstart-plugin-assets
+          path: dist
+      - name: Revalidate and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          test "${GITHUB_REF_NAME}" = "v${LINKSTART_VERSION}"
+          python3 scripts/release/release.py validate \
+            --manifest dist/plugin/assets/checksums.json
+          test -f "dist/linkstart-v${LINKSTART_VERSION}-plugin-assets.zip"
+          gh release create "${GITHUB_REF_NAME}" \
+            "dist/linkstart-v${LINKSTART_VERSION}-plugin-assets.zip" \
+            "dist/plugin/assets/checksums.json" \
+            --verify-tag \
+            --generate-notes \
+            --title "LinkStart ${GITHUB_REF_NAME}"

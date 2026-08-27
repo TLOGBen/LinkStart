@@ -1,0 +1,9 @@
+.strategic-advance/
+target/
+__pycache__/
+*.py[cod]
+release-bundle/
+incoming/
+dist/
+version.json
+scripts/release/__pycache__/
