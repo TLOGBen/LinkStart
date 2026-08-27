@@ -130,7 +130,7 @@ Skill 會先辨識 host，再只讀一份對應 reference：
 | Codex Windows loopback WebSocket | Experimental；不宣稱 production-ready |
 | Standalone Codex TUI hot takeover | 不支援 |
 
-**Status：**build、protocol 與 marketplace 安裝已可機械驗證；真實 Origin Session 往返仍必須依上述 host-specific Preview 路徑各自驗證，不能用 mock 或另一平台結果代替。
+**Status：** build、protocol 與 marketplace 安裝已可機械驗證；真實 Origin Session 往返仍必須依上述 host-specific Preview 路徑各自驗證，不能用 mock 或另一平台結果代替。
 
 ## 安全
 
