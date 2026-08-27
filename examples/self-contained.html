@@ -73,6 +73,7 @@ try {
   history.replaceState(null, "", location.pathname);
   instanceId = connected.instanceId;
   capability = connected.capability;
+  window.dispatchEvent(new CustomEvent("linkstart:connected", {detail: {instanceId}}));
   state.textContent = "App Instance 已連線；capability 僅在頁面記憶體。";
   button.disabled = false;
   stream().catch(error => state.textContent = `串流中斷：${error.message}`);

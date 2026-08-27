@@ -205,6 +205,15 @@ fn main_help_json() -> Value {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(windows)]
+    {
+        // Windows 主控台預設 codepage（如 cp950）會把 UTF-8 中文輸出顯示成亂碼。
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetConsoleOutputCP(code_page: u32) -> i32;
+        }
+        unsafe { SetConsoleOutputCP(65001) };
+    }
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Help(HelpArgs {
         command: None,
@@ -375,7 +384,8 @@ fn start_daemon(a: &StartArgs) -> Result<Value> {
         }
     }
     fs::create_dir_all(&a.state.state_dir)?;
-    let mut child = std::process::Command::new(std::env::current_exe()?)
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
         .args([
             "daemon",
             "run",
@@ -387,8 +397,15 @@ fn start_daemon(a: &StartArgs) -> Result<Value> {
             &a.port.to_string(),
         ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        // 沒有 CREATE_NO_WINDOW 時，console-subsystem 的 daemon run 從無 console 的
+        // parent（DETACHED_PROCESS）被生出來，Windows 會配一個常駐的空白 console 視窗。
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command.spawn()?;
     let address = format!("{}:{}", a.host, a.port);
     for _ in 0..100 {
         if child.try_wait()?.is_some() {
@@ -1118,6 +1135,103 @@ async fn create_grant(
         grant,
     }))
 }
+// LINK START 進場動畫；附加在文件尾端，因為 App html 不保證有 <body> 標籤。
+// pointer-events:none —— 動畫絕不能攔截使用者對 App 的第一個互動。
+// 隧道段等待 App 發出的 `linkstart:connected` 事件才收尾；等不到由 MAX_TUNNEL/MAXTOTAL 保險絲結束。
+const LINK_START_BOOT: &str = r##"
+<style>
+#linkstart-boot{position:fixed;inset:0;z-index:2147483647;pointer-events:none;background:#05070d;overflow:hidden;opacity:1;transition:opacity .35s ease}
+#linkstart-boot.lsboot-done{opacity:0}
+#linkstart-boot canvas{position:absolute;inset:0;width:100%;height:100%}
+#linkstart-boot .lsboot-text{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font:italic 800 clamp(2.4rem,9vw,5.5rem)/1 "Segoe UI",system-ui,sans-serif;letter-spacing:.16em;color:#f2f6ff;text-shadow:0 0 14px rgba(90,200,255,.9),0 0 46px rgba(90,160,255,.5);opacity:0;transform:scale(.85)}
+@media (prefers-reduced-motion: reduce){#linkstart-boot canvas{display:none}}
+</style>
+<div id="linkstart-boot" aria-hidden="true"><canvas></canvas><div class="lsboot-text">LINK START</div></div>
+<script>
+(function(){try{
+var boot=document.getElementById("linkstart-boot");if(!boot)return;
+var reduced=false;try{reduced=window.matchMedia("(prefers-reduced-motion: reduce)").matches}catch(_){}
+var text=boot.querySelector(".lsboot-text");
+var canvas=boot.querySelector("canvas");
+var ctx=canvas&&canvas.getContext?canvas.getContext("2d"):null;
+var T_TEXT=520,T_FLASH=700,MIN_TUNNEL=1900,MAX_TUNNEL=3600,BURST=420,MAXTOTAL=4600;
+var start=null,raf=0,finished=false,connected=false,burstAt=null;
+var colors=["#e3173c","#ff9d00","#ffe600","#7ed321","#00c9d7","#2f6bff","#8c2bd9","#e326b8","#15151a","#8a8a92"];
+var wedges=[],rot=0;
+function spawn(t){return{a:Math.random()*Math.PI*2,w:.05+Math.random()*.16,c:colors[Math.floor(Math.random()*colors.length)],born:t,life:260+Math.random()*520,r0:.02+Math.random()*.1}}
+function onConnect(){connected=true}
+window.addEventListener("linkstart:connected",onConnect);
+function finish(){if(finished)return;finished=true;
+if(raf)cancelAnimationFrame(raf);
+window.removeEventListener("keydown",finish,true);
+window.removeEventListener("linkstart:connected",onConnect);
+boot.classList.add("lsboot-done");
+setTimeout(function(){if(boot.parentNode)boot.parentNode.removeChild(boot)},400)}
+function frame(now){
+if(finished)return;
+if(start===null)start=now;
+var t=now-start,dpr=window.devicePixelRatio||1;
+var w=canvas.width=canvas.clientWidth*dpr,h=canvas.height=canvas.clientHeight*dpr;
+var cx=w/2,cy=h/2,m=Math.hypot(cx,cy)||1;
+if(t<T_TEXT){
+ctx.fillStyle="#05070d";ctx.fillRect(0,0,w,h);
+text.style.opacity=Math.min(1,t/180);
+text.style.transform="scale("+(.85+.15*Math.min(1,t/T_TEXT))+")";
+}else if(t<T_FLASH){
+text.style.opacity=Math.max(0,1-(t-T_TEXT)/120);
+ctx.fillStyle="#fff";ctx.fillRect(0,0,w,h);
+}else if(burstAt===null){
+text.style.opacity=0;
+if((connected&&t>MIN_TUNNEL)||t>MAX_TUNNEL){burstAt=t}
+else{
+var tt=t-T_FLASH;
+ctx.fillStyle="#fff";ctx.fillRect(0,0,w,h);
+rot+=.0016;
+var target=Math.min(44,8+Math.floor(tt/60));
+while(wedges.length<target)wedges.push(spawn(t));
+for(var i=0;i<wedges.length;i++){var p=wedges[i];
+if(t-p.born>p.life){wedges[i]=p=spawn(t)}
+var a=p.a+rot,r0=p.r0*m,r1=1.6*m;
+ctx.fillStyle=p.c;
+ctx.beginPath();
+ctx.moveTo(cx+Math.cos(a)*r0,cy+Math.sin(a)*r0);
+ctx.lineTo(cx+Math.cos(a-p.w/2)*r1,cy+Math.sin(a-p.w/2)*r1);
+ctx.lineTo(cx+Math.cos(a+p.w/2)*r1,cy+Math.sin(a+p.w/2)*r1);
+ctx.closePath();ctx.fill()}
+var vg=ctx.createRadialGradient(cx,cy,0,cx,cy,.3*m);
+vg.addColorStop(0,"rgba(8,10,16,.5)");vg.addColorStop(1,"rgba(8,10,16,0)");
+ctx.fillStyle=vg;ctx.fillRect(0,0,w,h);
+}
+}
+if(burstAt!==null){
+var tb=(t-burstAt)/BURST;
+if(tb>=1){finish();return}
+ctx.fillStyle="#fff";ctx.fillRect(0,0,w,h);
+for(var j=0;j<90;j++){var ba=j/90*Math.PI*2+rot;
+var g=ctx.createLinearGradient(cx,cy,cx+Math.cos(ba)*1.4*m,cy+Math.sin(ba)*1.4*m);
+g.addColorStop(0,"rgba(120,225,255,"+.55*(1-tb)+")");
+g.addColorStop(1,"rgba(160,235,255,0)");
+ctx.strokeStyle=g;ctx.lineWidth=(1+j%4)*dpr;
+ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(cx+Math.cos(ba)*1.4*m,cy+Math.sin(ba)*1.4*m);ctx.stroke()}
+var core=ctx.createRadialGradient(cx,cy,0,cx,cy,(.25+.95*tb)*m);
+core.addColorStop(0,"#fff");core.addColorStop(.55,"rgba(255,255,255,.92)");core.addColorStop(1,"rgba(220,246,255,0)");
+ctx.fillStyle=core;ctx.fillRect(0,0,w,h);
+}
+raf=requestAnimationFrame(frame)}
+window.addEventListener("keydown",finish,true);
+if(reduced||!ctx){text.style.opacity=1;text.style.transform="scale(1)";setTimeout(finish,700)}
+else{raf=requestAnimationFrame(frame)}
+setTimeout(finish,MAXTOTAL)
+}catch(_){}})();
+</script>
+"##;
+fn with_link_start_boot(mut html: String) -> String {
+    if html.contains("data-linkstart-boot=\"off\"") {
+        return html;
+    }
+    html.push_str(LINK_START_BOOT);
+    html
+}
 async fn serve_launch_page(
     State(s): State<AppState>,
     Path(locator): Path<String>,
@@ -1151,7 +1265,7 @@ async fn serve_launch_page(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    Ok((response_headers, html))
+    Ok((response_headers, with_link_start_boot(html)))
 }
 async fn redeem_grant(
     State(s): State<AppState>,

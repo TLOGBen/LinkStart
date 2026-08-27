@@ -102,12 +102,76 @@ fn start(dir: &TempDir, port: u16) -> Child {
     }
     panic!("daemon did not start")
 }
+fn get(url: &str) -> (u16, String) {
+    let output_file = tempfile::NamedTempFile::new().unwrap();
+    let output_path = output_file.path().to_str().unwrap().to_owned();
+    let code = String::from_utf8(
+        Command::new("curl")
+            .args(["-sS", "-o", &output_path, "-w", "%{http_code}", url])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .parse()
+    .unwrap();
+    (
+        code,
+        String::from_utf8(std::fs::read(output_file.path()).unwrap()).unwrap(),
+    )
+}
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port()
+}
+#[test]
+fn launch_page_gets_link_start_boot_unless_opted_out() {
+    let dir = TempDir::new().unwrap();
+    let port = free_port();
+    let mut child = start(&dir, port);
+    let base = format!("http://127.0.0.1:{port}");
+    let (_, con) = post(
+        &(base.clone() + "/v1/connections"),
+        None,
+        None,
+        json!({"protocolMajor":"v1","callsign":"動畫"}),
+    );
+    let cid = con["connectionId"].as_str().unwrap();
+    let cc = con["capability"].as_str().unwrap();
+    let launch = |html: &str| {
+        let page = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(page.path(), html).unwrap();
+        let (code, grant) = post(
+            &(base.clone() + "/v1/launch-grants"),
+            Some(cc),
+            None,
+            json!({"protocolMajor":"v1","connectionId":cid,"manifest":{"appId":"demo","displayName":"Demo","originPolicy":{"exactOrigin":"null"}},"page":{"htmlPath":page.path().to_str().unwrap()}}),
+        );
+        assert_eq!(code, 200);
+        let page_url = grant["launchUrl"]
+            .as_str()
+            .unwrap()
+            .split('#')
+            .next()
+            .unwrap()
+            .to_owned();
+        let (code, body) = get(&page_url);
+        assert_eq!(code, 200);
+        body
+    };
+    let body = launch("<!doctype html><title>App</title><p id=\"app-root\">hello</p>");
+    assert!(body.contains("id=\"app-root\""));
+    assert!(body.contains("id=\"linkstart-boot\""));
+    assert!(body.contains("LINK START"));
+    let opted_out = launch(
+        "<!doctype html><title>App</title><body data-linkstart-boot=\"off\"><p>hello</p></body>",
+    );
+    assert!(!opted_out.contains("id=\"linkstart-boot\""));
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 #[test]
 fn durable_http_round_trip_and_restart() {
