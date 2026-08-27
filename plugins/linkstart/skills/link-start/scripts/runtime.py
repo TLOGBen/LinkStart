@@ -13,12 +13,15 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 from urllib.error import URLError
 from urllib.request import urlopen
 
 
 PROTOCOL_MAJOR = "v1"
-RUNTIME_VERSION = "0.1.1"
+RUNTIME_VERSION = "0.1.2"
+CONTEXT_SCHEMA_VERSION = 1
+DEFAULT_MONITOR_TIMEOUT = 300
 TARGET_FILES = {
     "linux-x64-musl": "linkstart",
     "windows-x64": "linkstart.exe",
@@ -171,6 +174,291 @@ def default_state_dir() -> Path:
     return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "linkstart"
 
 
+def default_context_path() -> Path:
+    override = os.environ.get("LINKSTART_CONTEXT")
+    if override:
+        return Path(override).expanduser()
+    return default_state_dir() / "active-session.json"
+
+
+def write_private_context(path: Path, data: dict) -> None:
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        path.parent.chmod(0o700)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def load_context(path: Path) -> tuple[Path, dict]:
+    path = path.expanduser()
+    if path.is_symlink():
+        raise RuntimeErrorCode("session_context_invalid", f"context cannot be a symlink: {path}")
+    path = path.resolve()
+    if not path.is_file():
+        raise RuntimeErrorCode("session_context_missing", f"missing private context: {path}")
+    if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) != 0o600:
+        raise RuntimeErrorCode("session_context_not_private", f"context mode must be 0600: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorCode("session_context_invalid", str(exc)) from exc
+    required = {
+        "schemaVersion",
+        "runtimeVersion",
+        "protocolMajor",
+        "contextId",
+        "stateDir",
+        "connectionId",
+        "connectionCapability",
+        "pendingEvent",
+    }
+    if set(data) != required:
+        raise RuntimeErrorCode("session_context_invalid", "unexpected context fields")
+    if (
+        data.get("schemaVersion") != CONTEXT_SCHEMA_VERSION
+        or data.get("runtimeVersion") != RUNTIME_VERSION
+        or data.get("protocolMajor") != PROTOCOL_MAJOR
+    ):
+        raise RuntimeErrorCode("context_identity_mismatch", "context Runtime/protocol identity mismatch")
+    for key in ("contextId", "stateDir", "connectionId", "connectionCapability"):
+        if not isinstance(data.get(key), str) or not data[key]:
+            raise RuntimeErrorCode("session_context_invalid", f"invalid {key}")
+    return path, data
+
+
+def context_summary(path: Path, data: dict, *, reused: bool = False) -> dict:
+    pending = data.get("pendingEvent")
+    return {
+        "ok": True,
+        "operation": "context",
+        "contextId": data["contextId"],
+        "contextPath": str(path),
+        "stateDir": data["stateDir"],
+        "connectionId": data["connectionId"],
+        "capability": "redacted",
+        "pendingEventId": pending.get("eventId") if isinstance(pending, dict) else None,
+        "pendingAppInstanceId": pending.get("appInstanceId") if isinstance(pending, dict) else None,
+        "reused": reused,
+    }
+
+
+def create_context(path: Path, state_dir: Path, connection_id: str, capability: str) -> dict:
+    if not connection_id.strip() or len(capability) < 32:
+        raise RuntimeErrorCode("session_context_invalid", "connection identity or capability is invalid")
+    path = path.expanduser()
+    if path.is_symlink():
+        raise RuntimeErrorCode("session_context_invalid", f"context cannot be a symlink: {path}")
+    path = path.resolve()
+    state_dir = state_dir.expanduser().resolve()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        state_dir.chmod(0o700)
+    if path.exists():
+        current_path, current = load_context(path)
+        same_identity = (
+            Path(current["stateDir"]).resolve() == state_dir
+            and current["connectionId"] == connection_id
+            and current["connectionCapability"] == capability
+        )
+        if not same_identity:
+            raise RuntimeErrorCode("context_identity_mismatch", "existing context belongs to another connection")
+        return context_summary(current_path, current, reused=True)
+    data = {
+        "schemaVersion": CONTEXT_SCHEMA_VERSION,
+        "runtimeVersion": RUNTIME_VERSION,
+        "protocolMajor": PROTOCOL_MAJOR,
+        "contextId": str(uuid.uuid4()),
+        "stateDir": str(state_dir),
+        "connectionId": connection_id,
+        "connectionCapability": capability,
+        "pendingEvent": None,
+    }
+    write_private_context(path, data)
+    return context_summary(path, data)
+
+
+def run_runtime_json(context: dict, arguments: list[str], *, timeout: int) -> dict:
+    info = verify()
+    capability = context["connectionCapability"]
+    try:
+        proc = subprocess.run(
+            [info["path"], *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeErrorCode("runtime_operation_failed", str(exc)) from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}")
+        detail = detail.replace(capability, "<redacted>")
+        raise RuntimeErrorCode("runtime_operation_failed", detail[:1000])
+    try:
+        result = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeErrorCode("runtime_operation_failed", "Runtime did not return JSON") from exc
+    serialized = json.dumps(result, ensure_ascii=False)
+    if capability in serialized:
+        raise RuntimeErrorCode("runtime_secret_exposure", "Runtime output contained a capability")
+    return result
+
+
+def wait_for_event(path: Path, context: dict, timeout_seconds: int) -> dict:
+    if context.get("pendingEvent") is not None:
+        raise RuntimeErrorCode("event_pending_response", "respond to the pending Event before re-arming")
+    result = run_runtime_json(
+        context,
+        [
+            "monitor",
+            "wait",
+            "--json",
+            "--state-dir",
+            context["stateDir"],
+            "--connection-id",
+            context["connectionId"],
+            "--capability",
+            context["connectionCapability"],
+            "--timeout-seconds",
+            str(timeout_seconds),
+        ],
+        timeout=timeout_seconds + 10,
+    )
+    if result.get("status") == "timeout":
+        return {
+            "ok": True,
+            "operation": "arm",
+            "contextId": context["contextId"],
+            "status": "timeout",
+            "rearmRequired": True,
+        }
+    required = {"eventId", "appInstanceId", "sequence", "payload", "receiptId", "status"}
+    if not required <= set(result) or result.get("status") != "received":
+        raise RuntimeErrorCode("monitor_event_invalid", "monitor output did not match help --json schema")
+    event = {key: result[key] for key in required}
+    event["untrustedInput"] = True
+    context["pendingEvent"] = event
+    write_private_context(path, context)
+    return {
+        "ok": True,
+        "operation": "arm",
+        "contextId": context["contextId"],
+        "status": "event",
+        **event,
+    }
+
+
+def respond_and_wait(
+    path: Path,
+    context: dict,
+    payload_text: str,
+    event_id: str | None,
+    timeout_seconds: int,
+) -> dict:
+    pending = context.get("pendingEvent")
+    if not isinstance(pending, dict):
+        raise RuntimeErrorCode("event_not_armed", "arm must receive an Event before respond")
+    if event_id is not None and event_id != pending.get("eventId"):
+        raise RuntimeErrorCode("context_identity_mismatch", "event-id does not match the pending Event")
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeErrorCode("feedback_payload_invalid", "--payload must be valid JSON") from exc
+    canonical_payload = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    response_digest = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+    existing_digest = pending.get("responseDigest")
+    if existing_digest is not None and existing_digest != response_digest:
+        raise RuntimeErrorCode("context_identity_mismatch", "pending Event already has another response payload")
+    if existing_digest is None:
+        pending["responseDigest"] = response_digest
+        pending["feedbackId"] = "fb-" + hashlib.sha256(
+            f"{context['contextId']}\0{pending['eventId']}\0{response_digest}".encode("utf-8")
+        ).hexdigest()[:32]
+        pending["acked"] = False
+        pending["feedbackSent"] = False
+        write_private_context(path, context)
+    ack_result: dict | None = None
+    if not pending["acked"]:
+        ack_result = run_runtime_json(
+            context,
+            [
+                "monitor",
+                "ack",
+                "--json",
+                "--state-dir",
+                context["stateDir"],
+                "--connection-id",
+                context["connectionId"],
+                "--capability",
+                context["connectionCapability"],
+                "--event-id",
+                pending["eventId"],
+            ],
+            timeout=20,
+        )
+        pending["acked"] = True
+        write_private_context(path, context)
+    if not pending["feedbackSent"]:
+        feedback_result = run_runtime_json(
+            context,
+            [
+                "feedback",
+                "send",
+                "--json",
+                "--state-dir",
+                context["stateDir"],
+                "--connection-id",
+                context["connectionId"],
+                "--capability",
+                context["connectionCapability"],
+                "--app-instance-id",
+                pending["appInstanceId"],
+                "--feedback-id",
+                pending["feedbackId"],
+                "--payload",
+                canonical_payload,
+                "--in-reply-to-event-id",
+                pending["eventId"],
+            ],
+            timeout=20,
+        )
+        pending["feedbackSent"] = True
+        write_private_context(path, context)
+    else:
+        feedback_result = {
+            "feedbackId": pending["feedbackId"],
+            "inReplyToEventId": pending["eventId"],
+            "status": "already-sent",
+        }
+    completed_event_id = pending["eventId"]
+    context["pendingEvent"] = None
+    write_private_context(path, context)
+    next_result = wait_for_event(path, context, timeout_seconds)
+    return {
+        "ok": True,
+        "operation": "respond",
+        "contextId": context["contextId"],
+        "eventId": completed_event_id,
+        "deliveryAck": ack_result or {"status": "already-acked"},
+        "feedback": feedback_result,
+        "next": next_result,
+    }
+
+
 def health(port: int, expected: dict) -> dict:
     try:
         with urlopen(f"http://127.0.0.1:{port}/v1/health", timeout=1) as response:
@@ -240,6 +528,30 @@ def parser() -> argparse.ArgumentParser:
     c = sub.add_parser("run")
     c.add_argument("--json", action="store_true")
     c.add_argument("args", nargs=argparse.REMAINDER)
+    c = sub.add_parser("context")
+    context_sub = c.add_subparsers(dest="context_command", required=True)
+    create = context_sub.add_parser("create")
+    create.add_argument("--context", type=Path, default=default_context_path())
+    create.add_argument("--state-dir", type=Path, default=default_state_dir())
+    create.add_argument("--connection-id", required=True)
+    create.add_argument("--capability-stdin", action="store_true", required=True)
+    create.add_argument("--json", action="store_true")
+    show = context_sub.add_parser("show")
+    show.add_argument("--context", type=Path, default=default_context_path())
+    show.add_argument("--json", action="store_true")
+    c = sub.add_parser("arm")
+    c.add_argument("--context", type=Path, default=default_context_path())
+    c.add_argument("--timeout-seconds", type=int, default=DEFAULT_MONITOR_TIMEOUT)
+    c.add_argument("--json", action="store_true")
+    c = sub.add_parser("respond")
+    c.add_argument("--context", type=Path, default=default_context_path())
+    c.add_argument("--payload", required=True)
+    c.add_argument("--event-id")
+    c.add_argument("--timeout-seconds", type=int, default=DEFAULT_MONITOR_TIMEOUT)
+    c.add_argument("--json", action="store_true")
+    c = sub.add_parser("close")
+    c.add_argument("--context", type=Path, default=default_context_path())
+    c.add_argument("--json", action="store_true")
     return p
 
 
@@ -253,7 +565,7 @@ def main() -> None:
             payload = verify()
         elif args.command == "start":
             payload = start(args.state_dir or default_state_dir(), args.port)
-        else:
+        elif args.command == "run":
             info = verify()
             command = list(args.args)
             if command[:1] == ["--"]:
@@ -262,6 +574,40 @@ def main() -> None:
                 raise RuntimeErrorCode("runtime_command_missing", "no Runtime command supplied")
             os.execv(info["path"], [info["path"], *command])
             return
+        elif args.command == "context":
+            if args.context_command == "create":
+                if not args.capability_stdin or sys.stdin.isatty():
+                    raise RuntimeErrorCode(
+                        "session_context_invalid", "pipe the connection capability to --capability-stdin"
+                    )
+                capability = sys.stdin.read().strip()
+                payload = create_context(args.context, args.state_dir, args.connection_id, capability)
+            else:
+                path, context = load_context(args.context)
+                payload = context_summary(path, context)
+        elif args.command == "arm":
+            if args.timeout_seconds < 1 or args.timeout_seconds > 3600:
+                raise RuntimeErrorCode("monitor_timeout_invalid", "timeout must be 1..3600 seconds")
+            path, context = load_context(args.context)
+            payload = wait_for_event(path, context, args.timeout_seconds)
+        elif args.command == "respond":
+            if args.timeout_seconds < 1 or args.timeout_seconds > 3600:
+                raise RuntimeErrorCode("monitor_timeout_invalid", "timeout must be 1..3600 seconds")
+            path, context = load_context(args.context)
+            payload = respond_and_wait(
+                path, context, args.payload, args.event_id, args.timeout_seconds
+            )
+        else:
+            path, context = load_context(args.context)
+            path.unlink()
+            payload = {
+                "ok": True,
+                "operation": "close",
+                "contextId": context["contextId"],
+                "connectionId": context["connectionId"],
+                "credentialDeleted": True,
+                "connectionRevoked": False,
+            }
         emit(payload, args.json)
     except RuntimeErrorCode as exc:
         emit({"ok": False, "error": exc.code, "detail": exc.detail}, getattr(args, "json", False), 2)

@@ -8,7 +8,7 @@
       "name": "linkstart",
       "source": {
         "source": "local",
-        "path": "./codex/plugins/linkstart"
+        "path": "./plugins/linkstart"
       },
       "policy": {
         "installation": "AVAILABLE",
