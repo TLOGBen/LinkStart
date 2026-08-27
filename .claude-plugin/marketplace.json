@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "LinkStart local Runtime and same-Origin-Session HTML interaction plugin for Claude Code.",
-    "version": "0.2.2"
+    "version": "0.2.3"
   },
   "plugins": [
     {
@@ -14,7 +14,7 @@
       "source": "./plugins/linkstart",
       "description": "LinkStart v1 Preview: connect an interactive HTML or localhost app back to the same Claude Code session through the bundled Runtime, private session context, and one-call arm/respond monitor flow.",
       "displayName": "LinkStart",
-      "version": "0.2.2",
+      "version": "0.2.3",
       "defaultEnabled": false
     }
   ]
