@@ -1,7 +1,7 @@
 {
   "name": "linkstart",
   "displayName": "LinkStart",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "LinkStart v1 Preview integration: one link-start workflow reconnects an interactive HTML or localhost app to the same Claude Code session or Codex thread that produced it, using the exact bundled Runtime, private session context, and one-call arm/respond monitor flow. Opt-in.",
   "author": {
     "name": "ben.tsai",

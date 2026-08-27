@@ -46,6 +46,8 @@ codex plugin add linkstart@linkstart
 
 Repo 使用單一 shared package：`plugins/linkstart/` 同時含 `.claude-plugin/plugin.json`、`.codex-plugin/plugin.json` 與一份 `skills/link-start/**`；沒有重複的 Codex skill/assets tree。
 
+目前 marketplace plugin version 是 `0.2.2`，內嵌 Runtime `0.1.3`。
+
 ## Quick start
 
 1. 準備 App Manifest v1 與 HTML／localhost App。
