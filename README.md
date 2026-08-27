@@ -125,7 +125,7 @@ Release validator 測試：
 python3 -m unittest -v scripts/release/test_release.py
 ```
 
-`.github/workflows/release.yml` 在 pull request 與手動觸發時建立並上傳三個 target bundle。只有工作流程執行於精確的 `v0.1.0` tag 時，才會再產生以下符合 Integration Plugin consumer contract 的組裝產物：
+`.github/workflows/release.yml` 在 pull request 與手動觸發時建立並上傳三個 target bundle。只有工作流程執行於 `v*` tag，且 tag 與 Cargo 版本完全相符時，才會再產生以下符合 Integration Plugin consumer contract 的組裝產物：
 
 ```text
 assets/
@@ -140,9 +140,9 @@ assets/
 
 ## 發布與安裝
 
-推送與 `Cargo.toml` 完全一致的 tag（本版為 `v0.1.0`）後，Actions 才會進入 release job。它會在三個原生 build job 與 assembly validation 全通過後建立 GitHub Release，發布：
+推送與 `Cargo.toml` 完全一致的 tag（本版為 `v0.1.1`）後，Actions 才會進入 release job。它會在三個原生 build job 與 assembly validation 全通過後建立 GitHub Release；pull request 與 `workflow_dispatch` 即使選到 tag 也不會發布。Release assets 包含：
 
-- `linkstart-v0.1.0-plugin-assets.zip`：保留上述 Integration Plugin 注入路徑。
+- `linkstart-v0.1.1-plugin-assets.zip`：保留上述 Integration Plugin 注入路徑。
 - `checksums.json`：以 exact-key schema 記錄 Runtime semver、protocol major、release tag，以及每個 target 的相對路徑、大小、SHA-256、source repository/commit/tag 與 workflow run provenance。
 
 Tag/version 不符、target 缺漏或重複、Linux 非 static、macOS 非 universal、Windows 非 x64 PE、`version --json` 不符，或任何 checksum 不符時，release 會拒絕發布。

@@ -256,7 +256,7 @@ def bundle(args: argparse.Namespace) -> None:
         "rustTargets": rust_targets,
     }
     write_json(output / "provenance.json", provenance)
-    print(json.dumps(provenance, ensure_ascii=False, sort_keys=True))
+    print(json.dumps(provenance, ensure_ascii=True, sort_keys=True))
 
 
 def validate_bundle(path: Path, target: str, args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
@@ -362,7 +362,7 @@ def assemble(args: argparse.Namespace) -> None:
     }
     write_json(assets / "checksums.json", manifest)
     validate_manifest_file(assets / "checksums.json", output)
-    print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
+    print(json.dumps(manifest, ensure_ascii=True, sort_keys=True))
 
 
 def validate_manifest_file(manifest_path: Path, root: Path) -> None:

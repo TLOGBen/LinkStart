@@ -90,7 +90,14 @@ class ReleaseAssemblyTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.version_json = self.root / "version.json"
         self.version_json.write_text(
-            json.dumps({"version": "0.1.0", "protocolMajor": "v1"}), encoding="utf-8"
+            json.dumps(
+                {
+                    "version": "0.1.1",
+                    "protocolMajor": "v1",
+                    "channel": "LinkStart v1 Preview：Stable core",
+                }
+            ),
+            encoding="utf-8",
         )
 
     def tearDown(self) -> None:
@@ -111,11 +118,11 @@ class ReleaseAssemblyTest(unittest.TestCase):
                     binary=str(binary),
                     target=target,
                     output=str(incoming / target),
-                    version="0.1.0",
+                    version="0.1.1",
                     protocol_major="v1",
                     version_json=str(self.version_json),
                     source_commit=COMMIT,
-                    source_tag="v0.1.0",
+                    source_tag="v0.1.1",
                     source_repository=release.SOURCE_REPOSITORY,
                     workflow_run=WORKFLOW_RUN,
                     runner_os=runner_os,
@@ -130,10 +137,10 @@ class ReleaseAssemblyTest(unittest.TestCase):
         return Namespace(
             input=str(incoming),
             output=str(output),
-            version="0.1.0",
+            version="0.1.1",
             protocol_major="v1",
             source_commit=COMMIT,
-            source_tag="v0.1.0",
+            source_tag="v0.1.1",
             source_repository=release.SOURCE_REPOSITORY,
             workflow_run=WORKFLOW_RUN,
         )
@@ -181,7 +188,7 @@ class ReleaseAssemblyTest(unittest.TestCase):
 
     def test_tag_version_mismatch_is_rejected(self) -> None:
         with self.assertRaises(release.ReleaseError):
-            release.validate_version("0.1.0", "v1", "v0.2.0")
+            release.validate_version("0.1.1", "v1", "v0.2.0")
 
     def test_publication_is_push_exact_tag_only(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -190,7 +197,7 @@ class ReleaseAssemblyTest(unittest.TestCase):
         self.assertEqual(
             match.group(1),
             "github.event_name == 'push' && github.ref_type == 'tag' && "
-            "github.ref == 'refs/tags/v0.1.0'",
+            "startsWith(github.ref, 'refs/tags/v')",
         )
         self.assertNotIn("gh release create", workflow[: match.start()])
 
@@ -211,7 +218,7 @@ class ReleaseAssemblyTest(unittest.TestCase):
             json.dumps({"version": "0.2.0", "protocolMajor": "v1"}), encoding="utf-8"
         )
         with self.assertRaises(release.ReleaseError):
-            release.validate_version_json(self.version_json, "0.1.0", "v1")
+            release.validate_version_json(self.version_json, "0.1.1", "v1")
 
     def test_missing_target_is_rejected(self) -> None:
         incoming = self.create_bundles()
