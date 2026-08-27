@@ -23,8 +23,8 @@ COMMIT = "0123456789abcdef0123456789abcdef01234567"
 WORKFLOW_RUN = "https://github.com/TLOGBen/LinkStart/actions/runs/123/attempts/1"
 
 
-def assert_common_dev_consumer_contract(manifest: dict) -> None:
-    """Import-equivalent exact-key contract from common-dev runtime.py."""
+def assert_plugin_consumer_contract(manifest: dict) -> None:
+    """Import-equivalent exact-key contract from the bundled plugin Runtime helper."""
     assert set(manifest) == {
         "schemaVersion",
         "runtimeVersion",
@@ -150,7 +150,7 @@ class ReleaseAssemblyTest(unittest.TestCase):
         output = self.root / "assembled"
         release.assemble(self.assemble_args(incoming, output))
         manifest = json.loads((output / "assets" / "checksums.json").read_text(encoding="utf-8"))
-        assert_common_dev_consumer_contract(manifest)
+        assert_plugin_consumer_contract(manifest)
         self.assertEqual(
             [record["target"] for record in manifest["artifacts"]], sorted(release.TARGETS)
         )
@@ -160,7 +160,7 @@ class ReleaseAssemblyTest(unittest.TestCase):
         release.archive(Namespace(root=str(output), output=str(second)))
         self.assertEqual(release.digest(first), release.digest(second))
 
-    def test_common_dev_consumer_rejects_extra_keys(self) -> None:
+    def test_plugin_consumer_rejects_extra_keys(self) -> None:
         incoming = self.create_bundles()
         output = self.root / "assembled"
         release.assemble(self.assemble_args(incoming, output))
@@ -168,19 +168,19 @@ class ReleaseAssemblyTest(unittest.TestCase):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["extra"] = True
         with self.assertRaises(AssertionError):
-            assert_common_dev_consumer_contract(manifest)
+            assert_plugin_consumer_contract(manifest)
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         with self.assertRaises(release.ReleaseError):
             release.validate_manifest_file(manifest_path, output)
 
-    def test_common_dev_consumer_rejects_extra_artifact_keys(self) -> None:
+    def test_plugin_consumer_rejects_extra_artifact_keys(self) -> None:
         incoming = self.create_bundles()
         output = self.root / "assembled"
         release.assemble(self.assemble_args(incoming, output))
         manifest = json.loads((output / "assets" / "checksums.json").read_text(encoding="utf-8"))
         manifest["artifacts"][0]["extra"] = True
         with self.assertRaises(AssertionError):
-            assert_common_dev_consumer_contract(manifest)
+            assert_plugin_consumer_contract(manifest)
         manifest_path = output / "assets" / "checksums.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         with self.assertRaises(release.ReleaseError):

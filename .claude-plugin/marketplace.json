@@ -1,0 +1,21 @@
+{
+  "name": "linkstart",
+  "owner": {
+    "name": "ben.tsai",
+    "email": "vakarve@csie.io"
+  },
+  "metadata": {
+    "description": "LinkStart local Runtime and same-Origin-Session HTML interaction plugin for Claude Code.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "linkstart",
+      "source": "./plugins/linkstart",
+      "description": "LinkStart v1 Preview: connect an interactive HTML or localhost app back to the same Claude Code session that produced it through the bundled Runtime and host adapter.",
+      "displayName": "LinkStart",
+      "version": "0.2.0",
+      "defaultEnabled": false
+    }
+  ]
+}

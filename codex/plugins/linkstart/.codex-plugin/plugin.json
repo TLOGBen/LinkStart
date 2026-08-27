@@ -1,14 +1,20 @@
 {
   "name": "linkstart",
-  "displayName": "LinkStart",
   "version": "0.2.0",
   "description": "LinkStart v1 Preview integration: one link-start workflow reconnects an interactive HTML or localhost app to the same Claude Code session or Codex thread that produced it, using the exact bundled Runtime and a host-specific preview adapter. Opt-in.",
-  "author": {
-    "name": "ben.tsai",
-    "email": "vakarve@csie.io"
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Linkstart",
+    "shortDescription": "LinkStart v1 Preview integration: one link-start workflow reconnects an interactive HTML or localhost app to the same Cl"
   },
+  "homepage": "https://github.com/TLOGBen/LinkStart",
   "repository": "https://github.com/TLOGBen/LinkStart",
   "license": "MIT",
+  "author": {
+    "name": "ben.tsai",
+    "email": "vakarve@csie.io",
+    "url": "https://github.com/TLOGBen"
+  },
   "keywords": [
     "linkstart",
     "html",
@@ -16,6 +22,5 @@
     "claude-code",
     "codex",
     "agent-session"
-  ],
-  "defaultEnabled": false
+  ]
 }

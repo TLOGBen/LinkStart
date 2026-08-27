@@ -1,65 +1,93 @@
 # LinkStart
 
-LinkStart 是一個只監聽 loopback 的本機訊息 Runtime。它讓 agent 產出的 HTML／本機 app 可以把使用者互動送回**原本那個** Claude Code 或 Codex 工作階段，再由該工作階段把回饋送回頁面；過程不需要另外執行 `claude -p` 或 `codex -p` 建立新 session。
+LinkStart 是 loopback-only 的本機 Runtime 與 Integration Plugin，讓 agent 產出的互動 HTML／localhost App 在原 turn 結束後，仍能把事件送回**產出它的同一條** Claude Code session 或 Codex thread，並在同一個 App 收到 Agent Feedback。它不使用 `claude -p`、`codex -p`、SDK subprocess 或替代 session。
 
-目前版本是 **LinkStart v1 Preview**：Rust Runtime 與持久化協定是 stable core；Claude／Codex Origin Session adapter 仍是 Preview。平台 adapter 的安裝與 session orchestration 屬 `linkstart` Integration Plugin 層，不在 Rust core 裡。
+目前產品標示為 **LinkStart v1 Preview：Stable core + Preview platform adapters**。Runtime／protocol 使用 Rust 與 SQLite durable journal；Claude／Codex Origin Session adapters 仍是 Preview。
 
-## 它怎麼運作
+## 安裝 Integration Plugin
+
+### Claude Code
 
 ```text
-HTML / local app
-  │  HTTP JSON：送出互動，先取得 durable Event Receipt
-  │  SSE：接收 agent feedback
-  ▼
-LinkStart daemon（127.0.0.1、每位 OS 使用者一個、SQLite）
-  │
-  ├─ Agent Connection：Origin Session 的 adapter 監看事件並 Delivery Ack
-  └─ App Instance：每次註冊都有獨立 capability 與 exact-origin policy
-        │
-        ▼
-原本的 Claude Code / Codex session
+/plugin marketplace add https://github.com/TLOGBen/LinkStart.git
+/plugin install linkstart@linkstart
+/plugin enable linkstart@linkstart
 ```
 
-頁面事件採 receipt-first：Runtime durable 寫入後回傳 `received`，adapter 真正接走後才變成 `delivered`。同一個 `eventId` 搭配相同 payload 是冪等重送；相同 ID 搭配不同 payload 會衝突。這不宣稱模型處理的 exactly-once，也不把「訊息已投遞」冒充「模型已完成回覆」。
+呼叫：
 
-## Preview 支援邊界
+```text
+/linkstart:link-start <manifest.json>
+```
 
-- **Claude Code**：目標路徑是雙向 Channel（Research Preview）。plugin monitor + MCP reply tool 是實驗性相容路徑。
-- **Codex**：Origin thread 必須從一開始由同一個 LinkStart-owned app-server 擁有；active turn 使用 steer，idle thread 使用 turn start，TUI 以 remote 模式接入。Unix app-server adapter 是 Experimental Preview；Windows WebSocket 路徑仍屬實驗性，不宣稱 production-ready。
-- LinkStart 不會熱接管一個已經獨立啟動、未由 LinkStart 擁有的 Codex TUI session。
-- 未知 adapter 版本或 protocol major 一律 fail closed，不做猜測式相容。
+### Codex
 
-## CLI
+```console
+codex plugin marketplace add https://github.com/TLOGBen/LinkStart.git
+codex plugin add linkstart@linkstart
+```
 
-人類可讀說明：
+呼叫：`$link-start <manifest.json>`。
+
+## Runtime 與單一 Skill
+
+```text
+HTML / localhost App
+  │  HTTP JSON：送出 App Event，取得 durable Event Receipt
+  │  fetch-authenticated SSE：接收 Delivery Ack 與 Agent Feedback
+  ▼
+LinkStart daemon（127.0.0.1、每位 OS 使用者一個、SQLite/WAL）
+  │
+  ▼
+同一條 Claude Code Origin Session / Codex Origin thread
+```
+
+Plugin 只公開一個 `link-start` skill。它在內部依序執行 Runtime 驗證與 daemon discovery、Origin attach/rebind、App register/launch、monitor wait/ack/feedback。模型先判斷目前 host，再只讀一份對應 reference：
+
+- Claude Code：`references/claude-code.md`，Channel 是 canonical Research Preview；Monitor 是通過 live self-test 後的 compatibility path，採 background arm → wake → ack/feedback → turn 結束前 re-arm。
+- Codex：`references/codex.md`，要求 LinkStart-owned app-server 與同一 Origin thread；採 bounded foreground wait，active turn 用 steer、idle thread 用 turn start，事件或 timeout 後 re-arm。
+
+Standalone Codex TUI 不支援 hot takeover。未知 adapter/runtime/protocol、Origin offline 或 same-session 證據不足都 fail closed。
+
+Event Receipt 只證明 Runtime 已 durable 收件；Delivery Ack 只證明 adapter 已接受；Agent Feedback 是回到 App 的獨立訊息。三者都不代表模型完成處理。
+
+## 標準 Marketplace 佈局
+
+```text
+LinkStart/
+├── .claude-plugin/marketplace.json       # Claude marketplace: linkstart
+├── .agents/plugins/marketplace.json      # Codex Layout A（GitHub 安裝入口）
+├── plugins/linkstart/                     # Claude canonical plugin
+│   ├── .claude-plugin/plugin.json
+│   └── skills/link-start/
+│       ├── SKILL.md
+│       ├── references/{claude-code,codex}.md
+│       ├── scripts/
+│       └── assets/                        # exact v0.1.1 Runtime artifacts
+└── codex/
+    ├── .agents/plugins/marketplace.json  # Codex Layout B
+    └── plugins/linkstart/                 # generated Codex package
+```
+
+`plugins/linkstart` 是 Claude source；`codex/plugins/linkstart` 只由 `codex-skill-transfer` 生成，不手改。
+
+## Runtime CLI
 
 ```console
 linkstart --help
-linkstart help
-linkstart help daemon
-```
-
-機器可讀說明與身分：
-
-```console
 linkstart help --json
 linkstart version --json
-```
-
-Runtime 操作與診斷：
-
-```console
-linkstart daemon start --json
-linkstart daemon stop --json
-linkstart daemon restart --json
 linkstart status --json
 linkstart ps --json
 linkstart doctor --json
+linkstart daemon start --json
+linkstart daemon stop --json
+linkstart daemon restart --json
 linkstart connections list --json
 linkstart apps list --json
 ```
 
-Adapter 會使用以下低階命令；一般使用者應優先透過 Integration Plugin 的單一 `link-start` skill：
+Adapter 使用的低階命令：
 
 ```console
 linkstart monitor wait --connection-id <id> --capability <token> --json
@@ -69,88 +97,61 @@ linkstart feedback send --connection-id <id> --capability <token> \
   --payload '{"message":"已收到"}' --json
 ```
 
-Capability 是秘密。不要把它放進 query string、cookie、CLI log、畫面截圖或版本控制；`help/status/ps` 也不會輸出 capability。
+一般使用者應透過 `link-start` workflow；不要手工複製 capability 當成正式操作方式。
 
-## 最小 PoC 流程
+## HTML PoC
 
-1. Integration Plugin 的 `link-start` 內部 Runtime phase 啟動或重用 daemon，並把**當前 Origin Session** 連成一個 Agent Connection。
-2. 同一 workflow 的 App phase 以 manifest 註冊 HTML app，取得只屬於該 App Instance 的 launch grant／capability。
-3. HTML 載入 `web/linkstart.js`（或使用 `examples/self-contained.html` 的同等邏輯），以 `fetch + Authorization: Bearer …` 送出互動。
-4. Host-specific adapter 在同一 Origin Session 收到事件、交付給 agent，並送出 Delivery Ack。
-5. Agent feedback durable 寫回 Runtime，頁面透過 SSE 收到並更新 UI。
+Repo 內提供 [`examples/self-contained.html`](examples/self-contained.html) 與 vanilla [`web/linkstart.js`](web/linkstart.js)。最短流程：
 
-直接啟動 Runtime 做協定層測試：
+1. 安裝 plugin，在產出頁面的 Origin Session 呼叫 `link-start` 並提供 App Manifest v1。
+2. Skill 驗證並啟動／重用 bundled Runtime，attach 當前 Origin Session，註冊 App Instance，再開啟 HTML。
+3. 頁面以 `fetch + Authorization` 提交互動並取得 Event Receipt。
+4. 同一 Origin Session 接受事件後送 Delivery Ack，再把 Feedback 寫回 Runtime。
+5. 頁面透過 authenticated SSE 收到 Feedback 並更新 DOM。
 
-```console
-cargo run -- daemon start --json --state-dir /tmp/linkstart-poc
-cargo run -- status --json --state-dir /tmp/linkstart-poc
+App Manifest 只描述 `protocolMajor`、App identity/version、entry、exact Origin policy、requested capabilities 與 structured inputs；不包含 bearer、`connectionId`、tool approval 或 permission relay。
+
+## v0.1.1 Release Assets
+
+[GitHub Release v0.1.1](https://github.com/TLOGBen/LinkStart/releases/tag/v0.1.1) 由原生 Windows、Linux、macOS jobs 建置並組裝：
+
+```text
+skills/link-start/assets/
+├── checksums.json
+└── bin/
+    ├── linux-x64-musl/linkstart
+    ├── windows-x64/linkstart.exe
+    └── macos-universal/linkstart
 ```
 
-完整 Origin Session PoC 應由 Integration Plugin 建立連線與 app registration；不要手工複製 capability 當成正式操作方式。
+Skill 依**執行環境**選 target，並在執行前驗 Runtime `0.1.1`、protocol `v1`、source tag/commit/workflow provenance、SHA-256、size 與 Unix executable mode。它不首次下載、不從 `PATH` 猜測，也不拿本機重編 binary 頂替。
 
-## 本機安全模型
+## 安全邊界
 
-「只跑 localhost」不等於瀏覽器沒有來源邊界。若頁面由 daemon 同源供應，確實不需要 CORS；但 LinkStart 也支援 self-contained HTML 與其他 localhost dev server，它們對 `127.0.0.1` Runtime 仍是 cross-origin request。因此 Runtime 使用的是窄化的瀏覽器閘門，而不是公網式開放 CORS：
-
-- 只 bind `127.0.0.1`，不對 LAN 或 Internet 監聽。
-- App Instance 使用 256-bit bearer capability；`connectionId` 只是 locator，不是授權。
-- 逐次比對 `Host` 與 manifest 的 exact `Origin`，只對吻合來源回傳 CORS／Private Network Access headers。
-- JSON 與 SSE 都走 `fetch` 並帶 `Authorization`；不把秘密塞進 URL，也不使用無法帶 header 的原生 `EventSource`。
-- 頁面輸入只是資料，不能替 agent 核准權限、擴大 scope 或繞過既有 approval gate。
-- 狀態目錄應維持 OS 使用者私有權限；daemon discovery 與資料庫不應進版控。
+- Daemon 只 bind `127.0.0.1`；不服務 LAN 或 Internet。
+- App Instance 使用 256-bit bearer capability；`connectionId` 與 Callsign 都不是 authentication secret。
+- Runtime 驗 exact `Host`／`Origin`，JSON 與 SSE 都用 `fetch + Authorization`；secret 不放 query string、cookie、log、畫面或版控。
+- App input 永遠是不可信資料。即使內容是「同意」，也不能批准工具、擴大 permission/scope 或繞過 sandbox/approval gate。
+- 同 `eventId`＋同 payload 是冪等重送；同 ID＋不同 payload 回 conflict。每個 App Instance 同時只投遞一個 in-flight Event。
 
 ## MOP 與 MOE
 
-請分開看兩層證據：
+- **MOP**：Rust tests、三平台原生 build、static Linux musl、macOS universal、Windows x64、release manifest、SHA-256、plugin transfer/parity 與 marketplace install 都通過。
+- **MOE**：真實 HTML Event 在 turn 結束後進入原本 Origin Session，session/thread identity 不變，且真實 Feedback 回到同一 App Instance。
 
-- **MOP（工作有完成）**：Rust tests 通過、三平台 binary 在原生 runner 建置、`version --json` 正確、Linux 是 static musl、macOS 同時含 x86_64/arm64、release manifest 與 SHA-256 驗證通過。
-- **MOE（目標真的達成）**：真實 HTML 互動進入原本 Claude/Codex Origin Session，該 session 實際收到內容並把 feedback 回到同一頁面。
+CI、mock、`curl` roundtrip、build success 或 health response 只能證明 MOP／protocol behavior，不能替代真 Claude/Codex Origin Session MOE。
 
-CI、mock、`curl` round trip 與假的 app-server 都只能證明 MOP 或協定層效果，不能替代真實 Claude/Codex Origin Session MOE。
-
-## 建置與測試
-
-本機原生建置：
+## 建置與驗證
 
 ```console
 cargo fmt --check
 cargo check --locked
 cargo test --locked --all-targets
-cargo build --locked --release
-```
-
-Release validator 測試：
-
-```console
 python3 -m unittest -v scripts/release/test_release.py
 ```
 
-`.github/workflows/release.yml` 在 pull request 與手動觸發時建立並上傳三個 target bundle。只有工作流程執行於 `v*` tag，且 tag 與 Cargo 版本完全相符時，才會再產生以下符合 Integration Plugin consumer contract 的組裝產物：
+推送與 Cargo version 完全一致的 `v*` tag 才會進入 release job；任何 target、version、format、provenance 或 checksum gate 失敗都不發布。
 
-```text
-assets/
-├── bin/
-│   ├── linux-x64-musl/linkstart
-│   ├── windows-x64/linkstart.exe
-│   └── macos-universal/linkstart
-└── checksums.json
-```
-
-本機 assembly 必須取得三個真實 build bundle；`scripts/release/release.py` 缺任何 target 都會失敗，絕不製造假的跨平台 binary。
-
-## 發布與安裝
-
-推送與 `Cargo.toml` 完全一致的 tag（本版為 `v0.1.1`）後，Actions 才會進入 release job。它會在三個原生 build job 與 assembly validation 全通過後建立 GitHub Release；pull request 與 `workflow_dispatch` 即使選到 tag 也不會發布。Release assets 包含：
-
-- `linkstart-v0.1.1-plugin-assets.zip`：保留上述 Integration Plugin 注入路徑。
-- `checksums.json`：以 exact-key schema 記錄 Runtime semver、protocol major、release tag，以及每個 target 的相對路徑、大小、SHA-256、source repository/commit/tag 與 workflow run provenance。
-
-Tag/version 不符、target 缺漏或重複、Linux 非 static、macOS 非 universal、Windows 非 x64 PE、`version --json` 不符，或任何 checksum 不符時，release 會拒絕發布。
-
-終端使用者建議從 `common-dev` marketplace 安裝 `linkstart` Integration Plugin；它會挑選目前平台的 binary，先核對 `checksums.json`、版本與 protocol，再直接執行。從 GitHub Release 手動安裝時，也應先驗證 manifest，不要只下載裸 binary。
-
-本 repo 的 [`integrations/common-dev/`](integrations/common-dev/) 是同步發布鏡像；marketplace canonical source 仍在 sibling `common-dev-plugin`。更新方向固定為 common-dev Claude source → generated Codex package → 本 repo mirror，並以 `python3 integrations/common-dev/check-parity.py` 驗證 byte/mode parity。
-
-## 授權
+## License
 
 [MIT](LICENSE)

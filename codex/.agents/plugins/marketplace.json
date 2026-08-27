@@ -1,0 +1,20 @@
+{
+  "name": "linkstart",
+  "interface": {
+    "displayName": "LinkStart"
+  },
+  "plugins": [
+    {
+      "name": "linkstart",
+      "source": {
+        "source": "local",
+        "path": "./plugins/linkstart"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
