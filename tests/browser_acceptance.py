@@ -30,27 +30,34 @@ def main():
             else: raise AssertionError("daemon did not start")
             connection = call(base + "/v1/connections", {"protocolMajor":"v1", "callsign":"browser"}, {"Content-Type":"application/json"})
             cid, ccap = connection["connectionId"], connection["capability"]
-            grant = call(base + "/v1/launch-grants", {"protocolMajor":"v1", "connectionId":cid, "manifest":{"appId":"self-contained","displayName":"Browser PoC","originPolicy":{"exactOrigin":"null"}}}, {"Content-Type":"application/json", "Authorization":"Bearer " + ccap})["grant"]
-            page_url = (ROOT / "examples" / "self-contained.html").as_uri() + "#" + urllib.parse.urlencode({"daemon":base,"grant":grant})
+            launched = call(base + "/v1/launch-grants", {"protocolMajor":"v1", "connectionId":cid, "manifest":{"appId":"self-contained","displayName":"Browser PoC","originPolicy":{"exactOrigin":"null"}}, "page":{"htmlPath":str(ROOT / "examples" / "self-contained.html")}}, {"Content-Type":"application/json", "Authorization":"Bearer " + ccap})
+            grant, page_url = launched["grant"], launched["launchUrl"]
+            assert page_url.startswith(base + "/v1/launch-pages/") and "#" in page_url
+            assert "grant=" in urllib.parse.urlsplit(page_url).fragment
             with sync_playwright() as play:
                 browser = play.chromium.launch(headless=True)
                 page = browser.new_page()
+                page.add_init_script("window.__linkstartInitialHash = location.hash")
                 errors=[]; page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None); page.goto(page_url); page.wait_for_selector("#send:not([disabled])")
+                assert "grant=" in page.evaluate("window.__linkstartInitialHash")
                 assert "grant=" not in page.url
-                try: call(base + "/v1/launch-grants/redeem", None, {"Authorization":"Bearer " + grant, "Origin":"null"}); raise AssertionError("launch grant redeemed twice")
+                try: call(base + "/v1/launch-grants/redeem", None, {"Authorization":"Bearer " + grant, "Origin":base}); raise AssertionError("launch grant redeemed twice")
                 except urllib.error.HTTPError as error: assert error.code == 403
-                page.click("#send"); page.wait_for_function("document.querySelector('#events').innerText.includes('receipt: received')")
+                page.click("#send"); page.wait_for_function("document.querySelector('#receipt').innerText === 'received'")
                 monitor = json.loads(cli("monitor","wait","--json","--state-dir",state,"--connection-id",cid,"--capability",ccap,"--timeout-seconds","2"))
                 assert monitor["status"] == "received" and monitor["payload"]["message"] == "使用者互動"
                 cli("monitor","ack","--json","--state-dir",state,"--connection-id",cid,"--capability",ccap,"--event-id",monitor["eventId"])
                 page.evaluate("window.linkstartPoC.disconnect()")
                 cli("feedback","send","--json","--state-dir",state,"--connection-id",cid,"--capability",ccap,"--app-instance-id",monitor["appInstanceId"],"--feedback-id","browser-feedback","--in-reply-to-event-id",monitor["eventId"],"--payload",json.dumps({"message":"replayed feedback"}))
                 page.evaluate("() => { window.linkstartPoC.reconnect(); return true; }")
-                page.wait_for_function("document.querySelector('#events').innerText.includes('feedback: replayed feedback')")
-                assert "delivery_ack: delivered" in page.locator("#events").inner_text()
+                page.wait_for_function("document.querySelector('#feedback').innerText === 'replayed feedback'")
+                assert page.locator("#delivery-ack").inner_text() == "delivered"
                 assert not errors, errors
                 browser.close()
-            smoke = "".join([cli("help","--json"), cli("status","--json","--state-dir",state), cli("ps","--json","--state-dir",state), cli("doctor","--json","--state-dir",state)])
+            help_result = json.loads(cli("help","--json"))
+            assert set(["attach","register","launch","monitor","ack","feedback"]).issubset(help_result["operations"])
+            assert help_result["operations"]["launch"]["requiredFields"][-1] == "page.htmlPath"
+            smoke = "".join([json.dumps(help_result), cli("status","--json","--state-dir",state), cli("ps","--json","--state-dir",state), cli("doctor","--json","--state-dir",state)])
             assert ccap not in smoke and grant not in smoke
             print("browser_acceptance: PASS")
         finally:

@@ -1,3 +1,95 @@
-<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><title>LinkStart self-contained PoC</title><style>body{font:16px system-ui;margin:2rem}#state{padding:.7rem;background:#eef4ef}</style><h1>LinkStart self-contained PoC</h1><p id="state">正在兌換一次性 launch grant…</p><button id="send" disabled>送出互動事件</button><ul id="events"></ul><script type="module">
-const f=new URLSearchParams(location.hash.slice(1)),base=f.get("daemon"),grant=f.get("grant"),state=document.querySelector("#state"),button=document.querySelector("#send"),list=document.querySelector("#events");let instanceId,capability,cursor=0,abort;const add=t=>{const e=document.createElement("li");e.textContent=t;list.append(e)};const call=async(path,body,h={})=>{const r=await fetch(base+path,{method:"POST",headers:{...h,...(body?{"Content-Type":"application/json"}:{})},...(body?{body:JSON.stringify(body)}:{})});const x=await r.json();if(!r.ok||x.error)throw new Error(x.error||r.statusText);return x};async function stream(){abort?.abort();abort=new AbortController();const r=await fetch(`${base}/v1/apps/${instanceId}/stream?cursor=${cursor}`,{headers:{Authorization:`Bearer ${capability}`},signal:abort.signal});if(!r.ok)throw new Error("stream_auth_failed");const rd=r.body.pipeThrough(new TextDecoderStream()).getReader();let b="";for(;;){const {done,value}=await rd.read();if(done)return;b+=value;let i;while((i=b.indexOf("\n\n"))>=0){const raw=b.slice(0,i);b=b.slice(i+2),cursor=Number((raw.match(/^id: (.+)$/m)||[])[1]||cursor);const k=(raw.match(/^event: (.+)$/m)||[])[1],d=(raw.match(/^data: (.+)$/m)||[])[1];if(k&&d){const x=JSON.parse(d);add(`${k}: ${x.payload?.message||x.status||"received"}`)}}}}try{if(!base||!grant)throw new Error("缺少 fragment launch grant");const x=await call("/v1/launch-grants/redeem",null,{Authorization:`Bearer ${grant}`});history.replaceState(null,"",location.pathname);instanceId=x.instanceId;capability=x.capability;state.textContent="App Instance 已連線；capability 僅在頁面記憶體。";button.disabled=false;stream().catch(e=>add(`stream: ${e.message}`))}catch(e){state.textContent=`連線失敗：${e.message}`}button.onclick=async()=>{const x=await call(`/v1/apps/${instanceId}/events`,{eventId:`evt-${crypto.randomUUID()}`,payload:{message:"使用者互動"}},{Authorization:`Bearer ${capability}`});add(`receipt: ${x.status}`)};window.linkstartPoC={disconnect:()=>abort?.abort(),reconnect:stream,state:()=>({instanceId,cursor})};
-</script></html>
+<!doctype html>
+<html lang="zh-Hant">
+<meta charset="utf-8">
+<title>LinkStart self-contained PoC</title>
+<style>
+  body { font: 16px system-ui; margin: 2rem; }
+  #state { padding: .7rem; background: #eef4ef; }
+  .protocol { display: grid; grid-template-columns: repeat(3, minmax(10rem, 1fr)); gap: .6rem; margin: 1rem 0; }
+  .protocol section { border: 1px solid #ccd5cc; border-radius: .4rem; padding: .6rem; }
+  .protocol h2 { font-size: .8rem; text-transform: uppercase; margin: 0 0 .35rem; color: #526052; }
+</style>
+<h1>LinkStart self-contained PoC</h1>
+<p id="state">正在兌換一次性 launch grant…</p>
+<button id="send" disabled>送出互動事件</button>
+<div class="protocol">
+  <section><h2>Event Receipt</h2><div id="receipt">尚未收件</div></section>
+  <section><h2>Delivery Ack</h2><div id="delivery-ack">尚未接受</div></section>
+  <section><h2>Agent Feedback</h2><div id="feedback">尚未回饋</div></section>
+</div>
+<script type="module">
+const fragment = new URLSearchParams(location.hash.slice(1));
+const base = fragment.get("daemon");
+const grant = fragment.get("grant");
+const state = document.querySelector("#state");
+const button = document.querySelector("#send");
+const views = {
+  receipt: document.querySelector("#receipt"),
+  delivery_ack: document.querySelector("#delivery-ack"),
+  feedback: document.querySelector("#feedback")
+};
+let instanceId, capability, cursor = 0, abort;
+const show = (kind, text) => { if (views[kind]) views[kind].textContent = text; };
+const call = async (path, body, extraHeaders = {}) => {
+  const response = await fetch(base + path, {
+    method: "POST",
+    headers: {...extraHeaders, ...(body ? {"Content-Type": "application/json"} : {})},
+    ...(body ? {body: JSON.stringify(body)} : {})
+  });
+  const result = await response.json();
+  if (!response.ok || result.error) throw new Error(result.error || response.statusText);
+  return result;
+};
+async function stream() {
+  abort?.abort();
+  abort = new AbortController();
+  const response = await fetch(`${base}/v1/apps/${instanceId}/stream?cursor=${cursor}`, {
+    headers: {Authorization: `Bearer ${capability}`}, signal: abort.signal
+  });
+  if (!response.ok) throw new Error("stream_auth_failed");
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  for (;;) {
+    const {done, value} = await reader.read();
+    if (done) return;
+    buffer += value;
+    let boundary;
+    while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+      const raw = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      cursor = Number((raw.match(/^id: (.+)$/m) || [])[1] || cursor);
+      const kind = (raw.match(/^event: (.+)$/m) || [])[1];
+      const data = (raw.match(/^data: (.+)$/m) || [])[1];
+      if (kind && data) {
+        const message = JSON.parse(data);
+        show(kind, message.payload?.message || message.status || "received");
+      }
+    }
+  }
+}
+try {
+  if (!base || !grant) throw new Error("缺少 fragment launch grant");
+  const connected = await call("/v1/launch-grants/redeem", null, {Authorization: `Bearer ${grant}`});
+  history.replaceState(null, "", location.pathname);
+  instanceId = connected.instanceId;
+  capability = connected.capability;
+  state.textContent = "App Instance 已連線；capability 僅在頁面記憶體。";
+  button.disabled = false;
+  stream().catch(error => state.textContent = `串流中斷：${error.message}`);
+} catch (error) {
+  state.textContent = `連線失敗：${error.message}`;
+}
+button.onclick = async () => {
+  const result = await call(`/v1/apps/${instanceId}/events`, {
+    eventId: `evt-${crypto.randomUUID()}`,
+    payload: {message: "使用者互動"}
+  }, {Authorization: `Bearer ${capability}`});
+  show("receipt", result.status);
+};
+window.linkstartPoC = {
+  disconnect: () => abort?.abort(),
+  reconnect: stream,
+  state: () => ({instanceId, cursor})
+};
+</script>
+</html>

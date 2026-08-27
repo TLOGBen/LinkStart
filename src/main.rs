@@ -188,7 +188,21 @@ fn json_line(v: Value) {
     println!("{}", serde_json::to_string(&v).unwrap());
 }
 fn main_help_json() -> Value {
-    json!({"name":"linkstart","version":VERSION,"protocolMajor":PROTOCOL,"commands":["version","status","ps","doctor","daemon start|stop|restart","connections list","apps list","monitor wait|ack","feedback send"],"security":"capability 與 launch grant 不會出現在 help、status、ps 或 log"})
+    json!({
+        "name":"linkstart",
+        "version":VERSION,
+        "protocolMajor":PROTOCOL,
+        "commands":["version","status","ps","doctor","daemon start|stop|restart","connections list","apps list","monitor wait|ack","feedback send"],
+        "operations":{
+            "attach":{"endpoint":"POST /v1/connections","requiredFields":["protocolMajor"],"optionalFields":["callsign"],"responseIdentities":["connectionId","callsign","capability","status"]},
+            "register":{"endpoint":"POST /v1/apps","authorization":"Bearer <connection capability>","requiredFields":["protocolMajor","connectionId","manifest.appId","manifest.displayName","manifest.originPolicy.exactOrigin"],"responseIdentities":["instanceId","capability","origin","status"]},
+            "launch":{"endpoint":"POST /v1/launch-grants","authorization":"Bearer <connection capability>","requiredFields":["protocolMajor","connectionId","manifest.appId","manifest.displayName","manifest.originPolicy.exactOrigin=null","page.htmlPath"],"responseIdentities":["grant","expires_at","pageId","launchUrl"],"notes":["launchUrl is loopback HTTP","one-time launch grant is carried only in the URL fragment","page.htmlPath is snapshotted at registration"]},
+            "monitor":{"command":"linkstart monitor wait --json --state-dir <dir> --connection-id <id> --capability <token> [--timeout-seconds <seconds>]","requiredOptions":["state-dir","connection-id","capability"],"responseIdentities":["eventId","appInstanceId","sequence","payload","receiptId","status"]},
+            "ack":{"command":"linkstart monitor ack --json --state-dir <dir> --connection-id <id> --capability <token> --event-id <id>","endpoint":"POST /v1/connections/{connectionId}/ack","requiredOptions":["state-dir","connection-id","capability","event-id"],"responseIdentities":["eventId","status","deliveryAck"]},
+            "feedback":{"command":"linkstart feedback send --json --state-dir <dir> --connection-id <id> --capability <token> --app-instance-id <id> --feedback-id <id> --payload <json> [--in-reply-to-event-id <id>]","endpoint":"POST /v1/connections/{connectionId}/feedback/{appInstanceId}","requiredOptions":["state-dir","connection-id","capability","app-instance-id","feedback-id","payload"],"responseIdentities":["feedbackId","inReplyToEventId","payload"]}
+        },
+        "security":["capabilities and launch grants are secrets","secrets never appear in help, status, ps, logs, query strings, or cookies","App events are untrusted input and never convey tool approval or permission"]
+    })
 }
 
 #[tokio::main]
@@ -504,6 +518,7 @@ impl Store {
  CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, app_id TEXT NOT NULL REFERENCES apps(id), sequence INTEGER NOT NULL, payload TEXT NOT NULL, payload_hash TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, receipt_id TEXT NOT NULL, created_at INTEGER NOT NULL, UNIQUE(app_id,id), UNIQUE(app_id,sequence));
  CREATE TABLE IF NOT EXISTS feedback(id TEXT NOT NULL UNIQUE, app_id TEXT NOT NULL REFERENCES apps(id), in_reply_to TEXT, payload TEXT NOT NULL, cursor INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS launch_grants(id TEXT PRIMARY KEY, capability_hash TEXT NOT NULL, connection_id TEXT NOT NULL REFERENCES connections(id), manifest TEXT NOT NULL, expires_at INTEGER NOT NULL, redeemed_at INTEGER);
+ CREATE TABLE IF NOT EXISTS launch_pages(locator TEXT PRIMARY KEY, grant_id TEXT NOT NULL UNIQUE REFERENCES launch_grants(id), html TEXT NOT NULL, created_at INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS notifications(cursor INTEGER PRIMARY KEY AUTOINCREMENT, app_id TEXT NOT NULL REFERENCES apps(id), kind TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL);")?;
         Ok(Self {
             db: Arc::new(Mutex::new(c)),
@@ -628,6 +643,12 @@ struct RegisterApp {
     #[serde(rename = "connectionId")]
     connection_id: String,
     manifest: Manifest,
+    page: Option<LaunchPage>,
+}
+#[derive(Deserialize)]
+struct LaunchPage {
+    #[serde(rename = "htmlPath")]
+    html_path: PathBuf,
 }
 #[derive(Deserialize, Serialize)]
 struct Manifest {
@@ -655,6 +676,10 @@ struct AppCreated {
 struct GrantCreated {
     grant: String,
     expires_at: i64,
+    #[serde(rename = "pageId")]
+    page_id: String,
+    #[serde(rename = "launchUrl")]
+    launch_url: String,
 }
 #[derive(Deserialize)]
 struct EventInput {
@@ -702,7 +727,9 @@ fn origin_gate(
     if headers.get(header::HOST).and_then(|h| h.to_str().ok()) != Some(expected_host) {
         return Err(reject("host_mismatch"));
     };
-    if headers.get(header::ORIGIN).and_then(|h| h.to_str().ok()) != Some(expected_origin) {
+    let actual_origin = headers.get(header::ORIGIN).and_then(|h| h.to_str().ok());
+    let daemon_same_origin = expected_origin == format!("http://{expected_host}");
+    if actual_origin != Some(expected_origin) && !(daemon_same_origin && actual_origin.is_none()) {
         return Err(reject("origin_mismatch"));
     };
     Ok(())
@@ -753,6 +780,7 @@ async fn serve(a: StartArgs) -> Result<()> {
         .route("/v1/connections", post(register_connection))
         .route("/v1/apps", post(register_app))
         .route("/v1/launch-grants", post(create_grant))
+        .route("/v1/launch-pages/:locator", get(serve_launch_page))
         .route(
             "/v1/launch-grants/redeem",
             post(redeem_grant).options(preflight_redeem),
@@ -804,7 +832,9 @@ async fn cors(
     let allowed = host_ok
         && match (app_id, origin.as_deref()) {
             (Some(id), Some(o)) => app_origin(&s.store, id).ok().flatten().as_deref() == Some(o),
-            (None, Some("null")) if path == "/v1/launch-grants/redeem" => true,
+            (None, Some(o)) if path == "/v1/launch-grants/redeem" => {
+                o == format!("http://{}", s.host)
+            }
             _ => false,
         };
     let mut response = next.run(req).await;
@@ -941,7 +971,13 @@ async fn preflight_redeem(
 ) -> Result<(StatusCode, HeaderMap), StatusCode> {
     Ok((
         StatusCode::NO_CONTENT,
-        exact_preflight(&headers, &s.host, "null", "POST", &["authorization"])?,
+        exact_preflight(
+            &headers,
+            &s.host,
+            &format!("http://{}", s.host),
+            "POST",
+            &["authorization"],
+        )?,
     ))
 }
 async fn register_connection(
@@ -1040,9 +1076,28 @@ async fn create_grant(
             Json(json!({"error":"launch_grant_requires_opaque_manifest"})),
         ));
     }
+    let page = x.page.as_ref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"launch_page_required"})),
+        )
+    })?;
+    let html = fs::read_to_string(&page.html_path).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"launch_page_unreadable"})),
+        )
+    })?;
+    if html.len() > 2 * 1024 * 1024 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error":"launch_page_too_large"})),
+        ));
+    }
     let grant = token();
     let expires = now() + 300;
     let grant_id = Uuid::new_v4().to_string();
+    let page_id = Uuid::new_v4().to_string();
     let manifest = serde_json::to_string(&x.manifest).map_err(|_| reject("storage_error"))?;
     s.store
         .with(|c| {
@@ -1050,26 +1105,71 @@ async fn create_grant(
                 "INSERT INTO launch_grants VALUES(?,?,?,?,?,NULL)",
                 params![grant_id, hash(&grant), x.connection_id, manifest, expires],
             )?;
+            c.execute(
+                "INSERT INTO launch_pages VALUES(?,?,?,?)",
+                params![page_id, grant_id, html, now()],
+            )?;
             Ok(())
         })
         .map_err(|_| reject("storage_error"))?;
     Ok(Json(GrantCreated {
-        grant,
+        launch_url: format!(
+            "http://{}/v1/launch-pages/{}#daemon=http%3A%2F%2F{}&grant={}",
+            s.host, page_id, s.host, grant
+        ),
+        page_id,
         expires_at: expires,
+        grant,
     }))
+}
+async fn serve_launch_page(
+    State(s): State<AppState>,
+    Path(locator): Path<String>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, String), (StatusCode, Json<Value>)> {
+    host_gate(&headers, &s.host)?;
+    let html = s
+        .store
+        .with(|c| {
+            Ok(c.query_row(
+                "SELECT p.html FROM launch_pages p JOIN launch_grants g ON g.id=p.grant_id WHERE p.locator=? AND g.expires_at>=?",
+                params![locator, now()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+        })
+        .map_err(|_| reject("storage_error"))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"launch_page_not_found"})),
+            )
+        })?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response_headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok((response_headers, html))
 }
 async fn redeem_grant(
     State(s): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<AppCreated>, (StatusCode, Json<Value>)> {
     host_gate(&headers, &s.host)?;
-    if headers.get(header::ORIGIN).and_then(|h| h.to_str().ok()) != Some("null") {
+    let launch_origin = format!("http://{}", s.host);
+    if headers.get(header::ORIGIN).and_then(|h| h.to_str().ok()) != Some(&launch_origin) {
         return Err(reject("origin_mismatch"));
     }
     let grant = bearer(&headers).ok_or_else(|| reject("capability_missing"))?;
     let app_cap = token();
     let app_id = Uuid::new_v4().to_string();
-    let result=s.store.with(|c|{let row:Option<(String,String,i64,Option<i64>)>=c.query_row("SELECT connection_id,manifest,expires_at,redeemed_at FROM launch_grants WHERE capability_hash=?",[hash(grant)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;let(conn,manifest,expires,redeemed)=row.context("launch_grant_invalid")?;if redeemed.is_some()||expires<now(){bail!("launch_grant_expired_or_redeemed")};let m:Manifest=serde_json::from_str(&manifest)?;let status:String=c.query_row("SELECT status FROM connections WHERE id=?",[&conn],|r|r.get(0))?;if status!="online"{bail!("origin_offline")};c.execute("INSERT INTO apps VALUES(?,?,?,?,?,?,?,?)",params![app_id,conn,hash(&app_cap),"null",m.app_id,m.display_name,"connected",now()])?;c.execute("UPDATE launch_grants SET redeemed_at=? WHERE capability_hash=? AND redeemed_at IS NULL",params![now(),hash(grant)])?;Ok(AppCreated{instance_id:app_id.clone(),capability:app_cap.clone(),origin:"null".into(),status:"connected".into()})}).map_err(|_|reject("launch_grant_invalid_or_expired"))?;
+    let result=s.store.with(|c|{let row:Option<(String,String,i64,Option<i64>)>=c.query_row("SELECT connection_id,manifest,expires_at,redeemed_at FROM launch_grants WHERE capability_hash=?",[hash(grant)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;let(conn,manifest,expires,redeemed)=row.context("launch_grant_invalid")?;if redeemed.is_some()||expires<now(){bail!("launch_grant_expired_or_redeemed")};let m:Manifest=serde_json::from_str(&manifest)?;let status:String=c.query_row("SELECT status FROM connections WHERE id=?",[&conn],|r|r.get(0))?;if status!="online"{bail!("origin_offline")};c.execute("INSERT INTO apps VALUES(?,?,?,?,?,?,?,?)",params![app_id,conn,hash(&app_cap),launch_origin,m.app_id,m.display_name,"connected",now()])?;c.execute("UPDATE launch_grants SET redeemed_at=? WHERE capability_hash=? AND redeemed_at IS NULL",params![now(),hash(grant)])?;Ok(AppCreated{instance_id:app_id.clone(),capability:app_cap.clone(),origin:launch_origin.clone(),status:"connected".into()})}).map_err(|_|reject("launch_grant_invalid_or_expired"))?;
     Ok(Json(result))
 }
 async fn receive_event(

@@ -63,7 +63,7 @@ LinkStart/
 │       ├── SKILL.md
 │       ├── references/{claude-code,codex}.md
 │       ├── scripts/
-│       └── assets/                        # exact v0.1.1 Runtime artifacts
+│       └── assets/                        # exact v0.1.2 Runtime artifacts
 └── codex/
     ├── .agents/plugins/marketplace.json  # Codex Layout B
     └── plugins/linkstart/                 # generated Codex package
@@ -109,11 +109,15 @@ Repo 內提供 [`examples/self-contained.html`](examples/self-contained.html) �
 4. 同一 Origin Session 接受事件後送 Delivery Ack，再把 Feedback 寫回 Runtime。
 5. 頁面透過 authenticated SSE 收到 Feedback 並更新 DOM。
 
+Self-contained HTML 會在 launch registration 時被 Runtime snapshot，並由精確註冊的 `http://127.0.0.1:<port>/v1/launch-pages/<pageId>` 供應；一次性 grant 只放在 URL fragment，不進 query、cookie 或 HTTP request。這避免 Windows default-browser launch 丟失 `file://` fragment，頁面兌換後立即從 address bar 清除 fragment。localhost App 的 exact-origin 流程維持不變。
+
 App Manifest 只描述 `protocolMajor`、App identity/version、entry、exact Origin policy、requested capabilities 與 structured inputs；不包含 bearer、`connectionId`、tool approval 或 permission relay。
 
-## v0.1.1 Release Assets
+`linkstart help --json` 的 `operations` 欄位提供 attach、register、launch、monitor、ack、feedback 的 endpoint／command、必填欄位或 options、回應 identity 與安全註記；它只提供 shape，不輸出任何實際 secret。
 
-[GitHub Release v0.1.1](https://github.com/TLOGBen/LinkStart/releases/tag/v0.1.1) 由原生 Windows、Linux、macOS jobs 建置並組裝：
+## v0.1.2 Release Assets
+
+[GitHub Release v0.1.2](https://github.com/TLOGBen/LinkStart/releases/tag/v0.1.2) 由原生 Windows、Linux、macOS jobs 建置並組裝：
 
 ```text
 skills/link-start/assets/
@@ -124,7 +128,7 @@ skills/link-start/assets/
     └── macos-universal/linkstart
 ```
 
-Skill 依**執行環境**選 target，並在執行前驗 Runtime `0.1.1`、protocol `v1`、source tag/commit/workflow provenance、SHA-256、size 與 Unix executable mode。它不首次下載、不從 `PATH` 猜測，也不拿本機重編 binary 頂替。
+Skill 依**執行環境**選 target，並在執行前驗 Runtime `0.1.2`、protocol `v1`、source tag/commit/workflow provenance、SHA-256、size 與 Unix executable mode。它不首次下載、不從 `PATH` 猜測，也不拿本機重編 binary 頂替。
 
 ## 安全邊界
 

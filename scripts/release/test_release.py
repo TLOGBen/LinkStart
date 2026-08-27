@@ -92,7 +92,7 @@ class ReleaseAssemblyTest(unittest.TestCase):
         self.version_json.write_text(
             json.dumps(
                 {
-                    "version": "0.1.1",
+                    "version": "0.1.2",
                     "protocolMajor": "v1",
                     "channel": "LinkStart v1 Preview：Stable core",
                 }
@@ -118,11 +118,11 @@ class ReleaseAssemblyTest(unittest.TestCase):
                     binary=str(binary),
                     target=target,
                     output=str(incoming / target),
-                    version="0.1.1",
+                    version="0.1.2",
                     protocol_major="v1",
                     version_json=str(self.version_json),
                     source_commit=COMMIT,
-                    source_tag="v0.1.1",
+                    source_tag="v0.1.2",
                     source_repository=release.SOURCE_REPOSITORY,
                     workflow_run=WORKFLOW_RUN,
                     runner_os=runner_os,
@@ -137,10 +137,10 @@ class ReleaseAssemblyTest(unittest.TestCase):
         return Namespace(
             input=str(incoming),
             output=str(output),
-            version="0.1.1",
+            version="0.1.2",
             protocol_major="v1",
             source_commit=COMMIT,
-            source_tag="v0.1.1",
+            source_tag="v0.1.2",
             source_repository=release.SOURCE_REPOSITORY,
             workflow_run=WORKFLOW_RUN,
         )
@@ -188,7 +188,7 @@ class ReleaseAssemblyTest(unittest.TestCase):
 
     def test_tag_version_mismatch_is_rejected(self) -> None:
         with self.assertRaises(release.ReleaseError):
-            release.validate_version("0.1.1", "v1", "v0.2.0")
+            release.validate_version("0.1.2", "v1", "v0.2.0")
 
     def test_publication_is_push_exact_tag_only(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -218,7 +218,7 @@ class ReleaseAssemblyTest(unittest.TestCase):
             json.dumps({"version": "0.2.0", "protocolMajor": "v1"}), encoding="utf-8"
         )
         with self.assertRaises(release.ReleaseError):
-            release.validate_version_json(self.version_json, "0.1.1", "v1")
+            release.validate_version_json(self.version_json, "0.1.2", "v1")
 
     def test_missing_target_is_rejected(self) -> None:
         incoming = self.create_bundles()
