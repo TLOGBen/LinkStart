@@ -59,7 +59,7 @@ linkstart connections list --json
 linkstart apps list --json
 ```
 
-Adapter 會使用以下低階命令；一般使用者應優先透過 Integration Plugin 的 `open-connect`、`link-in` 與 `register-app` skills：
+Adapter 會使用以下低階命令；一般使用者應優先透過 Integration Plugin 的單一 `link-start` skill：
 
 ```console
 linkstart monitor wait --connection-id <id> --capability <token> --json
@@ -73,10 +73,10 @@ Capability 是秘密。不要把它放進 query string、cookie、CLI log、畫�
 
 ## 最小 PoC 流程
 
-1. Integration Plugin 執行 `open-connect`，啟動或重用 daemon，並把**當前 Origin Session** 連成一個 Agent Connection。
-2. `register-app` 以 manifest 註冊 HTML app，取得只屬於該 App Instance 的 launch grant／capability。
+1. Integration Plugin 的 `link-start` 內部 Runtime phase 啟動或重用 daemon，並把**當前 Origin Session** 連成一個 Agent Connection。
+2. 同一 workflow 的 App phase 以 manifest 註冊 HTML app，取得只屬於該 App Instance 的 launch grant／capability。
 3. HTML 載入 `web/linkstart.js`（或使用 `examples/self-contained.html` 的同等邏輯），以 `fetch + Authorization: Bearer …` 送出互動。
-4. `link-in` 的 adapter 在同一 Origin Session 收到事件、交付給 agent，並送出 Delivery Ack。
+4. Host-specific adapter 在同一 Origin Session 收到事件、交付給 agent，並送出 Delivery Ack。
 5. Agent feedback durable 寫回 Runtime，頁面透過 SSE 收到並更新 UI。
 
 直接啟動 Runtime 做協定層測試：
@@ -148,6 +148,8 @@ assets/
 Tag/version 不符、target 缺漏或重複、Linux 非 static、macOS 非 universal、Windows 非 x64 PE、`version --json` 不符，或任何 checksum 不符時，release 會拒絕發布。
 
 終端使用者建議從 `common-dev` marketplace 安裝 `linkstart` Integration Plugin；它會挑選目前平台的 binary，先核對 `checksums.json`、版本與 protocol，再直接執行。從 GitHub Release 手動安裝時，也應先驗證 manifest，不要只下載裸 binary。
+
+本 repo 的 [`integrations/common-dev/`](integrations/common-dev/) 是同步發布鏡像；marketplace canonical source 仍在 sibling `common-dev-plugin`。更新方向固定為 common-dev Claude source → generated Codex package → 本 repo mirror，並以 `python3 integrations/common-dev/check-parity.py` 驗證 byte/mode parity。
 
 ## 授權
 
