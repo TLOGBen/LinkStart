@@ -2,37 +2,37 @@
   "artifacts": [
     {
       "path": "bin/linux-x64-musl/linkstart",
-      "sha256": "fd01fb96c9e9f60b85d23d2238e89bf748226ae93a8acebe2aa8d413856c7865",
-      "size": 5779208,
-      "sourceCommit": "d4fb3a140f79dfcd0b7e63382d14389c00e349d4",
+      "sha256": "3a3413bcb935704fdaeb12e6528044c80f44a20a0d127b61af6336ee0dc0a4bd",
+      "size": 5828864,
+      "sourceCommit": "dcec343dc8e0d5c19a702f4517acaedc9e7d3ec0",
       "sourceRepository": "https://github.com/TLOGBen/LinkStart",
-      "sourceTag": "v0.1.3",
+      "sourceTag": "v0.1.5",
       "target": "linux-x64-musl",
-      "workflowRun": "https://github.com/TLOGBen/LinkStart/actions/runs/33049940902/attempts/1"
+      "workflowRun": "https://github.com/TLOGBen/LinkStart/actions/runs/33059893376/attempts/1"
     },
     {
       "path": "bin/macos-universal/linkstart",
-      "sha256": "6f5eec06731c8098eab0f48576ef9fca626afd24632bb917f744f5606bcadc01",
-      "size": 10033552,
-      "sourceCommit": "d4fb3a140f79dfcd0b7e63382d14389c00e349d4",
+      "sha256": "74e9947ea044bbae29d20b5fce2feee11be1c0d949c247ffa09f4536d60d3887",
+      "size": 10065872,
+      "sourceCommit": "dcec343dc8e0d5c19a702f4517acaedc9e7d3ec0",
       "sourceRepository": "https://github.com/TLOGBen/LinkStart",
-      "sourceTag": "v0.1.3",
+      "sourceTag": "v0.1.5",
       "target": "macos-universal",
-      "workflowRun": "https://github.com/TLOGBen/LinkStart/actions/runs/33049940902/attempts/1"
+      "workflowRun": "https://github.com/TLOGBen/LinkStart/actions/runs/33059893376/attempts/1"
     },
     {
       "path": "bin/windows-x64/linkstart.exe",
-      "sha256": "be30fa92e1cbc267786f0976ba06b2bf4b1ac7f99b9fc99d466d5360493b9e41",
-      "size": 4575232,
-      "sourceCommit": "d4fb3a140f79dfcd0b7e63382d14389c00e349d4",
+      "sha256": "15e8246f096db075e96f5c07d19eb4cc0038c28039acdb969d19118a9bc6c958",
+      "size": 4577792,
+      "sourceCommit": "dcec343dc8e0d5c19a702f4517acaedc9e7d3ec0",
       "sourceRepository": "https://github.com/TLOGBen/LinkStart",
-      "sourceTag": "v0.1.3",
+      "sourceTag": "v0.1.5",
       "target": "windows-x64",
-      "workflowRun": "https://github.com/TLOGBen/LinkStart/actions/runs/33049940902/attempts/1"
+      "workflowRun": "https://github.com/TLOGBen/LinkStart/actions/runs/33059893376/attempts/1"
     }
   ],
   "protocolMajor": "v1",
-  "releaseTag": "v0.1.3",
-  "runtimeVersion": "0.1.3",
+  "releaseTag": "v0.1.5",
+  "runtimeVersion": "0.1.5",
   "schemaVersion": 1
 }

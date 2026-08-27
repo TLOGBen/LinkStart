@@ -10,13 +10,13 @@
 
 ### CLI release binaries
 
-[v0.1.3 Release](https://github.com/TLOGBen/LinkStart/releases/tag/v0.1.3) 提供一個已組裝並附 provenance checksums 的套件：
+[v0.1.5 Release](https://github.com/TLOGBen/LinkStart/releases/tag/v0.1.5) 提供一個已組裝並附 provenance checksums 的套件：
 
 ```console
-curl -LO https://github.com/TLOGBen/LinkStart/releases/download/v0.1.3/linkstart-v0.1.3-plugin-assets.zip
-curl -LO https://github.com/TLOGBen/LinkStart/releases/download/v0.1.3/checksums.json
+curl -LO https://github.com/TLOGBen/LinkStart/releases/download/v0.1.5/linkstart-v0.1.5-plugin-assets.zip
+curl -LO https://github.com/TLOGBen/LinkStart/releases/download/v0.1.5/checksums.json
 sha256sum checksums.json
-unzip linkstart-v0.1.3-plugin-assets.zip
+unzip linkstart-v0.1.5-plugin-assets.zip
 ```
 
 從 `assets/bin/` 選擇執行環境對應檔案：
@@ -46,13 +46,13 @@ codex plugin add linkstart@linkstart
 
 Repo 使用單一 shared package：`plugins/linkstart/` 同時含 `.claude-plugin/plugin.json`、`.codex-plugin/plugin.json` 與一份 `skills/link-start/**`；沒有重複的 Codex skill/assets tree。
 
-目前 marketplace plugin version 是 `0.2.2`，內嵌 Runtime `0.1.3`。
+目前 marketplace plugin version 是 `0.2.3`，內嵌 Runtime `0.1.5`。
 
 ## Quick start
 
 1. 準備 App Manifest v1 與 HTML／localhost App。
 2. 在產出 App 的 Origin Session 呼叫 Claude `/linkstart:link-start <manifest.json>` 或 Codex `$link-start <manifest.json>`。
-3. Skill 驗證 bundled Runtime `0.1.3`，啟動／重用 daemon，attach 當前 session，註冊並開啟 App。
+3. Skill 驗證 bundled Runtime `0.1.5`，啟動／重用 daemon，attach 當前 session，註冊並開啟 App。
 4. App 送出互動後，`arm` 讓同一 Origin Session 收到 Event；模型只需一次 `respond --payload ...`，wrapper 會自動 Ack、Feedback 並進入下一次 wait。
 
 CLI smoke：

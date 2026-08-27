@@ -17,7 +17,7 @@ HELPER="${CLAUDE_PLUGIN_ROOT}/skills/link-start/scripts/runtime.py"
 "$HELPER" start --state-dir "$STATE_DIR" --json
 ```
 
-Require Runtime `0.1.3`, protocol `v1`, and the `operations.attach/register/launch/monitor/ack/feedback` schemas from `help --json`. Do not inspect Rust source or guess missing fields.
+Require Runtime `0.1.5`, protocol `v1`, and the `operations.attach/register/launch/monitor/ack/feedback` schemas from `help --json`. Do not inspect Rust source or guess missing fields.
 
 ## Attach, register, and launch
 
