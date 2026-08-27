@@ -47,11 +47,9 @@ def main():
                 monitor = json.loads(cli("monitor","wait","--json","--state-dir",state,"--connection-id",cid,"--capability",ccap,"--timeout-seconds","2"))
                 assert monitor["status"] == "received" and monitor["payload"]["message"] == "使用者互動"
                 cli("monitor","ack","--json","--state-dir",state,"--connection-id",cid,"--capability",ccap,"--event-id",monitor["eventId"])
-                page.evaluate("window.linkstartPoC.disconnect()")
-                cli("feedback","send","--json","--state-dir",state,"--connection-id",cid,"--capability",ccap,"--app-instance-id",monitor["appInstanceId"],"--feedback-id","browser-feedback","--in-reply-to-event-id",monitor["eventId"],"--payload",json.dumps({"message":"replayed feedback"}))
-                page.evaluate("() => { window.linkstartPoC.reconnect(); return true; }")
-                page.wait_for_function("document.querySelector('#feedback').innerText === 'replayed feedback'")
-                assert page.locator("#delivery-ack").inner_text() == "delivered"
+                page.wait_for_function("document.querySelector('#delivery-ack').innerText === 'delivered'")
+                cli("feedback","send","--json","--state-dir",state,"--connection-id",cid,"--capability",ccap,"--app-instance-id",monitor["appInstanceId"],"--feedback-id","browser-feedback","--in-reply-to-event-id",monitor["eventId"],"--payload",json.dumps({"message":"live feedback"}))
+                page.wait_for_function("document.querySelector('#feedback').innerText === 'live feedback'")
                 assert not errors, errors
                 browser.close()
             help_result = json.loads(cli("help","--json"))

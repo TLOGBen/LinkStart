@@ -10,13 +10,13 @@
 
 ### CLI release binaries
 
-[v0.1.2 Release](https://github.com/TLOGBen/LinkStart/releases/tag/v0.1.2) 提供一個已組裝並附 provenance checksums 的套件：
+[v0.1.3 Release](https://github.com/TLOGBen/LinkStart/releases/tag/v0.1.3) 提供一個已組裝並附 provenance checksums 的套件：
 
 ```console
-curl -LO https://github.com/TLOGBen/LinkStart/releases/download/v0.1.2/linkstart-v0.1.2-plugin-assets.zip
-curl -LO https://github.com/TLOGBen/LinkStart/releases/download/v0.1.2/checksums.json
+curl -LO https://github.com/TLOGBen/LinkStart/releases/download/v0.1.3/linkstart-v0.1.3-plugin-assets.zip
+curl -LO https://github.com/TLOGBen/LinkStart/releases/download/v0.1.3/checksums.json
 sha256sum checksums.json
-unzip linkstart-v0.1.2-plugin-assets.zip
+unzip linkstart-v0.1.3-plugin-assets.zip
 ```
 
 從 `assets/bin/` 選擇執行環境對應檔案：
@@ -50,7 +50,7 @@ Repo 使用單一 shared package：`plugins/linkstart/` 同時含 `.claude-plugi
 
 1. 準備 App Manifest v1 與 HTML／localhost App。
 2. 在產出 App 的 Origin Session 呼叫 Claude `/linkstart:link-start <manifest.json>` 或 Codex `$link-start <manifest.json>`。
-3. Skill 驗證 bundled Runtime `0.1.2`，啟動／重用 daemon，attach 當前 session，註冊並開啟 App。
+3. Skill 驗證 bundled Runtime `0.1.3`，啟動／重用 daemon，attach 當前 session，註冊並開啟 App。
 4. App 送出互動後，`arm` 讓同一 Origin Session 收到 Event；模型只需一次 `respond --payload ...`，wrapper 會自動 Ack、Feedback 並進入下一次 wait。
 
 CLI smoke：
@@ -74,6 +74,8 @@ LinkStart daemon（127.0.0.1、每位 OS 使用者一個、SQLite/WAL）
 ```
 
 Event Receipt 只證明 Runtime 已 durable 收件；Delivery Ack 只證明 adapter 已接受；Agent Feedback 是回到 App 的獨立訊息。三者都不代表模型完成處理。
+
+SSE 依 durable notification cursor 持續讀取 SQLite，因此由另一個 CLI process 寫入的 Delivery Ack／Feedback 會直接出現在仍在線的 App；斷線後也從同一 cursor journal replay。
 
 ## CLI
 

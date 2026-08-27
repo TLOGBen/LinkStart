@@ -10,14 +10,14 @@ use axum::{
     Json, Router,
 };
 use clap::{Args, Parser, Subcommand};
-use futures_util::Stream;
+use futures_util::{stream as future_stream, Stream};
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     convert::Infallible,
     fs,
     io::{Read, Write},
@@ -26,8 +26,6 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::broadcast;
-use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::limit::RequestBodyLimitLayer;
 use uuid::Uuid;
 
@@ -488,7 +486,6 @@ fn print_human_help(cmd: Option<&str>) {
 struct AppState {
     store: Store,
     host: String,
-    tx: broadcast::Sender<Notification>,
 }
 #[derive(Clone, Serialize)]
 struct Notification {
@@ -773,8 +770,7 @@ async fn serve(a: StartArgs) -> Result<()> {
             &json!({"address":host,"pid":std::process::id(),"version":VERSION,"protocolMajor":PROTOCOL}),
         )?,
     )?;
-    let (tx, _) = broadcast::channel(128);
-    let state = AppState { store, host, tx };
+    let state = AppState { store, host };
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/connections", post(register_connection))
@@ -1196,12 +1192,9 @@ async fn receive_event(
     let h = hash(&payload_s);
     let reply=s.store.with(|c|{let conn_status: String=c.query_row("SELECT c.status FROM connections c JOIN apps a ON a.connection_id=c.id WHERE a.id=?",[&id],|r|r.get(0))?;if conn_status!="online"{return Ok(json!({"error":"origin_offline"}))};let old:Option<(String,String,String,i64)>=c.query_row("SELECT receipt_id,payload_hash,status,sequence FROM events WHERE app_id=? AND id=?",params![id,x.event_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;if let Some((receipt,old_hash,status,seq))=old{return Ok(if old_hash==h {json!({"receiptId":receipt,"eventId":x.event_id,"sequence":seq,"status":status,"duplicate":true})}else{json!({"error":"event_id_conflict"})})};let seq:i64=c.query_row("SELECT COALESCE(MAX(sequence),0)+1 FROM events WHERE app_id=?",[&id],|r|r.get(0))?;let receipt=format!("rcpt-{}",Uuid::new_v4());c.execute("INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?)",params![x.event_id,id,seq,payload_s,h,"received",Option::<String>::None,receipt,now()])?;Ok(json!({"receiptId":receipt,"eventId":x.event_id,"sequence":seq,"status":"received","untrustedInput":true}))}).map_err(|_|reject("storage_error"))?;
     if reply.get("error").is_none() {
-        let _ = s.tx.send(Notification {
-            cursor: 0,
-            app_id: id.clone(),
-            kind: "receipt".into(),
-            data: reply.clone(),
-        });
+        s.store
+            .with(|c| Store::insert_notification(c, &id, "receipt", &reply))
+            .map_err(|_| reject("storage_error"))?;
     }
     Ok(Json(reply))
 }
@@ -1226,12 +1219,9 @@ async fn cancel_event(
         ));
     };
     let d = json!({"eventId":x.event_id,"status":"cancelled"});
-    let _ = s.tx.send(Notification {
-        cursor: 0,
-        app_id: id.clone(),
-        kind: "event".into(),
-        data: d.clone(),
-    });
+    s.store
+        .with(|c| Store::insert_notification(c, &id, "event", &d))
+        .map_err(|_| reject("storage_error"))?;
     Ok(Json(d))
 }
 async fn ack(
@@ -1248,23 +1238,12 @@ async fn ack(
     {
         return Err(reject("capability_invalid"));
     };
-    let out=s.store.with(|c|{let app:String=c.query_row("SELECT e.app_id FROM events e JOIN apps a ON a.id=e.app_id WHERE a.connection_id=? AND e.id=? AND e.status='received' ORDER BY e.sequence LIMIT 1",params![id,x.event_id],|r|r.get(0)).optional()?.ok_or_else(||anyhow::anyhow!("not received"))?;let first:Option<String>=c.query_row("SELECT id FROM events WHERE app_id=? AND status='received' ORDER BY sequence LIMIT 1",[&app],|r|r.get(0)).optional()?;if first.as_deref()!=Some(&x.event_id){bail!("not inflight")};c.execute("UPDATE events SET status='delivered' WHERE app_id=? AND id=?",params![app,x.event_id])?;Ok(json!({"eventId":x.event_id,"status":"delivered","deliveryAck":true}))}).map_err(|_|(StatusCode::CONFLICT,Json(json!({"error":"event_not_received_or_not_inflight"}))))?;
-    let app_for_notification = s
-        .store
-        .with(|c| {
-            Ok(
-                c.query_row("SELECT app_id FROM events WHERE id=?", [&x.event_id], |r| {
-                    r.get::<_, String>(0)
-                })?,
-            )
-        })
-        .map_err(|_| reject("storage_error"))?;
-    let _ = s.tx.send(Notification {
-        cursor: 0,
-        app_id: app_for_notification,
-        kind: "delivery_ack".into(),
-        data: out.clone(),
-    });
+    let out = s.store.ack_event(&id, &x.event_id).map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"event_not_received_or_not_inflight"})),
+        )
+    })?;
     Ok(Json(out))
 }
 async fn fail(
@@ -1305,36 +1284,10 @@ async fn feedback(
         return Err(reject("capability_invalid"));
     };
     let data = canonical(x.payload);
-    s.store
-        .with(|c| {
-            let belongs: i64 = c.query_row(
-                "SELECT count(*) FROM apps WHERE id=? AND connection_id=?",
-                params![app, id],
-                |r| r.get(0),
-            )?;
-            if belongs != 1 {
-                bail!("wrong app")
-            };
-            c.execute(
-                "INSERT INTO feedback(id,app_id,in_reply_to,payload,created_at) VALUES(?,?,?,?,?)",
-                params![
-                    x.feedback_id,
-                    app,
-                    x.in_reply_to,
-                    serde_json::to_string(&data)?,
-                    now()
-                ],
-            )?;
-            Ok(())
-        })
+    let out = s
+        .store
+        .insert_feedback(&id, &app, &x.feedback_id, x.in_reply_to.as_deref(), data)
         .map_err(|_| reject("storage_error"))?;
-    let out = json!({"feedbackId":x.feedback_id,"inReplyToEventId":x.in_reply_to,"payload":data});
-    let _ = s.tx.send(Notification {
-        cursor: 0,
-        app_id: app.clone(),
-        kind: "feedback".into(),
-        data: out.clone(),
-    });
     Ok(Json(out))
 }
 async fn stream(
@@ -1350,26 +1303,30 @@ async fn stream(
         .map_err(|_| reject("storage_error"))?
         .ok_or_else(|| reject("capability_invalid"))?;
     origin_gate(&headers, &s.host, &o)?;
+    let cursor = query.cursor.unwrap_or(0);
     let replay = s
         .store
-        .replay(&id, query.cursor.unwrap_or(0))
+        .replay(&id, cursor)
         .map_err(|_| reject("storage_error"))?;
-    let initial = tokio_stream::iter(replay.into_iter().map(|n| {
-        Ok(Event::default()
-            .id(n.cursor.to_string())
-            .event(n.kind)
-            .data(n.data.to_string()))
-    }));
-    let st: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> = Box::pin(
-        initial.chain(BroadcastStream::new(s.tx.subscribe()).filter_map(move |x| {
-            x.ok().filter(|n| n.app_id == id).map(|n| {
-                Ok(Event::default()
-                    .id(n.cursor.to_string())
-                    .event(n.kind)
-                    .data(n.data.to_string()))
-            })
-        })),
+    let durable = future_stream::unfold(
+        (s.store.clone(), id, cursor, VecDeque::from(replay)),
+        |(store, app_id, mut cursor, mut pending)| async move {
+            loop {
+                if let Some(notification) = pending.pop_front() {
+                    cursor = notification.cursor;
+                    let event = Event::default()
+                        .id(notification.cursor.to_string())
+                        .event(notification.kind)
+                        .data(notification.data.to_string());
+                    return Some((Ok(event), (store, app_id, cursor, pending)));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                pending = VecDeque::from(store.replay(&app_id, cursor).unwrap_or_default());
+            }
+        },
     );
+    let st: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
+        Box::pin(durable);
     let mut response = Sse::new(st)
         .keep_alive(KeepAlive::default())
         .into_response();
