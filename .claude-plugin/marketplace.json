@@ -6,15 +6,15 @@
   },
   "metadata": {
     "description": "LinkStart local Runtime and same-Origin-Session HTML interaction plugin for Claude Code.",
-    "version": "0.3.0"
+    "version": "0.4.0"
   },
   "plugins": [
     {
       "name": "linkstart",
       "source": "./plugins/linkstart",
-      "description": "LinkStart v1 Preview: reconnect an interactive HTML or localhost app to the same Origin Session with a persistent Codex host lease and foreground compatibility.",
+      "description": "LinkStart v1 Preview: reconnect an interactive HTML or localhost app to the same Origin Session with persistent Claude channel/monitor and Codex host leases plus foreground compatibility.",
       "displayName": "LinkStart",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "defaultEnabled": false
     }
   ]

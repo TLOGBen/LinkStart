@@ -33,7 +33,7 @@ jobs:
         run: |
           cargo fmt --check
           python3 -m unittest -v scripts/release/test_release.py
-          python3 -m unittest -v tests/test_codex_adapter.py
+          python3 -m unittest -v tests/test_codex_adapter.py tests/test_claude_adapter.py
           cargo test --locked --all-targets
           cargo build --locked --release --target x86_64-unknown-linux-musl
           target/x86_64-unknown-linux-musl/release/linkstart version --json > version.json
@@ -85,7 +85,7 @@ jobs:
         shell: pwsh
         run: |
           cargo fmt --check
-          python -m unittest -v tests/test_codex_adapter.py
+          python -m unittest -v tests/test_codex_adapter.py tests/test_claude_adapter.py
           cargo test --locked --all-targets --no-run
           cargo build --locked --release --target x86_64-pc-windows-msvc
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -132,7 +132,7 @@ jobs:
         shell: bash
         run: |
           cargo fmt --check
-          python3 -m unittest -v tests/test_codex_adapter.py
+          python3 -m unittest -v tests/test_codex_adapter.py tests/test_claude_adapter.py
           cargo test --locked --all-targets --no-run
           cargo build --locked --release --target x86_64-apple-darwin
           cargo build --locked --release --target aarch64-apple-darwin

@@ -1,0 +1,8 @@
+[
+  {
+    "name": "linkstart-wake",
+    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/skills/link-start/scripts/claude_adapter.py monitor",
+    "description": "LinkStart App Event wake monitor (compatibility mode for sessions without channel opt-in)",
+    "when": "on-skill-invoke:link-start"
+  }
+]

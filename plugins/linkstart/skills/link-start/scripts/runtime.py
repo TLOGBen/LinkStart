@@ -17,6 +17,7 @@ import uuid
 from urllib.error import URLError
 from urllib.request import urlopen
 
+import claude_adapter
 import codex_adapter
 
 
@@ -569,11 +570,19 @@ def parser() -> argparse.ArgumentParser:
     adapter_sub = c.add_subparsers(dest="adapter_command", required=True)
     start_adapter = adapter_sub.add_parser("start")
     start_adapter.add_argument("--context", type=Path, default=default_context_path())
+    start_adapter.add_argument("--host", choices=("codex", "claude"), default="codex")
+    start_adapter.add_argument("--mode", choices=("channel", "monitor"))
     start_adapter.add_argument("--thread-id")
     start_adapter.add_argument("--json", action="store_true")
     status_adapter = adapter_sub.add_parser("status")
     status_adapter.add_argument("--context", type=Path, default=default_context_path())
     status_adapter.add_argument("--json", action="store_true")
+    probe_adapter = adapter_sub.add_parser("probe")
+    probe_adapter.add_argument("--context", type=Path, default=default_context_path())
+    probe_adapter.add_argument("--json", action="store_true")
+    pull_adapter = adapter_sub.add_parser("pull")
+    pull_adapter.add_argument("--context", type=Path, default=default_context_path())
+    pull_adapter.add_argument("--json", action="store_true")
     feedback_adapter = adapter_sub.add_parser("feedback")
     feedback_adapter.add_argument("--context", type=Path, default=default_context_path())
     feedback_adapter.add_argument("--event-id", required=True)
@@ -631,38 +640,105 @@ def main() -> None:
                 path, context, args.payload, args.event_id, args.timeout_seconds
             )
         elif args.command == "adapter":
-            lease_path = codex_adapter.default_lease_path(args.context)
+            claude_lease = claude_adapter.default_lease_path(args.context)
+            codex_lease = codex_adapter.default_lease_path(args.context)
+            if claude_lease.exists() and codex_lease.exists():
+                raise RuntimeErrorCode(
+                    "monitor_owner_conflict",
+                    "both claude and codex adapter leases exist for this context",
+                )
             if args.adapter_command == "start":
-                thread_id = codex_adapter.require_thread_id(
-                    args.thread_id or os.environ.get("CODEX_THREAD_ID")
-                )
-                payload = codex_adapter.start_background(
-                    context_path=args.context,
-                    thread_id=thread_id,
-                    lease_path=lease_path,
-                )
-            elif args.adapter_command == "status":
-                payload = codex_adapter.background_status(lease_path)
-            elif args.adapter_command == "feedback":
-                load_context(args.context)
-                ledger = codex_adapter.SqliteLedger(lease_path)
-                try:
-                    parsed_payload = json.loads(args.payload)
-                    if not isinstance(parsed_payload, dict):
+                if args.host == "claude":
+                    if codex_lease.exists():
                         raise RuntimeErrorCode(
-                            "feedback_payload_invalid", "--payload must be a JSON object"
+                            "monitor_owner_conflict",
+                            "a codex adapter lease already owns this context",
                         )
-                    payload = codex_adapter.queue_feedback(
-                        ledger, args.event_id, parsed_payload
+                    if not args.mode:
+                        raise RuntimeErrorCode(
+                            "adapter_mode_missing",
+                            "--mode channel|monitor is required for --host claude",
+                        )
+                    adapter_name = (
+                        claude_adapter.ADAPTER_CHANNEL
+                        if args.mode == "channel"
+                        else claude_adapter.ADAPTER_MONITOR
                     )
-                finally:
-                    ledger.close()
+                    payload = claude_adapter.arm_lease(
+                        context_path=args.context,
+                        adapter=adapter_name,
+                        lease_path=claude_lease,
+                    )
+                else:
+                    if claude_lease.exists():
+                        raise RuntimeErrorCode(
+                            "monitor_owner_conflict",
+                            "a claude adapter lease already owns this context",
+                        )
+                    thread_id = codex_adapter.require_thread_id(
+                        args.thread_id or os.environ.get("CODEX_THREAD_ID")
+                    )
+                    payload = codex_adapter.start_background(
+                        context_path=args.context,
+                        thread_id=thread_id,
+                        lease_path=codex_lease,
+                    )
+            elif args.adapter_command == "status":
+                if claude_lease.exists():
+                    payload = claude_adapter.lease_status(claude_lease)
+                else:
+                    payload = codex_adapter.background_status(codex_lease)
+            elif args.adapter_command == "probe":
+                payload = claude_adapter.request_probe(claude_lease)
+            elif args.adapter_command == "pull":
+                payload = claude_adapter.pull_event(args.context, lease_path=claude_lease)
+            elif args.adapter_command == "feedback":
+                parsed_payload = json.loads(args.payload)
+                if not isinstance(parsed_payload, dict):
+                    raise RuntimeErrorCode(
+                        "feedback_payload_invalid", "--payload must be a JSON object"
+                    )
+                if claude_lease.exists():
+                    payload = claude_adapter.send_event_feedback(
+                        args.context,
+                        args.event_id,
+                        parsed_payload,
+                        lease_path=claude_lease,
+                    )
+                else:
+                    load_context(args.context)
+                    ledger = codex_adapter.SqliteLedger(codex_lease)
+                    try:
+                        payload = codex_adapter.queue_feedback(
+                            ledger, args.event_id, parsed_payload
+                        )
+                    finally:
+                        ledger.close()
             else:
-                payload = codex_adapter.stop_background(
-                    lease_path, context_path=args.context
-                )
+                if claude_lease.exists():
+                    payload = claude_adapter.stop_lease(
+                        claude_lease, context_path=args.context
+                    )
+                else:
+                    payload = codex_adapter.stop_background(
+                        codex_lease, context_path=args.context
+                    )
         else:
             path, context = load_context(args.context)
+            claude_lease = claude_adapter.default_lease_path(path)
+            if claude_lease.exists():
+                stopped = claude_adapter.stop_lease(claude_lease, context_path=path)
+                payload = {
+                    "ok": True,
+                    "operation": "close",
+                    "contextId": context["contextId"],
+                    "connectionId": context["connectionId"],
+                    "credentialDeleted": stopped["credentialDeleted"],
+                    "connectionRevoked": False,
+                    "leaseStatus": stopped["leaseStatus"],
+                }
+                emit(payload, args.json)
+                return
             lease_path = codex_adapter.default_lease_path(path)
             if lease_path.exists():
                 stopped = codex_adapter.stop_background(lease_path, context_path=path)
