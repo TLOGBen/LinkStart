@@ -17,6 +17,8 @@ import uuid
 from urllib.error import URLError
 from urllib.request import urlopen
 
+import codex_adapter
+
 
 PROTOCOL_MAJOR = "v1"
 RUNTIME_VERSION = "0.1.5"
@@ -563,6 +565,23 @@ def parser() -> argparse.ArgumentParser:
     c.add_argument("--event-id")
     c.add_argument("--timeout-seconds", type=int, default=DEFAULT_MONITOR_TIMEOUT)
     c.add_argument("--json", action="store_true")
+    c = sub.add_parser("adapter")
+    adapter_sub = c.add_subparsers(dest="adapter_command", required=True)
+    start_adapter = adapter_sub.add_parser("start")
+    start_adapter.add_argument("--context", type=Path, default=default_context_path())
+    start_adapter.add_argument("--thread-id")
+    start_adapter.add_argument("--json", action="store_true")
+    status_adapter = adapter_sub.add_parser("status")
+    status_adapter.add_argument("--context", type=Path, default=default_context_path())
+    status_adapter.add_argument("--json", action="store_true")
+    feedback_adapter = adapter_sub.add_parser("feedback")
+    feedback_adapter.add_argument("--context", type=Path, default=default_context_path())
+    feedback_adapter.add_argument("--event-id", required=True)
+    feedback_adapter.add_argument("--payload", required=True)
+    feedback_adapter.add_argument("--json", action="store_true")
+    close_adapter = adapter_sub.add_parser("close")
+    close_adapter.add_argument("--context", type=Path, default=default_context_path())
+    close_adapter.add_argument("--json", action="store_true")
     c = sub.add_parser("close")
     c.add_argument("--context", type=Path, default=default_context_path())
     c.add_argument("--json", action="store_true")
@@ -611,18 +630,70 @@ def main() -> None:
             payload = respond_and_wait(
                 path, context, args.payload, args.event_id, args.timeout_seconds
             )
+        elif args.command == "adapter":
+            lease_path = codex_adapter.default_lease_path(args.context)
+            if args.adapter_command == "start":
+                thread_id = codex_adapter.require_thread_id(
+                    args.thread_id or os.environ.get("CODEX_THREAD_ID")
+                )
+                payload = codex_adapter.start_background(
+                    context_path=args.context,
+                    thread_id=thread_id,
+                    lease_path=lease_path,
+                )
+            elif args.adapter_command == "status":
+                payload = codex_adapter.background_status(lease_path)
+            elif args.adapter_command == "feedback":
+                load_context(args.context)
+                ledger = codex_adapter.SqliteLedger(lease_path)
+                try:
+                    parsed_payload = json.loads(args.payload)
+                    if not isinstance(parsed_payload, dict):
+                        raise RuntimeErrorCode(
+                            "feedback_payload_invalid", "--payload must be a JSON object"
+                        )
+                    payload = codex_adapter.queue_feedback(
+                        ledger, args.event_id, parsed_payload
+                    )
+                finally:
+                    ledger.close()
+            else:
+                payload = codex_adapter.stop_background(
+                    lease_path, context_path=args.context
+                )
         else:
             path, context = load_context(args.context)
-            path.unlink()
-            payload = {
-                "ok": True,
-                "operation": "close",
-                "contextId": context["contextId"],
-                "connectionId": context["connectionId"],
-                "credentialDeleted": True,
-                "connectionRevoked": False,
-            }
+            lease_path = codex_adapter.default_lease_path(path)
+            if lease_path.exists():
+                stopped = codex_adapter.stop_background(lease_path, context_path=path)
+                payload = {
+                    "ok": True,
+                    "operation": "close",
+                    "contextId": context["contextId"],
+                    "connectionId": context["connectionId"],
+                    "credentialDeleted": stopped["credentialDeleted"],
+                    "connectionRevoked": False,
+                    "leaseStatus": stopped["leaseStatus"],
+                }
+            else:
+                path.unlink()
+                payload = {
+                    "ok": True,
+                    "operation": "close",
+                    "contextId": context["contextId"],
+                    "connectionId": context["connectionId"],
+                    "credentialDeleted": True,
+                    "connectionRevoked": False,
+                }
         emit(payload, args.json)
+    except (
+        codex_adapter.AdapterAdmissionError,
+        codex_adapter.FeedbackConflict,
+        codex_adapter.RuntimeBoundaryError,
+        codex_adapter.AppServerError,
+    ) as exc:
+        code = getattr(exc, "code", "feedback_payload_conflict")
+        emit({"ok": False, "error": code}, getattr(args, "json", False), 2)
     except RuntimeErrorCode as exc:
         emit({"ok": False, "error": exc.code, "detail": exc.detail}, getattr(args, "json", False), 2)
 

@@ -1,0 +1,920 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LinkStart App 契約邏輯原型</title>
+  <style>
+    :root {
+      --paper: #f5f3ed;
+      --panel: #fffefa;
+      --ink: #242722;
+      --muted: #6c7169;
+      --line: #d9d8cf;
+      --accent: #315f55;
+      --accent-soft: #e3eeea;
+      --warn: #8a5d17;
+      --warn-soft: #f8ecd4;
+      --danger: #9b3c35;
+      --danger-soft: #f7e3df;
+      --ok: #2f6c4d;
+      --ok-soft: #e2f0e7;
+      --code: #eef0eb;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", sans-serif;
+      color: var(--ink);
+      background: var(--paper);
+    }
+
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+    .shell { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 32px 0 64px; }
+    .hero { display: grid; gap: 14px; margin-bottom: 22px; }
+    .eyebrow { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .prototype-mark, .memory-mark {
+      display: inline-flex; align-items: center; min-height: 28px; padding: 3px 10px;
+      border: 1px solid var(--danger); border-radius: 999px; color: var(--danger);
+      font-size: 12px; font-weight: 750; letter-spacing: .06em;
+    }
+    .memory-mark { border-color: var(--accent); color: var(--accent); }
+    h1 { margin: 0; font-size: clamp(28px, 5vw, 47px); line-height: 1.08; letter-spacing: -.035em; }
+    .question { max-width: 920px; margin: 0; color: var(--muted); font-size: 17px; line-height: 1.72; }
+    .invariant {
+      padding: 14px 16px; border-left: 4px solid var(--accent); background: var(--accent-soft);
+      line-height: 1.65; font-size: 14px;
+    }
+
+    .section { margin-top: 20px; }
+    .section-head { display: flex; justify-content: space-between; align-items: end; gap: 16px; margin-bottom: 10px; }
+    .section-head h2 { margin: 0; font-size: 19px; }
+    .section-head p { margin: 0; color: var(--muted); font-size: 13px; }
+
+    .status-strip {
+      display: flex; flex-wrap: wrap; gap: 8px; padding: 12px;
+      border: 1px solid var(--line); border-radius: 12px 12px 0 0; background: var(--panel);
+    }
+    .chip { display: inline-flex; gap: 6px; align-items: center; padding: 5px 9px; border-radius: 999px; background: var(--code); font-size: 12px; }
+    .chip.ok { background: var(--ok-soft); color: var(--ok); }
+    .chip.warn { background: var(--warn-soft); color: var(--warn); }
+    .chip.danger { background: var(--danger-soft); color: var(--danger); }
+    .chip strong { font-weight: 750; }
+
+    .last-change {
+      padding: 13px 15px; border: 1px solid var(--line); border-top: 0; background: #faf9f4;
+      display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: start; line-height: 1.55;
+    }
+    .last-change strong { color: var(--accent); }
+    .last-change.danger strong { color: var(--danger); }
+    .last-change.warn strong { color: var(--warn); }
+
+    .state-grid {
+      display: grid; grid-template-columns: repeat(12, 1fr); gap: 12px; padding: 12px;
+      border: 1px solid var(--line); border-top: 0; border-radius: 0 0 12px 12px; background: #ecebe5;
+    }
+    .card { grid-column: span 4; min-width: 0; padding: 15px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
+    .card.wide { grid-column: span 8; }
+    .card.full { grid-column: 1 / -1; }
+    .card h3 { margin: 0 0 11px; font-size: 14px; color: var(--accent); }
+    .card-note { margin: -4px 0 10px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .kv { display: grid; grid-template-columns: minmax(105px, .7fr) minmax(0, 1.3fr); gap: 7px 12px; margin: 0; font-size: 13px; }
+    .kv dt { color: var(--muted); }
+    .kv dd { margin: 0; overflow-wrap: anywhere; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .secret { color: var(--accent); font-weight: 700; }
+    .never { color: var(--danger); font-weight: 700; }
+    .caps { display: flex; flex-wrap: wrap; gap: 5px; }
+    .caps span { padding: 3px 7px; border: 1px solid var(--line); border-radius: 999px; background: var(--code); font-size: 11px; }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: 8px 9px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-weight: 650; white-space: nowrap; }
+    td { overflow-wrap: anywhere; }
+    tr:last-child td { border-bottom: 0; }
+    .empty { padding: 14px; border: 1px dashed var(--line); border-radius: 8px; color: var(--muted); text-align: center; font-size: 13px; }
+
+    .feedback-list, .history-list { display: grid; gap: 7px; }
+    .feedback-item, .history-item { padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px; background: #faf9f4; font-size: 12px; line-height: 1.55; }
+    .feedback-item.replayed { border-color: var(--warn); background: var(--warn-soft); }
+    .feedback-meta { display: flex; gap: 8px; justify-content: space-between; color: var(--muted); margin-bottom: 3px; }
+    .question-box { padding: 11px; border: 1px solid var(--accent); border-radius: 8px; background: var(--accent-soft); }
+    .question-box p { margin: 0 0 9px; line-height: 1.55; }
+    .question-options { display: flex; flex-wrap: wrap; gap: 7px; }
+
+    .controls { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .control-group { padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+    .control-group h3 { margin: 0 0 10px; font-size: 14px; }
+    .buttons { display: flex; flex-wrap: wrap; gap: 7px; }
+    .action {
+      border: 1px solid var(--line); border-radius: 7px; background: #fff; color: var(--ink);
+      padding: 7px 10px; font-size: 12px;
+    }
+    .action:hover { border-color: var(--accent); color: var(--accent); }
+    .action.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+    .action.danger { border-color: #d6aaa5; color: var(--danger); }
+    .text-send { display: flex; gap: 7px; margin-top: 8px; }
+    .text-send input { min-width: 0; flex: 1; border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px; background: #fff; }
+
+    .walkthrough { border: 1px solid var(--line); border-radius: 11px; background: var(--panel); overflow: hidden; }
+    .tabs { display: flex; overflow-x: auto; border-bottom: 1px solid var(--line); background: #ebeae4; }
+    .tab { flex: 0 0 auto; padding: 11px 14px; border: 0; border-right: 1px solid var(--line); background: transparent; color: var(--muted); font-size: 13px; }
+    .tab.active { background: var(--panel); color: var(--accent); font-weight: 750; }
+    .scenario-body { padding: 16px; }
+    .scenario-body h3 { margin: 0 0 6px; font-size: 16px; }
+    .scenario-body > p { margin: 0 0 13px; color: var(--muted); font-size: 13px; line-height: 1.65; }
+    .steps { display: grid; gap: 7px; }
+    .step {
+      display: grid; grid-template-columns: 29px minmax(0, 1fr) auto; gap: 9px; align-items: center;
+      width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; text-align: left;
+    }
+    .step .num { display: grid; place-items: center; width: 25px; height: 25px; border-radius: 999px; background: var(--code); color: var(--muted); font-size: 11px; }
+    .step small { color: var(--muted); }
+    .step.current { border-color: var(--accent); background: var(--accent-soft); }
+    .step.done { opacity: .6; }
+    .step:disabled { cursor: default; }
+
+    .footnote { margin-top: 20px; color: var(--muted); font-size: 12px; line-height: 1.65; text-align: center; }
+    @media (max-width: 900px) {
+      .card, .card.wide { grid-column: span 6; }
+      .controls { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 640px) {
+      .shell { width: min(100% - 20px, 1180px); padding-top: 20px; }
+      .card, .card.wide { grid-column: 1 / -1; }
+      .controls { grid-template-columns: 1fr; }
+      .section-head { align-items: start; flex-direction: column; }
+      .last-change { grid-template-columns: 1fr; }
+      .step { grid-template-columns: 29px minmax(0, 1fr); }
+      .step small { grid-column: 2; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="hero">
+      <div class="eyebrow">
+        <span class="prototype-mark">PROTOTYPE — THROWAWAY</span>
+        <span class="memory-mark">純前端記憶體模擬</span>
+      </div>
+      <h1>App 連上 Origin Session 時，這份契約摸起來對嗎？</h1>
+      <p class="question">這個邏輯原型要回答：一份不含祕密的 App Manifest，加上一次性 launch grant、記憶體內 App Instance capability、HTTP Receipt、SSE Delivery Ack／Feedback，是否足以讓一般使用者理解 self-contained HTML 與既有 localhost App 的完整往返，同時看得出哪些動作不能成立。</p>
+      <div class="invariant"><strong>不可跨越的界線：</strong>App Event、結構化問題的「同意」、Event Receipt、Delivery Ack 與 Agent Feedback 都不是 tool approval，也不能擴大 sandbox、permission 或工作 scope。本原型完全沒有 approval relay。</div>
+    </header>
+
+    <section class="section" aria-labelledby="state-title">
+      <div class="section-head">
+        <div><h2 id="state-title">完整模擬狀態</h2><p>每次操作後全部重新呈現；祕密只顯示遮罩與是否存在。</p></div>
+      </div>
+      <div id="status-strip" class="status-strip"></div>
+      <div id="last-change" class="last-change"></div>
+      <div id="state-grid" class="state-grid"></div>
+    </section>
+
+    <section class="section" aria-labelledby="free-title">
+      <div class="section-head">
+        <div><h2 id="free-title">自由操作</h2><p>按錯順序也沒關係；模型會留下明確拒絕原因。</p></div>
+      </div>
+      <div class="controls">
+        <div class="control-group">
+          <h3>入口與註冊</h3>
+          <div class="buttons">
+            <button class="action" data-action="SET_PROFILE" data-profile="self-contained">改用 self-contained HTML</button>
+            <button class="action" data-action="SET_PROFILE" data-profile="localhost">改用 localhost App</button>
+            <button class="action primary" data-action="REGISTER">登錄 Manifest</button>
+            <button class="action" data-action="ISSUE_GRANT">核發一次性 launch grant</button>
+            <button class="action" data-action="ALLOW_LNA">允許瀏覽器本機連線</button>
+            <button class="action primary" data-action="REDEEM_GRANT">兌換 App Instance capability</button>
+            <button class="action danger" data-action="EXPIRE_GRANT">讓 grant 過期</button>
+          </div>
+        </div>
+        <div class="control-group">
+          <h3>Trust gate 與 SSE</h3>
+          <div class="buttons">
+            <button class="action primary" data-action="CONNECT_STREAM">以 fetch + Authorization 連 SSE</button>
+            <button class="action" data-action="DISCONNECT_STREAM">模擬 SSE 斷線</button>
+            <button class="action" data-action="RECONNECT_STREAM">帶 cursor 重連並 replay</button>
+            <button class="action danger" data-action="TAMPER_ORIGIN">偽造 Origin</button>
+            <button class="action danger" data-action="TAMPER_HOST">偽造 Host</button>
+            <button class="action" data-action="RESTORE_GATES">恢復已註冊 Host／Origin</button>
+            <button class="action danger" data-action="DENY_LNA">拒絕 LNA</button>
+          </div>
+        </div>
+        <div class="control-group">
+          <h3>Event、Receipt 與 Ack</h3>
+          <div class="buttons">
+            <button class="action" data-action="SUBMIT_EVENT" data-kind="choice" data-value="採用建議方案">送出選擇事件</button>
+            <button class="action primary" data-action="ACK_INFLIGHT">Adapter 接受：Delivery Ack</button>
+            <button class="action danger" data-action="CANCEL_INFLIGHT">Ack 前取消</button>
+            <button class="action danger" data-action="FAIL_INFLIGHT">投遞失敗</button>
+            <button class="action" data-action="RESEND_SAME">同 eventId／同 payload 重送</button>
+            <button class="action danger" data-action="RESEND_CONFLICT">同 eventId／不同 payload</button>
+          </div>
+          <div class="text-send">
+            <input id="event-text" value="請再說明一次" aria-label="自由文字事件">
+            <button id="send-text" class="action">送出文字</button>
+          </div>
+        </div>
+        <div class="control-group">
+          <h3>Feedback 與結構化問題</h3>
+          <div class="buttons">
+            <button class="action" data-action="AGENT_FEEDBACK">Agent 回傳說明</button>
+            <button class="action primary" data-action="ASK_QUESTION">Agent 發出結構化問題</button>
+            <button class="action danger" data-action="TRY_TOOL_APPROVAL">嘗試把「同意」當 tool approval</button>
+          </div>
+        </div>
+        <div class="control-group">
+          <h3>Origin 與失敗</h3>
+          <div class="buttons">
+            <button class="action danger" data-action="SET_ORIGIN_OFFLINE">Origin Session 離線</button>
+            <button class="action" data-action="SET_ORIGIN_ONLINE">Origin Session 回到線上</button>
+            <button class="action danger" data-action="REVOKE_INSTANCE">關閉並 revoke Instance</button>
+          </div>
+        </div>
+        <div class="control-group">
+          <h3>清空</h3>
+          <div class="buttons"><button class="action danger" data-action="RESET">重設全部記憶體狀態</button></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="guide-title">
+      <div class="section-head">
+        <div><h2 id="guide-title">引導案例</h2><p>切換分頁會重設成該案例的已知初始狀態。</p></div>
+      </div>
+      <div class="walkthrough">
+        <div id="scenario-tabs" class="tabs" role="tablist"></div>
+        <div id="scenario-body" class="scenario-body"></div>
+      </div>
+    </section>
+
+    <p class="footnote">這個檔案不會呼叫網路、不會持久化、不含真實 bearer 或 routing credential。重新整理頁面即清空狀態；它只用來感受 v1 contract。</p>
+  </div>
+
+  <script>
+  // ===== 可攜式純邏輯模組：不讀 DOM、不做網路、不做持久化 =====
+  const LinkStartContract = (() => {
+    const clone = (value) => JSON.parse(JSON.stringify(value));
+
+    function manifestFor(profile) {
+      const selfContained = profile === "self-contained";
+      return {
+        protocolMajor: "v1",
+        appId: selfContained ? "demo.linkstart.decision-card" : "demo.linkstart.local-dashboard",
+        displayName: selfContained ? "決策卡片" : "本機專案儀表板",
+        appVersion: "0.1-prototype",
+        entry: selfContained
+          ? { kind: "self_contained_html", location: "file:///…/decision-card.html" }
+          : { kind: "localhost_app", location: "http://127.0.0.1:4173/" },
+        originPolicy: selfContained
+          ? { kind: "opaque_file", exactOrigin: "null" }
+          : { kind: "exact", exactOrigin: "http://127.0.0.1:4173" },
+        requestedCapabilities: [
+          "event:submit",
+          "event:cancel-own-received",
+          "event:read-own-status",
+          "feedback:stream-own"
+        ],
+        structuredInputs: ["single_choice", "free_text"],
+        intentionallyAbsent: ["connectionId", "bearer", "toolApproval", "permissionRelay"]
+      };
+    }
+
+    function initialState(profile = "self-contained") {
+      const manifest = manifestFor(profile);
+      return {
+        profile,
+        manifest,
+        registration: { status: "unregistered", registrationId: null },
+        launchGrant: { status: "none", masked: null, expires: null },
+        appInstance: {
+          status: "absent",
+          instanceId: null,
+          capabilityInMemory: false,
+          capabilityMasked: null,
+          boundToOneConnection: false
+        },
+        agentConnection: {
+          status: "online",
+          callsign: "松雀-27",
+          locatorVisibleToApp: false,
+          binding: "由 Daemon 內部 capability mapping 決定"
+        },
+        security: {
+          expectedHost: "127.0.0.1:45831",
+          observedHost: "127.0.0.1:45831",
+          expectedOrigin: manifest.originPolicy.exactOrigin,
+          observedOrigin: manifest.originPolicy.exactOrigin,
+          hostGate: "not_checked",
+          originGate: "not_checked",
+          cors: "not_checked",
+          lna: "not_requested",
+          authTransport: "fetch + Authorization header",
+          nativeEventSource: false,
+          querySecret: false,
+          cookieSecret: false
+        },
+        stream: {
+          status: "disconnected",
+          authenticated: false,
+          cursor: "尚無",
+          epoch: "daemon-epoch-1",
+          reconnects: 0,
+          replayedOnLastConnect: 0
+        },
+        events: [],
+        inFlightEventId: null,
+        feedback: [],
+        activeQuestion: null,
+        approvalBoundary: {
+          permissionRelayDeclared: false,
+          appCanApproveTools: false,
+          rejectedAttempts: 0,
+          lastAttempt: "尚無"
+        },
+        counters: { event: 1, receipt: 1, sequence: 1, feedback: 1, cursor: 0, transition: 0 },
+        lastTransition: { title: "原型已就緒", detail: "尚未建立 registration；請自由操作或選一個引導案例。", tone: "ok" },
+        history: []
+      };
+    }
+
+    function finish(state, title, detail, tone = "ok") {
+      state.counters.transition += 1;
+      state.lastTransition = { title, detail, tone };
+      state.history.unshift({ step: state.counters.transition, title, detail, tone });
+      state.history = state.history.slice(0, 12);
+      return state;
+    }
+
+    function reject(state, code, detail) {
+      return finish(state, `拒絕：${code}`, detail, "danger");
+    }
+
+    function checkGates(state, requireCapability) {
+      if (state.security.observedHost !== state.security.expectedHost) return "host_mismatch";
+      if (state.security.observedOrigin !== state.security.expectedOrigin) return "origin_mismatch";
+      if (state.security.lna === "denied") return "lna_denied";
+      if (state.security.lna !== "allowed") return "lna_permission_required";
+      if (requireCapability && !state.appInstance.capabilityInMemory) return "capability_missing";
+      return null;
+    }
+
+    function markGateSuccess(state) {
+      state.security.hostGate = "exact_match";
+      state.security.originGate = state.security.expectedOrigin === "null" ? "null + grant（不是身份）" : "exact_match";
+      state.security.cors = `只回 ${state.security.expectedOrigin}`;
+    }
+
+    function promoteNext(state) {
+      const next = state.events.find((event) => event.status === "received" && event.eventId !== state.inFlightEventId);
+      state.inFlightEventId = next ? next.eventId : null;
+    }
+
+    function submitEvent(state, kind, value, extra = {}) {
+      if (state.registration.status !== "registered") return reject(state, "registration_missing", "沒有 App Registration，不建立 Event Receipt。"), false;
+      if (state.appInstance.status !== "connected") return reject(state, "instance_not_connected", "App Instance 尚未連線或已被關閉。"), false;
+      const gateError = checkGates(state, true);
+      if (gateError) return reject(state, gateError, "Host、Origin、LNA 與 capability 必須同時通過，才能收件。"), false;
+      if (state.agentConnection.status !== "online") return reject(state, "origin_offline", "Origin Session 離線：不收件、不排隊，也不另開替代 session。"), false;
+
+      markGateSuccess(state);
+      const eventId = `evt-${String(state.counters.event).padStart(3, "0")}`;
+      const receiptId = `rcpt-${String(state.counters.receipt).padStart(3, "0")}`;
+      const event = {
+        eventId,
+        type: kind,
+        value,
+        canonicalPayload: JSON.stringify({ type: kind, value, ...extra }),
+        sequence: state.counters.sequence,
+        receiptId,
+        receiptMeaning: "已驗證並寫入 durable journal（模擬）",
+        status: "received",
+        deliveryAck: null,
+        failureReason: null,
+        approvalSemantic: false,
+        structured: extra
+      };
+      state.counters.event += 1;
+      state.counters.receipt += 1;
+      state.counters.sequence += 1;
+      state.events.push(event);
+      if (!state.inFlightEventId) state.inFlightEventId = eventId;
+      finish(state, "Event Receipt 已建立", `${eventId} 配到 instance-local sequence ${event.sequence}；Receipt 不代表 adapter 已接受。`);
+      return true;
+    }
+
+    function addFeedback(state, type, text, inReplyToEventId = null) {
+      if (state.appInstance.status !== "connected") return reject(state, "instance_not_connected", "沒有可接收 Agent Feedback 的 App Instance。"), false;
+      const feedbackId = `fb-${String(state.counters.feedback).padStart(3, "0")}`;
+      state.counters.feedback += 1;
+      state.counters.cursor += 1;
+      const observed = state.stream.status === "connected";
+      state.feedback.push({
+        feedbackId,
+        type,
+        text,
+        inReplyToEventId,
+        transportCursor: `${state.stream.epoch}:${state.counters.cursor}`,
+        observed,
+        replayed: false
+      });
+      if (observed) state.stream.cursor = `${state.stream.epoch}:${state.counters.cursor}`;
+      return true;
+    }
+
+    function reduce(previous, action) {
+      if (action.type === "RESET") return finish(initialState(previous.profile), "已重設", "所有模擬狀態已清空；沒有真實 persistence。", "warn");
+      if (action.type === "SET_PROFILE") return finish(initialState(action.profile), "入口已切換", action.profile === "self-contained" ? "Manifest 現在描述直接開啟的 self-contained HTML。" : "Manifest 現在描述 exact-origin localhost App。", "warn");
+
+      const state = clone(previous);
+
+      switch (action.type) {
+        case "REGISTER":
+          if (state.registration.status === "registered") return reject(state, "already_registered", "Manifest 已登錄；重複操作不建立第二份 registration。");
+          state.registration = { status: "registered", registrationId: state.profile === "self-contained" ? "reg-file-01" : "reg-local-01" };
+          return finish(state, "App Manifest 已登錄", "Manifest 只有識別、入口、Origin policy 與 protocol-visible capabilities；沒有 routing credential。", "ok");
+
+        case "ISSUE_GRANT":
+          if (state.registration.status !== "registered") return reject(state, "registration_missing", "必須先由可信的 register-app 操作建立 registration。");
+          state.launchGrant = { status: "issued", masked: "grant_••••7K2Q", expires: "單次、最長 5 分鐘（模擬）" };
+          return finish(state, "一次性 launch grant 已核發", "Grant 只透過 URL fragment 交給 App；它不是永久 App capability。", "ok");
+
+        case "EXPIRE_GRANT":
+          if (state.launchGrant.status !== "issued") return reject(state, "no_live_grant", "目前沒有可過期的 launch grant。");
+          state.launchGrant.status = "expired";
+          return finish(state, "Launch grant 已過期", "之後的 redemption 必須 fail closed。", "warn");
+
+        case "ALLOW_LNA":
+          state.security.lna = "allowed";
+          return finish(state, "瀏覽器本機連線已允許", "LNA 只是 browser policy；它沒有取代 sender capability。", "ok");
+
+        case "DENY_LNA":
+          state.security.lna = "denied";
+          state.stream.status = "disconnected";
+          state.stream.authenticated = false;
+          return finish(state, "瀏覽器拒絕本機連線", "Client 應顯示 lna_denied，不得降級到無驗證通道。", "warn");
+
+        case "REDEEM_GRANT": { 
+          if (state.registration.status !== "registered") return reject(state, "registration_missing", "沒有 registration，不能兌換 grant。");
+          if (state.launchGrant.status === "expired") return reject(state, "launch_grant_expired", "過期 grant 不建立 App Instance。");
+          if (state.launchGrant.status !== "issued") return reject(state, "launch_grant_missing", "需要一個尚未用過的一次性 grant。");
+          const gateError = checkGates(state, false);
+          if (gateError) return reject(state, gateError, "Redemption 仍須通過 canonical Host、registered Origin 與 browser LNA gate。");
+          markGateSuccess(state);
+          state.launchGrant.status = "redeemed";
+          state.appInstance = {
+            status: "connected",
+            instanceId: state.profile === "self-contained" ? "inst-file-A" : "inst-local-A",
+            capabilityInMemory: true,
+            capabilityMasked: "cap_••••9F2A（只在頁面記憶體）",
+            boundToOneConnection: true
+          };
+          return finish(state, "App Instance 已建立", "一次性 grant 已作廢；新的 bearer capability 只綁這個 Instance 與唯一 Agent Connection。", "ok");
+        }
+
+        case "CONNECT_STREAM": { 
+          if (state.appInstance.status !== "connected") return reject(state, "instance_not_connected", "先完成 launch-grant redemption。");
+          const gateError = checkGates(state, true);
+          if (gateError) return reject(state, gateError, "fetch SSE 必須重新驗 Host、Origin、LNA 與 Authorization capability。");
+          markGateSuccess(state);
+          state.stream.status = "connected";
+          state.stream.authenticated = true;
+          state.stream.replayedOnLastConnect = 0;
+          return finish(state, "SSE 已驗證連線", "使用 fetch + Authorization；沒有 native EventSource、cookie 或 query secret。", "ok");
+        }
+
+        case "DISCONNECT_STREAM":
+          if (state.stream.status !== "connected") return reject(state, "stream_not_connected", "目前沒有可中斷的 SSE stream。");
+          state.stream.status = "reconnecting";
+          state.stream.authenticated = false;
+          return finish(state, "SSE 已中斷", `最後 cursor 保留為 ${state.stream.cursor}；Agent Feedback 仍可先寫入 journal。`, "warn");
+
+        case "RECONNECT_STREAM": { 
+          if (state.appInstance.status !== "connected") return reject(state, "instance_not_connected", "關閉的 Instance 不能重連。");
+          const gateError = checkGates(state, true);
+          if (gateError) return reject(state, gateError, "每次 reconnect 都要重新驗 capability；cursor 不是 auth。");
+          markGateSuccess(state);
+          const unseen = state.feedback.filter((item) => !item.observed);
+          unseen.forEach((item) => { item.observed = true; item.replayed = true; });
+          state.stream.status = "connected";
+          state.stream.authenticated = true;
+          state.stream.reconnects += 1;
+          state.stream.replayedOnLastConnect = unseen.length;
+          if (state.feedback.length) state.stream.cursor = state.feedback[state.feedback.length - 1].transportCursor;
+          return finish(state, "SSE 已重新驗證並恢復", unseen.length ? `從同 Instance／epoch cursor replay ${unseen.length} 則未觀察 Feedback。` : "沒有需要 replay 的 Feedback；cursor 仍不是 eventId。", "ok");
+        }
+
+        case "TAMPER_ORIGIN":
+          state.security.observedOrigin = "https://evil.example";
+          state.security.originGate = "mismatch";
+          return finish(state, "Observed Origin 已被偽造", "下一個 redemption、request 或 SSE reconnect 應在 capability 使用前拒絕。", "warn");
+
+        case "TAMPER_HOST":
+          state.security.observedHost = "evil.example:45831";
+          state.security.hostGate = "mismatch";
+          return finish(state, "Observed Host 已被偽造", "下一個操作應以 host_mismatch fail closed。", "warn");
+
+        case "RESTORE_GATES":
+          state.security.observedHost = state.security.expectedHost;
+          state.security.observedOrigin = state.security.expectedOrigin;
+          state.security.hostGate = "not_checked";
+          state.security.originGate = "not_checked";
+          return finish(state, "Host／Origin 已恢復", "Observed 值再次符合 registration 與 canonical daemon authority。", "ok");
+
+        case "SUBMIT_EVENT":
+          submitEvent(state, action.kind || "choice", action.value || "採用建議方案");
+          return state;
+
+        case "ACK_INFLIGHT": { 
+          if (!state.inFlightEventId) return reject(state, "no_inflight_event", "目前沒有等待 adapter 接受的 App Event。");
+          const event = state.events.find((item) => item.eventId === state.inFlightEventId);
+          if (!event || event.status !== "received") return reject(state, "event_not_received", "只有 received Event 可以產生 Delivery Ack。");
+          event.status = "delivered";
+          event.deliveryAck = `ack-${event.eventId}`;
+          const delivered = event.eventId;
+          state.inFlightEventId = null;
+          promoteNext(state);
+          return finish(state, "Delivery Ack 已產生", `${delivered} 已由 adapter 接受；不表示模型處理完成，也不表示工具已核准。`, "ok");
+        }
+
+        case "CANCEL_INFLIGHT": { 
+          if (!state.inFlightEventId) return reject(state, "no_cancellable_event", "只有仍為 received 的 in-flight Event 可取消；delivered 不能撤回。");
+          const event = state.events.find((item) => item.eventId === state.inFlightEventId);
+          if (!event || event.status !== "received") return reject(state, "event_not_cancellable", "Ack 後不能取消，只能送新的修正 Event。");
+          event.status = "cancelled";
+          const cancelled = event.eventId;
+          state.inFlightEventId = null;
+          promoteNext(state);
+          return finish(state, "Event 已在 Ack 前取消", `${cancelled} 進入 terminal cancelled；沒有 Delivery Ack。`, "warn");
+        }
+
+        case "FAIL_INFLIGHT": { 
+          if (!state.inFlightEventId) return reject(state, "no_inflight_event", "目前沒有可標記失敗的 Event。");
+          const event = state.events.find((item) => item.eventId === state.inFlightEventId);
+          event.status = "failed";
+          event.failureReason = action.reason || "adapter_rejected";
+          const failed = event.eventId;
+          state.inFlightEventId = null;
+          promoteNext(state);
+          return finish(state, "Event 投遞失敗", `${failed} → failed(${event.failureReason})；失敗可觀測，沒有假裝完成。`, "danger");
+        }
+
+        case "RESEND_SAME": { 
+          const event = state.events[state.events.length - 1];
+          if (!event) return reject(state, "no_event_to_resend", "先建立一個 App Event。");
+          return finish(state, "既有 Receipt 已重用", `${event.eventId} 與 canonical payload 相同：回 ${event.receiptId}／${event.status}，不配置新 sequence。`, "ok");
+        }
+
+        case "RESEND_CONFLICT": { 
+          const event = state.events[state.events.length - 1];
+          if (!event) return reject(state, "no_event_to_conflict", "先建立一個 App Event。");
+          return reject(state, "event_id_conflict", `${event.eventId} 被配上不同 payload；不覆寫原 Event，也不建立 Receipt。`);
+        }
+
+        case "AGENT_FEEDBACK": { 
+          const related = [...state.events].reverse().find((item) => item.status === "delivered");
+          if (!addFeedback(state, "message", "Agent：我已收到事件，這是獨立的回饋，不會把 Event 變成 completed。", related ? related.eventId : null)) return state;
+          const mode = state.stream.status === "connected" ? "已經由 SSE 即時觀察。" : "目前 stream 不在線，等待同 Instance cursor replay。";
+          return finish(state, "Agent Feedback 已寫入 journal", mode, "ok");
+        }
+
+        case "ASK_QUESTION":
+          if (!addFeedback(state, "structured_question", "Agent 問：要採用哪一個呈現密度？", null)) return state;
+          state.activeQuestion = {
+            questionId: "q-density-01",
+            text: "要採用哪一個呈現密度？",
+            options: ["精簡", "平衡", "完整"],
+            status: "waiting",
+            answer: null,
+            toolApproval: false
+          };
+          return finish(state, "結構化問題已送到 App", "這是 Agent Feedback；回答會形成新的 App Event，不會變成 permission verdict。", "ok");
+
+        case "ANSWER_QUESTION":
+          if (!state.activeQuestion || state.activeQuestion.status !== "waiting") return reject(state, "no_active_question", "目前沒有等待回答的結構化問題。");
+          if (!submitEvent(state, "structured_answer", action.answer || "平衡", { questionId: state.activeQuestion.questionId, toolApproval: false })) return state;
+          state.activeQuestion.status = "answered";
+          state.activeQuestion.answer = action.answer || "平衡";
+          state.lastTransition = {
+            title: "結構化回答已成為 App Event",
+            detail: `回答「${state.activeQuestion.answer}」已收件；approvalSemantic 仍為 false。`,
+            tone: "ok"
+          };
+          state.history[0] = { step: state.counters.transition, ...state.lastTransition };
+          return state;
+
+        case "TRY_TOOL_APPROVAL":
+          state.approvalBoundary.rejectedAttempts += 1;
+          state.approvalBoundary.lastAttempt = "App 傳入『同意執行 Bash』→ protocol 拒絕";
+          return reject(state, "approval_forbidden", "App input 只能是 untrusted App Event；v1 沒有 Claude permission relay，也不替 Codex 回 approval request。");
+
+        case "SET_ORIGIN_OFFLINE":
+          state.agentConnection.status = "offline";
+          state.events.filter((event) => event.status === "received").forEach((event) => {
+            event.status = "failed";
+            event.failureReason = "origin_offline";
+          });
+          state.inFlightEventId = null;
+          return finish(state, "Origin Session 已離線", "尚未 Delivery Ack 的 Event 轉 failed(origin_offline)；不排隊、不 cold resume。", "danger");
+
+        case "SET_ORIGIN_ONLINE":
+          state.agentConnection.status = "online";
+          return finish(state, "Origin Session 已回到線上", "這只模擬明確 rebind 完成；既有 failed Event 不會復活。", "ok");
+
+        case "REVOKE_INSTANCE":
+          state.appInstance.status = "closed";
+          state.appInstance.capabilityInMemory = false;
+          state.appInstance.capabilityMasked = null;
+          state.stream.status = "disconnected";
+          state.stream.authenticated = false;
+          return finish(state, "App Instance 已關閉並 revoke", "後續 request 與 SSE reconnect 都必須 fail closed。", "danger");
+
+        default:
+          return reject(state, "unknown_action", `未知操作 ${action.type}`);
+      }
+    }
+
+    return { initialState, reduce };
+  })();
+  // ===== 純邏輯模組結束 =====
+
+  // ===== Throwaway 頁面殼：只負責 dispatch 與呈現 =====
+  const scenarios = [
+    {
+      id: "happy",
+      label: "Self-contained happy path",
+      profile: "self-contained",
+      description: "從直接開啟的 HTML 出發。注意 Origin 雖是 null，真正身份仍來自單次 grant 與 instance capability；Receipt、Ack、Feedback 各自出現。",
+      steps: [
+        ["登錄不含祕密的 Manifest", { type: "REGISTER" }],
+        ["核發一次性 fragment grant", { type: "ISSUE_GRANT" }],
+        ["模擬使用者允許本機連線", { type: "ALLOW_LNA" }],
+        ["兌換記憶體內 capability", { type: "REDEEM_GRANT" }],
+        ["用 fetch + Authorization 連 SSE", { type: "CONNECT_STREAM" }],
+        ["送出一個 App Event，取得 Receipt", { type: "SUBMIT_EVENT", kind: "choice", value: "採用建議方案" }],
+        ["Adapter 接受，取得 Delivery Ack", { type: "ACK_INFLIGHT" }],
+        ["Agent 送回獨立 Feedback", { type: "AGENT_FEEDBACK" }]
+      ]
+    },
+    {
+      id: "localhost",
+      label: "localhost + 結構化問題",
+      profile: "localhost",
+      description: "既有 localhost App 使用 exact Origin。Agent 主動提問，App 的選項回答會成為新 Event；即使文字是『同意』也不具 approval 語意。",
+      steps: [
+        ["登錄 exact-origin localhost Manifest", { type: "REGISTER" }],
+        ["核發 launch grant", { type: "ISSUE_GRANT" }],
+        ["允許本機連線", { type: "ALLOW_LNA" }],
+        ["建立 App Instance", { type: "REDEEM_GRANT" }],
+        ["連上 authenticated SSE", { type: "CONNECT_STREAM" }],
+        ["Agent 發出 structured question", { type: "ASK_QUESTION" }],
+        ["回答『平衡』，形成 App Event", { type: "ANSWER_QUESTION", answer: "平衡" }],
+        ["Adapter 接受回答事件", { type: "ACK_INFLIGHT" }],
+        ["嘗試把 App 回答升格成 tool approval", { type: "TRY_TOOL_APPROVAL" }]
+      ]
+    },
+    {
+      id: "errors",
+      label: "Trust gate／取消／失敗",
+      profile: "self-contained",
+      description: "刻意走錯路：Origin mismatch、grant 過期、Ack 前取消、Origin offline。每次都應清楚 fail closed，而不是留下半成功狀態。",
+      steps: [
+        ["登錄 Manifest", { type: "REGISTER" }],
+        ["核發 grant", { type: "ISSUE_GRANT" }],
+        ["允許本機連線", { type: "ALLOW_LNA" }],
+        ["把 observed Origin 改成惡意網站", { type: "TAMPER_ORIGIN" }],
+        ["嘗試兌換：應拒絕", { type: "REDEEM_GRANT" }],
+        ["恢復 exact gates", { type: "RESTORE_GATES" }],
+        ["讓 grant 過期", { type: "EXPIRE_GRANT" }],
+        ["再次兌換：仍應拒絕", { type: "REDEEM_GRANT" }],
+        ["核發新的單次 grant", { type: "ISSUE_GRANT" }],
+        ["成功建立 Instance", { type: "REDEEM_GRANT" }],
+        ["送出 Event 取得 Receipt", { type: "SUBMIT_EVENT", kind: "text", value: "先不要執行" }],
+        ["在 Ack 前取消", { type: "CANCEL_INFLIGHT" }],
+        ["讓 Origin Session 離線", { type: "SET_ORIGIN_OFFLINE" }],
+        ["離線時送 Event：不收件、不排隊", { type: "SUBMIT_EVENT", kind: "text", value: "這則不能排隊" }]
+      ]
+    },
+    {
+      id: "replay",
+      label: "SSE reconnect／replay",
+      profile: "localhost",
+      description: "先觀察一則即時 Feedback，再斷線。斷線期間的新 Feedback 應在同 Instance／epoch cursor 重連後 replay；eventId 去重與 SSE cursor 是兩件事。",
+      steps: [
+        ["登錄 Manifest", { type: "REGISTER" }],
+        ["核發 grant", { type: "ISSUE_GRANT" }],
+        ["允許本機連線", { type: "ALLOW_LNA" }],
+        ["建立 Instance", { type: "REDEEM_GRANT" }],
+        ["連上 authenticated SSE", { type: "CONNECT_STREAM" }],
+        ["送 Event 並取得 Receipt", { type: "SUBMIT_EVENT", kind: "choice", value: "開始 replay 測試" }],
+        ["Adapter 接受 Event", { type: "ACK_INFLIGHT" }],
+        ["收到第一則即時 Feedback", { type: "AGENT_FEEDBACK" }],
+        ["模擬 SSE 斷線", { type: "DISCONNECT_STREAM" }],
+        ["斷線期間寫入第二則 Feedback", { type: "AGENT_FEEDBACK" }],
+        ["重驗 capability、帶 cursor 重連", { type: "RECONNECT_STREAM" }],
+        ["同 eventId／同 payload：重用 Receipt", { type: "RESEND_SAME" }],
+        ["同 eventId／不同 payload：conflict", { type: "RESEND_CONFLICT" }]
+      ]
+    }
+  ];
+
+  let state = LinkStartContract.initialState();
+  let activeScenarioId = "happy";
+  let scenarioStep = 0;
+
+  const esc = (value) => String(value ?? "—").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[char]));
+  const badgeTone = (value) => /online|connected|registered|redeemed|allowed|delivered|exact|已/.test(value) ? "ok" : /offline|failed|mismatch|denied|expired|closed|拒絕/.test(value) ? "danger" : "warn";
+  const kv = (pairs) => `<dl class="kv">${pairs.map(([key, value, cls = ""]) => `<dt>${esc(key)}</dt><dd class="${cls}">${value}</dd>`).join("")}</dl>`;
+
+  function dispatch(action) {
+    state = LinkStartContract.reduce(state, action);
+    render();
+  }
+
+  function renderStatus() {
+    const items = [
+      ["入口", state.profile === "self-contained" ? "self-contained HTML" : "localhost App"],
+      ["Registration", state.registration.status],
+      ["Instance", state.appInstance.status],
+      ["Origin Session", state.agentConnection.status],
+      ["SSE", state.stream.status],
+      ["Callsign", state.agentConnection.callsign]
+    ];
+    document.getElementById("status-strip").innerHTML = items.map(([key, value]) => `<span class="chip ${badgeTone(value)}"><strong>${esc(key)}</strong>${esc(value)}</span>`).join("");
+  }
+
+  function renderState() {
+    const manifestCaps = state.manifest.requestedCapabilities.map((cap) => `<span>${esc(cap)}</span>`).join("");
+    const absent = state.manifest.intentionallyAbsent.map((item) => `<span>${esc(item)}</span>`).join("");
+    const events = state.events.length ? `
+      <div class="table-wrap"><table>
+        <thead><tr><th>sequence／eventId</th><th>Event</th><th>Event Receipt</th><th>狀態</th><th>Delivery Ack／失敗</th><th>approval</th></tr></thead>
+        <tbody>${state.events.map((event) => `<tr>
+          <td><span class="mono">${event.sequence}／${esc(event.eventId)}</span>${state.inFlightEventId === event.eventId ? "<br><strong>目前 in-flight</strong>" : ""}</td>
+          <td>${esc(event.type)}<br><span class="mono">${esc(event.value)}</span></td>
+          <td><span class="mono">${esc(event.receiptId)}</span><br>${esc(event.receiptMeaning)}</td>
+          <td><span class="chip ${badgeTone(event.status)}">${esc(event.status)}</span></td>
+          <td>${esc(event.deliveryAck || event.failureReason || "尚無")}</td>
+          <td class="never">${event.approvalSemantic ? "是" : "永遠否"}</td>
+        </tr>`).join("")}</tbody>
+      </table></div>` : `<div class="empty">尚無 App Event；驗證成功後才會建立 Receipt。</div>`;
+
+    const feedback = state.feedback.length ? `<div class="feedback-list">${[...state.feedback].reverse().map((item) => `<div class="feedback-item ${item.replayed ? "replayed" : ""}">
+      <div class="feedback-meta"><span><span class="mono">${esc(item.feedbackId)}</span> · ${esc(item.type)}</span><span class="mono">${esc(item.transportCursor)}</span></div>
+      <div>${esc(item.text)}</div>
+      <div class="feedback-meta"><span>inReplyTo: ${esc(item.inReplyToEventId || "無（主動 Feedback）")}</span><span>${item.replayed ? "重連 replay" : item.observed ? "已觀察" : "等待 replay"}</span></div>
+    </div>`).join("")}</div>` : `<div class="empty">尚無 Agent Feedback。</div>`;
+
+    const question = state.activeQuestion ? `<div class="question-box">
+      <p><strong>${esc(state.activeQuestion.text)}</strong><br><small>狀態：${esc(state.activeQuestion.status)}；toolApproval：<span class="never">false</span>${state.activeQuestion.answer ? `；回答：${esc(state.activeQuestion.answer)}` : ""}</small></p>
+      <div class="question-options">${state.activeQuestion.options.map((option) => `<button class="action answer-question" data-answer="${esc(option)}">回答「${esc(option)}」</button>`).join("")}</div>
+    </div>` : `<div class="empty">尚無 structured question；Agent 可主動發起。</div>`;
+
+    const history = state.history.length ? `<div class="history-list">${state.history.map((item) => `<div class="history-item"><strong>#${item.step} ${esc(item.title)}</strong><br>${esc(item.detail)}</div>`).join("")}</div>` : `<div class="empty">尚無操作紀錄。</div>`;
+
+    document.getElementById("state-grid").innerHTML = `
+      <article class="card wide">
+        <h3>App Manifest（持久描述，不含祕密）</h3>
+        ${kv([
+          ["protocolMajor", `<code>${esc(state.manifest.protocolMajor)}</code>`],
+          ["appId", `<code>${esc(state.manifest.appId)}</code>`],
+          ["顯示名稱／版本", `${esc(state.manifest.displayName)}／${esc(state.manifest.appVersion)}`],
+          ["入口", `<code>${esc(state.manifest.entry.kind)}</code> · ${esc(state.manifest.entry.location)}`],
+          ["Origin policy", `<code>${esc(state.manifest.originPolicy.kind)}</code> · <code>${esc(state.manifest.originPolicy.exactOrigin)}</code>`],
+          ["申請 capabilities", `<div class="caps">${manifestCaps}</div>`],
+          ["刻意不放進 Manifest", `<div class="caps">${absent}</div>`, "never"]
+        ])}
+      </article>
+      <article class="card">
+        <h3>Registration／Launch／Instance</h3>
+        ${kv([
+          ["Registration", esc(state.registration.status)],
+          ["registrationId", `<code>${esc(state.registration.registrationId)}</code>`],
+          ["Launch grant", `<span class="secret">${esc(state.launchGrant.masked || "不存在")}</span> · ${esc(state.launchGrant.status)}`],
+          ["Grant 生命週期", esc(state.launchGrant.expires)],
+          ["App Instance", `<code>${esc(state.appInstance.instanceId)}</code> · ${esc(state.appInstance.status)}`],
+          ["Bearer capability", `<span class="secret">${esc(state.appInstance.capabilityMasked || "不存在")}</span>`],
+          ["唯一 connection binding", state.appInstance.boundToOneConnection ? "是" : "否"]
+        ])}
+      </article>
+      <article class="card">
+        <h3>Origin Session／Callsign</h3>
+        <p class="card-note">Callsign 只給人看；App 看不到 connectionId，也不能靠它 routing。</p>
+        ${kv([
+          ["Origin 狀態", esc(state.agentConnection.status)],
+          ["Callsign", `<strong>${esc(state.agentConnection.callsign)}</strong>`],
+          ["connectionId 暴露給 App", `<span class="never">${state.agentConnection.locatorVisibleToApp ? "是" : "否"}</span>`],
+          ["Routing", esc(state.agentConnection.binding)]
+        ])}
+      </article>
+      <article class="card wide">
+        <h3>Exact Host／Origin／CORS／LNA</h3>
+        ${kv([
+          ["Expected Host", `<code>${esc(state.security.expectedHost)}</code>`],
+          ["Observed Host", `<code>${esc(state.security.observedHost)}</code> · ${esc(state.security.hostGate)}`],
+          ["Expected Origin", `<code>${esc(state.security.expectedOrigin)}</code>`],
+          ["Observed Origin", `<code>${esc(state.security.observedOrigin)}</code> · ${esc(state.security.originGate)}`],
+          ["CORS response", esc(state.security.cors)],
+          ["Local Network Access", esc(state.security.lna)],
+          ["安全判斷", "Origin／Host／CORS／LNA 都不能代替 capability"]
+        ])}
+      </article>
+      <article class="card">
+        <h3>Authenticated SSE</h3>
+        ${kv([
+          ["狀態", esc(state.stream.status)],
+          ["每次連線驗證", state.stream.authenticated ? "已驗 capability" : "尚未驗證"],
+          ["Transport", esc(state.security.authTransport)],
+          ["native EventSource", `<span class="never">${state.security.nativeEventSource ? "使用" : "不使用"}</span>`],
+          ["query／cookie secret", `<span class="never">${state.security.querySecret || state.security.cookieSecret ? "有" : "沒有"}</span>`],
+          ["cursor", `<code>${esc(state.stream.cursor)}</code>`],
+          ["stream epoch", `<code>${esc(state.stream.epoch)}</code>`],
+          ["重連／本次 replay", `${state.stream.reconnects}／${state.stream.replayedOnLastConnect}`]
+        ])}
+      </article>
+      <article class="card full">
+        <h3>App Events：Event Receipt 與 Delivery Ack 分離</h3>
+        <p class="card-note">同時最多一個 in-flight；Receipt＝收件，Ack＝adapter 接受。兩者都不是 processing complete 或 tool approval。</p>
+        ${events}
+      </article>
+      <article class="card wide">
+        <h3>Agent Feedback／SSE replay</h3>
+        <p class="card-note">Feedback 有自己的 feedbackId；SSE cursor 只用於同 Instance／epoch stream resume，不取代 eventId。</p>
+        ${feedback}
+      </article>
+      <article class="card">
+        <h3>Structured question</h3>
+        ${question}
+      </article>
+      <article class="card">
+        <h3>Permission 邊界</h3>
+        ${kv([
+          ["Claude permission relay", `<span class="never">${state.approvalBoundary.permissionRelayDeclared ? "已宣告" : "未宣告"}</span>`],
+          ["App 可 tool-approve", `<span class="never">${state.approvalBoundary.appCanApproveTools ? "是" : "否"}</span>`],
+          ["拒絕次數", String(state.approvalBoundary.rejectedAttempts)],
+          ["最近嘗試", esc(state.approvalBoundary.lastAttempt)]
+        ])}
+      </article>
+      <article class="card wide">
+        <h3>最近 12 次狀態轉移</h3>
+        ${history}
+      </article>`;
+
+    document.querySelectorAll(".answer-question").forEach((button) => button.addEventListener("click", () => dispatch({ type: "ANSWER_QUESTION", answer: button.dataset.answer })));
+  }
+
+  function renderScenario() {
+    document.getElementById("scenario-tabs").innerHTML = scenarios.map((scenario) => `<button class="tab ${scenario.id === activeScenarioId ? "active" : ""}" data-scenario="${scenario.id}" role="tab">${esc(scenario.label)}</button>`).join("");
+    const scenario = scenarios.find((item) => item.id === activeScenarioId);
+    document.getElementById("scenario-body").innerHTML = `
+      <h3>${esc(scenario.label)}</h3>
+      <p>${esc(scenario.description)}</p>
+      <div class="steps">${scenario.steps.map(([label], index) => `<button class="step ${index < scenarioStep ? "done" : index === scenarioStep ? "current" : ""}" data-step="${index}" ${index !== scenarioStep ? "disabled" : ""}>
+        <span class="num">${index + 1}</span><span>${esc(label)}</span><small>${index < scenarioStep ? "已完成" : index === scenarioStep ? "現在按這裡" : "等待前一步"}</small>
+      </button>`).join("")}</div>`;
+
+    document.querySelectorAll("[data-scenario]").forEach((button) => button.addEventListener("click", () => {
+      activeScenarioId = button.dataset.scenario;
+      const next = scenarios.find((item) => item.id === activeScenarioId);
+      scenarioStep = 0;
+      state = LinkStartContract.initialState(next.profile);
+      state = LinkStartContract.reduce(state, { type: "RESET" });
+      render();
+    }));
+    document.querySelectorAll("[data-step]").forEach((button) => button.addEventListener("click", () => {
+      const index = Number(button.dataset.step);
+      if (index !== scenarioStep) return;
+      const [, action] = scenario.steps[index];
+      state = LinkStartContract.reduce(state, action);
+      scenarioStep += 1;
+      render();
+    }));
+  }
+
+  function render() {
+    renderStatus();
+    const last = document.getElementById("last-change");
+    last.className = `last-change ${state.lastTransition.tone}`;
+    last.innerHTML = `<strong>${esc(state.lastTransition.title)}</strong><span>${esc(state.lastTransition.detail)}</span>`;
+    renderState();
+    renderScenario();
+  }
+
+  document.querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", () => {
+    const action = { type: button.dataset.action };
+    if (button.dataset.profile) action.profile = button.dataset.profile;
+    if (button.dataset.kind) action.kind = button.dataset.kind;
+    if (button.dataset.value) action.value = button.dataset.value;
+    dispatch(action);
+  }));
+  document.getElementById("send-text").addEventListener("click", () => {
+    const input = document.getElementById("event-text");
+    dispatch({ type: "SUBMIT_EVENT", kind: "text", value: input.value.trim() || "（空白）" });
+  });
+
+  render();
+  </script>
+</body>
+</html>

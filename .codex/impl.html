@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>LinkStart main.rs 模組化拆分 — 進度帳本</title>
+<style>
+body{font:15px/1.7 "Segoe UI",system-ui,sans-serif;max-width:1000px;margin:2rem auto;padding:0 1.5rem;background:#0f1115;color:#e6e9ef}
+h1{font-size:1.6rem;border-bottom:2px solid #2b3140;padding-bottom:.5rem}
+h2{font-size:1.15rem;margin-top:2rem;color:#8fd0ff}
+table{border-collapse:collapse;width:100%;margin:.6rem 0}
+th,td{border:1px solid #2b3140;padding:.4rem .6rem;text-align:left;vertical-align:top}
+th{background:#1a1f2b}
+code{background:#1a1f2b;padding:.1rem .3rem;border-radius:3px;font-size:.9em}
+.ok{color:#7ee787}.pend{color:#d29922}.fail{color:#ff7b72}
+ul{margin:.4rem 0}
+</style>
+</head>
+<body>
+<h1>LinkStart <code>src/main.rs</code> 模組化拆分 — 進度帳本</h1>
+<p><strong>建立時間：</strong>2026-08-27 17:24 CST ｜ <strong>基線 HEAD：</strong><code>2873e48</code>（工作區乾淨，僅有未追蹤的 <code>.claude/</code>、<code>CONTEXT.md</code>）</p>
+
+<h2>目前階段</h2>
+<p class="ok">階段 3（完成）：8 個模組已拆分，全部驗收項目通過。<code>src/main.rs</code> 1535 → 170 行。</p>
+
+<h2>任務界線</h2>
+<ul>
+<li>目標：<code>src/main.rs</code>（1535 行）純機械拆成 8 個模組，零行為變更。</li>
+<li>可寫檔：<code>src/{main,cli,util,help,daemon,store,boot_page,server}.rs</code>、本帳本。</li>
+<li>禁止：改 <code>tests/</code>、<code>plugins/</code>、<code>web/</code>、<code>examples/</code>、<code>Cargo.toml</code>；禁止 commit/push；禁止改任何字串／JSON 欄位／錯誤訊息／中文註解。</li>
+<li>模組項目一律 <code>pub(crate)</code>（<code>main</code> 除外）；<code>LINK_START_BOOT</code> 的 <code>r##"…"##</code> 逐位元組保留。</li>
+</ul>
+
+<h2>已讀檔案</h2>
+<table>
+<tr><th>檔案</th><th>用途</th></tr>
+<tr><td><code>src/main.rs</code>（全 1535 行）</td><td>拆分來源，已完整讀取兩段（1-1205、1206-1536）</td></tr>
+<tr><td><code>Cargo.toml</code></td><td>確認 bin-only crate、無 lib target、dev-dep 只有 tempfile</td></tr>
+<tr><td><code>tests/http_roundtrip.rs</code>、<code>tests/lifecycle_cli.rs</code>（開頭）</td><td>確認為黑箱整合測試，走 <code>CARGO_BIN_EXE_linkstart</code>，不 import crate 內部項目 → 拆分不影響測試可見性</td></tr>
+</table>
+
+<h2>決策</h2>
+<table>
+<tr><th>#</th><th>決策</th><th>理由</th></tr>
+<tr><td>D1</td><td>所有搬出的項目一律標 <code>pub(crate)</code>，含 struct 欄位</td><td>跨模組存取必需；欄位（如 <code>StartArgs.state</code>、<code>AppState.store</code>）被其他模組直接讀取</td></tr>
+<tr><td>D2</td><td><code>Manifest</code>／<code>OriginPolicy</code>／<code>LaunchPage</code> 等 request-response struct 全歸 <code>server.rs</code></td><td>驗收清單指定「<code>RegisterConnection</code> 到 <code>StreamQuery</code>」的連續區段</td></tr>
+<tr><td>D3</td><td><code>cors</code>／<code>preflight_headers</code>／<code>exact_preflight</code>／<code>app_origin</code>／<code>health</code> 歸 <code>server.rs</code></td><td>屬「全部 axum handler／gate／preflight」範圍</td></tr>
+<tr><td>D4</td><td>搬移順序：util → cli → boot_page → help → store → daemon → server → main</td><td>依相依方向由葉往根，每步可獨立 <code>cargo check</code></td></tr>
+<tr><td>D5</td><td>函式／struct 內文一字不改，僅在前面加 <code>pub(crate)</code> 與補 <code>use</code></td><td>驗收第 4 項：git diff 只能呈現搬移與可見性調整</td></tr>
+</table>
+
+<h2>模組相依（規劃）</h2>
+<table>
+<tr><th>模組</th><th>對外使用</th></tr>
+<tr><td><code>util.rs</code></td><td>（無 crate 內相依）</td></tr>
+<tr><td><code>cli.rs</code></td><td>（無 crate 內相依）</td></tr>
+<tr><td><code>boot_page.rs</code></td><td>（無 crate 內相依）</td></tr>
+<tr><td><code>help.rs</code></td><td>util::{PROTOCOL, VERSION}</td></tr>
+<tr><td><code>store.rs</code></td><td>util::{PROTOCOL, VERSION, hash, now}</td></tr>
+<tr><td><code>daemon.rs</code></td><td>cli::{DaemonRecord, StartArgs}, util::{PROTOCOL, VERSION, json_line, output}</td></tr>
+<tr><td><code>server.rs</code></td><td>boot_page, cli::{DaemonRecord, StartArgs}, daemon::process_alive, store::{Notification, Store}, util::*</td></tr>
+<tr><td><code>main.rs</code></td><td>全部（mod 宣告 + dispatch）</td></tr>
+</table>
+
+<h2>實際變更</h2>
+<p><strong>手法：</strong>不手抄任何一行。以 Python 腳本按行號區間從原 <code>main.rs</code> 抽取，再前置手寫 <code>use</code> 標頭。原因：<code>LINK_START_BOOT</code> 有 95 行壓縮 JS 且測試斷言其內容，另有 8 處手工壓縮成單行的函式（<code>Store::status</code>、<code>next_received</code>、<code>ack_event</code>、<code>replay</code>、<code>redeem_grant</code>、<code>receive_event</code>、<code>cancel_event</code>、<code>fail</code>）。手抄＝靜默失敗的主要途徑。</p>
+<table>
+<tr><th>檔案</th><th>行數</th><th>來源行號區間</th><th>內容</th></tr>
+<tr><td><code>util.rs</code></td><td>51</td><td>32-34, 171-187, 550-556, 1523-1535</td><td>PROTOCOL/VERSION/MAX_BODY、now、token、hash、json_line、output、canonical</td></tr>
+<tr><td><code>cli.rs</code></td><td>141</td><td>36-170</td><td>全部 clap 型別 + <code>default_state_dir</code></td></tr>
+<tr><td><code>help.rs</code></td><td>33</td><td>188-212, 557-559</td><td>main_help_json、print_human_help</td></tr>
+<tr><td><code>daemon.rs</code></td><td>199</td><td>363-549</td><td>daemon_control、start_daemon、health_ready、win_process、process_alive、stop_daemon</td></tr>
+<tr><td><code>store.rs</code></td><td>147</td><td>566-695</td><td>Notification、Store + impl</td></tr>
+<tr><td><code>boot_page.rs</code></td><td>105</td><td>1197-1301</td><td>中文註解 3 行 + LINK_START_BOOT + with_link_start_boot</td></tr>
+<tr><td><code>server.rs</code></td><td>756</td><td>561-565, 697-1196, 1302-1522</td><td>AppState、serve、全部 handler／gate／preflight／req-resp struct</td></tr>
+<tr><td><code>main.rs</code></td><td>170</td><td>214-362</td><td>mod 宣告 + use + main() dispatch（目標 ≤300 ✔）</td></tr>
+</table>
+<p><strong>可見性調整：</strong>7 個新模組的所有頂層項目加 <code>pub(crate)</code>。欄位只在跨模組讀取時才加，避免無謂 diff 噪音：<code>cli.rs</code> 全部 struct 欄位（含 <code>DaemonRecord</code> 4 欄）＋ <code>store::Notification</code> 3 欄（被 <code>server::stream</code> 讀取）＋ <code>Store</code> 全部方法（含關聯函式 <code>insert_notification</code>）。<code>AppState</code>／<code>Store</code>／<code>Manifest</code> 等欄位僅在自身模組內使用，維持 private。<code>mod win_process</code> 為 <code>daemon.rs</code> 內部私有模組，未更動（且本機為 WSL2，<code>cfg(windows)</code> 區塊編譯器管不到，只能靠行號抽取保證正確）。</p>
+
+<h2>失敗與重試</h2>
+<table>
+<tr><th>#</th><th>事件</th><th>處置</th></tr>
+<tr><td>F1</td><td>首次 <code>cargo check</code> 出現 1 個 warning：<code>server.rs</code> 的 <code>Notification</code> import 未使用</td><td><code>server::stream</code> 只透過 <code>store.replay()</code> 的推導型別存取 <code>.cursor/.kind/.data</code>，從未具名該型別 → 移除該 import。欄位的 <code>pub(crate)</code> 仍為必要。修正後 warning 歸零。</td></tr>
+<tr><td>F2</td><td><code>cargo fmt --check</code> 要求重排 2 個簽名</td><td><code>host_gate</code>（91→102 字元）與 <code>Store::insert_notification</code>（99→110 字元），純粹因為 <code>pub(crate) </code> 前綴推過 max_width=100。屬可見性調整的必然後果，僅重排參數、未動任何函式主體。已套用 <code>cargo fmt</code>。</td></tr>
+</table>
+
+<h2>驗證結果</h2>
+<p><strong>基線（動 src/ 之前，HEAD=2873e48）：</strong>fmt 乾淨、4 測試全過、browser_acceptance PASS。三項皆有前後對照。</p>
+<table>
+<tr><th>#</th><th>檢查</th><th>狀態</th><th>證據</th></tr>
+<tr><td>1</td><td><code>cargo fmt --check</code></td><td class="ok">PASS</td><td>無輸出（<code>FMT_OK</code>）</td></tr>
+<tr><td>2</td><td><code>cargo test --all-targets</code></td><td class="ok">PASS</td><td>4/4：<code>launch_page_gets_link_start_boot_unless_opted_out</code>、<code>durable_http_round_trip_and_restart</code>、<code>start_reports_json_failure_when_port_is_occupied</code>、<code>lifecycle_json_is_one_truthful_control_result</code>。與基線同樣 4 passed / 0 failed。</td></tr>
+<tr><td>3</td><td><code>python3 tests/browser_acceptance.py</code></td><td class="ok">PASS</td><td><code>browser_acceptance: PASS</code></td></tr>
+<tr><td>4</td><td>git diff 僅搬移</td><td class="ok">PASS</td><td>見下方「機械等價證明」</td></tr>
+<tr><td>5</td><td>中文註解原樣保留</td><td class="ok">PASS</td><td>7 行全數保留：main.rs:26（原 218）、daemon.rs:61-62,144（原 411-412、494）、boot_page.rs:1-3（原 1197-1199）。以 <code>grep -rn '//.*[一-龥]' src/</code> 前後比對，內容逐字相同。</td></tr>
+<tr><td>6</td><td>編譯警告</td><td class="ok">0</td><td><code>cargo check --all-targets</code> 警告與錯誤各 0 筆</td></tr>
+</table>
+
+<h2>機械等價證明</h2>
+<p><code>cargo test</code> 通過不等於機械等價。實際採用的證明是「排序後逐行集合比對」——把舊 <code>main.rs</code>（第 32 行起）與 8 個新檔全部串接，剝除 <code>pub(crate) </code>、剝除行首空白、去空行、排序後 diff：</p>
+<table>
+<tr><th>指標</th><th>結果</th></tr>
+<tr><td>舊檔有效行數</td><td>1499</td></tr>
+<tr><td>新檔合計有效行數</td><td>1581（+82）</td></tr>
+<tr><td>「舊有新無」（<code>&lt;</code>）行</td><td><strong>僅 2 行</strong>，且都是 F2 記錄的 rustfmt 簽名重排：<code>fn host_gate(...)</code>、<code>fn insert_notification(...)</code></td></tr>
+</table>
+<p><strong>+82 的逐項對帳（這一步才讓證明閉合）：</strong>排序比對本身證明不了「沒有重複或悄悄少一行」，必須讓行數差額完全可解釋：</p>
+<pre>1499 − 2（被重排的原始簽名）
+     + 4 + 6（它們重排後的新形式）
+     + 74（新增 use／mod 標頭）
+     = 1581 ✓ 與實測完全吻合</pre>
+<p>標頭 74 行的分佈：util 7、cli 4、help 2、daemon 10、store 10、boot_page 0、server 23、main 18。差額零殘留 —— 沒有任何一行是無法解釋的。</p>
+<p>換言之，除了那 2 個被 <code>pub(crate)</code> 撐爆行寬而重排的簽名之外，原始碼每一行都逐位元組存活，包含 95 行 boot script 與 8 個手工壓縮單行函式。</p>
+
+<h2>項目落點驗證（排序比對補不到的一環）</h2>
+<p>排序比對是「順序盲」的：它證明同一個行集合存在，卻證明不了某一行落在<em>正確的模組</em>。而模組結構本身就是驗收標準，故另以 <code>grep -n '^\(pub(crate) \)\?\(async fn \|fn \|struct \|enum \|const \|impl \|mod \)' src/*.rs</code> 逐一核對：</p>
+<table>
+<tr><th>模組</th><th>應有項目數</th><th>實測</th></tr>
+<tr><td><code>cli.rs</code></td><td>14 型別 + <code>default_state_dir</code> = 15</td><td class="ok">15 ✔ 完全吻合</td></tr>
+<tr><td><code>util.rs</code></td><td>3 常數 + 6 函式 = 9</td><td class="ok">9 ✔</td></tr>
+<tr><td><code>help.rs</code></td><td>2</td><td class="ok">2 ✔</td></tr>
+<tr><td><code>daemon.rs</code></td><td>5 函式 + <code>mod win_process</code> = 6</td><td class="ok">6 ✔</td></tr>
+<tr><td><code>store.rs</code></td><td><code>Notification</code>、<code>Store</code>、<code>impl Store</code></td><td class="ok">3 ✔</td></tr>
+<tr><td><code>boot_page.rs</code></td><td>2</td><td class="ok">2 ✔</td></tr>
+<tr><td><code>server.rs</code></td><td><code>AppState</code> + <code>RegisterConnection</code>…<code>StreamQuery</code> 14 struct + 全部 handler／gate／preflight</td><td class="ok">40 ✔</td></tr>
+<tr><td><code>main.rs</code></td><td>只能有 7 個 <code>mod</code> 宣告 + <code>async fn main</code></td><td class="ok">8 ✔ 無任何殘留的項目定義</td></tr>
+</table>
+<p><strong>LINK_START_BOOT 額外的雜湊比對：</strong>舊 1200-1294 行與新 <code>boot_page.rs</code> 對應區段（剝除 <code>pub(crate) </code> 前綴後）sha256 完全相同 —— <code>177c835cfaeabb5d1337739256675bf3b1358bc4575907f1b7fa675dec6ba345</code>。</p>
+
+<h2>git diff --stat</h2>
+<pre> src/boot_page.rs |  105 ++++
+ src/cli.rs       |  141 ++++++
+ src/daemon.rs    |  199 ++++++++
+ src/help.rs      |   33 ++
+ src/main.rs      | 1399 +-----------------------------------------------------
+ src/server.rs    |  756 +++++++++++++++++++++++++++++
+ src/store.rs     |  147 ++++++
+ src/util.rs      |   51 ++
+ 8 files changed, 1449 insertions(+), 1382 deletions(-)</pre>
+<p>（已先 <code>git add -N src/*.rs</code>，否則新檔不會出現在 diff 中，驗收第 4 項會落空。）</p>
+
+<h2>需由督導裁決的兩個判斷（非我可自行認定）</h2>
+<ol>
+<li><strong><code>pub(crate)</code> 的適用範圍。</strong>MUST 寫「模組項目一律用 <code>pub(crate)</code>」。我採 Rust 語意上的「項目（item）」＝ fn／struct／enum／const／impl／mod，因此 struct <em>欄位</em>只在跨模組存取確有需要時才加。若督導的原意是連欄位也一律加，則 <code>server.rs</code> 的 13 個 req-resp struct 與 <code>AppState</code>／<code>Store</code> 欄位需補上（純加關鍵字，零風險，但會增加需要辯護的 diff 噪音）。</li>
+<li><strong><code>mod win_process</code> 維持 private。</strong>依字面解讀，它是具名的模組項目，理應標 <code>pub(crate)</code>。但它只在 <code>daemon.rs</code> 內部使用，加了是「死可見性」；且它在 <code>#[cfg(windows)]</code> 之下，本機 WSL2 無法編譯驗證。加關鍵字本身零風險（可見性關鍵字不會破壞模組內容、也不會觸發預設 lint），但同樣零效益。我選擇不動並在此明列，不做無聲決定。</li>
+</ol>
+
+<h2>未跑的檢查</h2>
+<ul>
+<li><strong>Windows 平台實機驗證：</strong>本機為 WSL2，<code>#[cfg(windows)]</code> 的三處程式碼（<code>mod win_process</code>、<code>start_daemon</code> 的 <code>creation_flags</code>、<code>stop_daemon</code> 的 terminate 分支）從未被編譯器檢查過。其正確性由「行號區間原樣抽取、未手動編輯」與上述等價證明保證，但沒有 Windows 上的實際編譯／執行證據。</li>
+<li><strong>未 commit／未 push：</strong>依權限界線，變更留在工作區。</li>
+</ul>
+</body>
+</html>

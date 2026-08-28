@@ -1,0 +1,858 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LinkStart Daemon 生命週期原型</title>
+  <style>
+    :root {
+      --bg: #f4f1ea;
+      --paper: #fffdf8;
+      --ink: #252823;
+      --muted: #6d7168;
+      --line: #d8d3c8;
+      --accent: #315f53;
+      --accent-soft: #e4eeea;
+      --warn: #96582a;
+      --warn-soft: #fff0dc;
+      --bad: #9d3d3d;
+      --bad-soft: #fbe7e5;
+      --ok: #2f6b4f;
+      --ok-soft: #e3f2e8;
+      --code: #1f2824;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", sans-serif;
+      line-height: 1.55;
+    }
+    main { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 28px 0 72px; }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { font-size: clamp(1.65rem, 4vw, 2.4rem); margin-bottom: 8px; }
+    h2 { font-size: 1.1rem; margin-bottom: 14px; }
+    h3 { font-size: .95rem; margin-bottom: 8px; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .eyebrow { color: var(--accent); font-weight: 800; letter-spacing: .1em; font-size: .75rem; text-transform: uppercase; }
+    .lead { color: var(--muted); max-width: 900px; }
+    .question {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-left: 5px solid var(--accent);
+      border-radius: 12px;
+      padding: 18px 20px;
+      margin: 20px 0;
+    }
+    .question strong { display: block; margin-bottom: 6px; }
+    .prototype-mark { display: inline-block; padding: 4px 9px; border-radius: 999px; background: var(--warn-soft); color: var(--warn); font-weight: 800; font-size: .78rem; }
+    .defaults, .grid, .controls-grid { display: grid; gap: 12px; }
+    .defaults { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); margin: 18px 0 24px; }
+    .default-card, .card, section.panel {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+    }
+    .default-card { padding: 14px; }
+    .default-card b { display: block; color: var(--accent); margin-bottom: 3px; }
+    .default-card span { color: var(--muted); font-size: .9rem; }
+    section.panel { padding: 18px; margin-top: 16px; }
+    .result {
+      border-radius: 10px;
+      padding: 13px 15px;
+      margin-bottom: 14px;
+      background: var(--accent-soft);
+      border: 1px solid #b8d2c8;
+    }
+    .result.rejected { background: var(--bad-soft); border-color: #e4b7b2; color: #6d2626; }
+    .result .action { font-weight: 800; }
+    .result .detail { color: inherit; opacity: .85; }
+    .grid { grid-template-columns: repeat(auto-fit, minmax(235px, 1fr)); }
+    .card { padding: 14px; min-height: 148px; }
+    .card h3 { color: var(--accent); }
+    dl { display: grid; grid-template-columns: minmax(92px, auto) 1fr; gap: 5px 10px; margin: 0; font-size: .88rem; }
+    dt { color: var(--muted); }
+    dd { margin: 0; font-weight: 650; overflow-wrap: anywhere; }
+    .pill { display: inline-block; border-radius: 999px; padding: 2px 8px; font-size: .78rem; font-weight: 800; background: #ece9e1; }
+    .pill.ok { color: var(--ok); background: var(--ok-soft); }
+    .pill.warn { color: var(--warn); background: var(--warn-soft); }
+    .pill.bad { color: var(--bad); background: var(--bad-soft); }
+    .controls-grid { grid-template-columns: repeat(auto-fit, minmax(255px, 1fr)); }
+    .control-group { border: 1px dashed var(--line); border-radius: 10px; padding: 12px; }
+    .control-group h3 { margin-bottom: 10px; }
+    .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+    button {
+      appearance: none;
+      border: 1px solid #a9b9b2;
+      background: #f8fbf9;
+      color: #244b41;
+      border-radius: 8px;
+      padding: 8px 11px;
+      font: inherit;
+      font-size: .86rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); background: var(--accent-soft); }
+    button.secondary { color: var(--ink); border-color: var(--line); background: #faf8f3; }
+    button.danger { color: var(--bad); border-color: #ddb1ad; background: #fff8f7; }
+    button:disabled { cursor: not-allowed; opacity: .45; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--line); margin-bottom: 14px; }
+    .tab { border-radius: 8px 8px 0 0; border-bottom: none; }
+    .tab.active { background: var(--accent); color: white; border-color: var(--accent); }
+    .scenario-intro { color: var(--muted); }
+    .steps { display: grid; gap: 8px; }
+    .step { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; gap: 10px; align-items: center; border: 1px solid var(--line); border-radius: 9px; padding: 9px; }
+    .step.current { border-color: var(--accent); background: var(--accent-soft); }
+    .step.done { opacity: .63; }
+    .step-number { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; background: #ebe7de; font-weight: 800; }
+    .step small { display: block; color: var(--muted); }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: .84rem; }
+    th, td { text-align: left; border-bottom: 1px solid var(--line); padding: 8px 7px; white-space: nowrap; }
+    th { color: var(--muted); font-weight: 750; }
+    .empty { color: var(--muted); font-style: italic; }
+    details { margin-top: 12px; }
+    summary { cursor: pointer; color: var(--accent); font-weight: 750; }
+    pre {
+      overflow: auto;
+      max-height: 480px;
+      background: var(--code);
+      color: #e9f0ec;
+      padding: 14px;
+      border-radius: 9px;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .log { margin: 0; padding-left: 20px; max-height: 230px; overflow: auto; font-size: .85rem; }
+    .log li { margin-bottom: 5px; }
+    .note { font-size: .82rem; color: var(--muted); }
+    @media (max-width: 650px) {
+      main { width: min(100% - 20px, 1180px); padding-top: 18px; }
+      .step { grid-template-columns: 30px 1fr; }
+      .step button { grid-column: 2; justify-self: start; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">LinkStart Wayfinder · Ticket 07</div>
+  <h1>Daemon 發現、生命週期與版本切換</h1>
+  <p class="lead">點按操作，感受「每位使用者一個 Daemon」在正常啟動、版本衝突、重啟與 crash 復原時應如何保護其他 Origin Session。</p>
+  <span class="prototype-mark">PROTOTYPE — 純記憶體模擬，不會啟動程序、連網或寫入資料庫</span>
+
+  <div class="question">
+    <strong>這份原型要回答的問題</strong>
+    `open-connect` 如何發現並重用同版本 Daemon；遇到不同版本時如何 fail closed；只有在明確 drain/restart 後才切換版本；以及 crash 後如何以 durable journal 恢復 `received` Event、等待同一 Agent Connection rebind、重播 Feedback，而不另開 Origin Session？
+  </div>
+
+  <h2>建議的 v1 預設</h2>
+  <div class="defaults">
+    <div class="default-card"><b>按需啟動</b><span>不做 OS login auto-start。第一次 `open-connect` 才啟動；零連線且無待投遞工作 15 分鐘後關閉。</span></div>
+    <div class="default-card"><b>SQLite-style journal</b><span>單一 DB、WAL、`synchronous=FULL`；Receipt／Feedback 先 commit，再回應或推 SSE。</span></div>
+    <div class="default-card"><b>期限</b><span>delivery 120 秒、rebind grace 30 秒、drain 30 秒。Origin 離線不排隊。</span></div>
+    <div class="default-card"><b>保留</b><span>terminal Event Receipt、Feedback 與 tombstone 保留 7 天；同一 `eventId` 於保留窗內去重。</span></div>
+    <div class="default-card"><b>state dir</b><span>Unix 目錄 `0700`／檔案 `0600`；Windows current-user-only DACL。</span></div>
+    <div class="default-card"><b>復原</b><span>檢查 stale marker → WAL recovery → 同 `connectionId` rebind；逾期即 `origin_offline`，不 cold resume。</span></div>
+  </div>
+
+  <section class="panel" aria-labelledby="state-title">
+    <h2 id="state-title">目前完整狀態</h2>
+    <div id="last-result" class="result"></div>
+    <div id="state-cards" class="grid"></div>
+
+    <h3 style="margin-top:18px">Agent Connections</h3>
+    <div class="table-wrap"><table id="connections-table"></table></div>
+    <h3 style="margin-top:18px">App Events／Receipts</h3>
+    <div class="table-wrap"><table id="events-table"></table></div>
+    <h3 style="margin-top:18px">Agent Feedback journal</h3>
+    <div class="table-wrap"><table id="feedback-table"></table></div>
+
+    <details>
+      <summary>查看完整 reducer state JSON</summary>
+      <pre id="state-json"></pre>
+    </details>
+  </section>
+
+  <section class="panel">
+    <h2>自由操作</h2>
+    <p class="note">按鈕永遠可按；不合法轉移會留下拒絕原因，方便確認 fail-closed 邊界。</p>
+    <div class="controls-grid">
+      <div class="control-group">
+        <h3>發現與啟動</h3>
+        <div class="buttons">
+          <button data-action="DISCOVER">執行 discovery</button>
+          <button data-action="START">按需啟動／重用</button>
+          <button data-action="COMPLETE_START">完成啟動與 WAL recovery</button>
+          <button data-action="HEALTH_CHECK">執行 health check</button>
+        </div>
+      </div>
+      <div class="control-group">
+        <h3>呼叫端期待版本</h3>
+        <div class="buttons">
+          <button data-action="SET_VERSION" data-version="1.0.0" data-major="1">期待 1.0.0（同版）</button>
+          <button data-action="SET_VERSION" data-version="1.1.0" data-major="1">期待 1.1.0（需切換）</button>
+          <button data-action="SET_VERSION" data-version="2.0.0" data-major="2">期待 2.0.0（跨 major）</button>
+        </div>
+      </div>
+      <div class="control-group">
+        <h3>連線與資料</h3>
+        <div class="buttons">
+          <button data-action="OPEN_CONNECTION">建立 Agent Connection</button>
+          <button data-action="SUBMIT_EVENT">送入 App Event（durable Receipt）</button>
+          <button data-action="ACCEPT_EVENT">Adapter 接受 Event</button>
+          <button data-action="WRITE_FEEDBACK">先 journal Feedback</button>
+          <button data-action="APP_DISCONNECT">App SSE 斷線</button>
+          <button data-action="APP_RECONNECT">App 重連並 replay Feedback</button>
+        </div>
+      </div>
+      <div class="control-group">
+        <h3>安全重啟與 rebind</h3>
+        <div class="buttons">
+          <button data-action="REQUEST_RESTART">要求 restart（可能被擋）</button>
+          <button data-action="BEGIN_DRAIN">明確開始 drain</button>
+          <button data-action="RESTART_AFTER_DRAIN">drain 後切換／重啟</button>
+          <button data-action="REBIND">Adapter 以同 connectionId rebind</button>
+        </div>
+      </div>
+      <div class="control-group">
+        <h3>失敗與期限</h3>
+        <div class="buttons">
+          <button class="danger" data-action="CRASH">模擬 Daemon crash</button>
+          <button class="danger" data-action="ORIGIN_OFFLINE">Origin process 離線</button>
+          <button class="danger" data-action="CLOSE_CONNECTION">明確 close（terminal）</button>
+          <button class="secondary" data-action="ADVANCE" data-seconds="30">時間 +30 秒</button>
+          <button class="secondary" data-action="ADVANCE" data-seconds="120">時間 +120 秒</button>
+          <button class="secondary" data-action="ADVANCE" data-seconds="900">時間 +15 分鐘</button>
+        </div>
+      </div>
+      <div class="control-group">
+        <h3>重新開始</h3>
+        <div class="buttons"><button class="secondary" data-action="RESET">重設全部狀態</button></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>引導情境</h2>
+    <div id="scenario-tabs" class="tabs"></div>
+    <div id="scenario-body"></div>
+  </section>
+
+  <section class="panel">
+    <h2>操作紀錄</h2>
+    <ol id="event-log" class="log"></ol>
+  </section>
+</main>
+
+<script>
+/*
+ * 可攜式邏輯核心：無 DOM、無 timer、無 IO。
+ * reduce(state, action) 對同一輸入永遠產生同一輸出。
+ */
+const DaemonMachine = (() => {
+  const DEFAULTS = Object.freeze({
+    daemonPolicy: 'on-demand；不做 OS login auto-start',
+    idleShutdownSec: 900,
+    deliveryDeadlineSec: 120,
+    rebindGraceSec: 30,
+    drainDeadlineSec: 30,
+    retentionSec: 604800,
+    journal: 'SQLite / WAL / synchronous=FULL / receipt-first commit',
+    unixPermissions: 'state dir 0700；DB/WAL/lock 0600',
+    windowsPermissions: 'current-user-only DACL',
+  });
+
+  const clone = value => JSON.parse(JSON.stringify(value));
+
+  function initialState() {
+    return {
+      defaults: DEFAULTS,
+      clockSec: 0,
+      requested: { runtimeVersion: '1.0.0', protocolMajor: 1 },
+      daemon: {
+        phase: 'absent',
+        installedVersion: '1.0.0',
+        runningVersion: null,
+        runningProtocolMajor: null,
+        targetVersion: null,
+        targetProtocolMajor: null,
+        generation: 0,
+        admission: 'closed',
+        health: 'unknown',
+        marker: 'none',
+        bootMode: null,
+        idleShutdownAt: null,
+      },
+      discovery: { status: 'not_run', detail: '尚未執行 discovery。' },
+      journal: {
+        engine: DEFAULTS.journal,
+        transactionSeq: 0,
+        walFrames: 0,
+        integrity: 'clean',
+        recoveryRequired: false,
+        recoveryCount: 0,
+        lastCommit: '尚無 commit',
+      },
+      recovery: {
+        mode: 'none',
+        rebindDeadlineAt: null,
+        drainDeadlineAt: null,
+        recoveredReceivedEvents: 0,
+        recoveredFeedback: 0,
+      },
+      counters: { connection: 0, event: 0, feedback: 0 },
+      connections: [],
+      events: [],
+      feedback: [],
+      lastAction: {
+        type: 'INIT',
+        accepted: true,
+        summary: '原型已重設',
+        detail: 'Daemon 不存在；等待第一次 open-connect 明確啟動。',
+      },
+      log: ['t+0s · INIT · Daemon absent；不自動啟動。'],
+    };
+  }
+
+  function commit(s, reason) {
+    s.journal.transactionSeq += 1;
+    s.journal.walFrames += 1;
+    s.journal.lastCommit = `tx-${String(s.journal.transactionSeq).padStart(3, '0')} · ${reason}`;
+  }
+
+  function finish(s, action, accepted, summary, detail) {
+    s.lastAction = { type: action.type, accepted, summary, detail };
+    s.log.unshift(`t+${s.clockSec}s · ${action.type} · ${accepted ? 'ACCEPT' : 'REJECT'} · ${summary}`);
+    s.log = s.log.slice(0, 40);
+    return s;
+  }
+
+  const activeConnections = s => s.connections.filter(c => c.status === 'online');
+  const reconnectingConnections = s => s.connections.filter(c => c.status === 'reconnecting');
+  const firstConnection = (s, statuses) => s.connections.find(c => statuses.includes(c.status));
+  const firstReceived = s => s.events.find(e => e.status === 'received');
+
+  function scheduleIdleIfEligible(s) {
+    const live = s.connections.some(c => ['online', 'reconnecting'].includes(c.status));
+    const pending = s.events.some(e => e.status === 'received');
+    s.daemon.idleShutdownAt = s.daemon.phase === 'online' && !live && !pending
+      ? s.clockSec + DEFAULTS.idleShutdownSec
+      : null;
+  }
+
+  function expireDeadlines(s) {
+    for (const event of s.events) {
+      if (event.status === 'received' && s.clockSec >= event.deliveryDeadlineAt) {
+        event.status = 'failed';
+        event.reason = 'delivery_timeout';
+        commit(s, `${event.eventId} → failed(delivery_timeout)`);
+      }
+    }
+
+    if (s.recovery.rebindDeadlineAt !== null && s.clockSec >= s.recovery.rebindDeadlineAt) {
+      for (const conn of reconnectingConnections(s)) {
+        conn.status = 'offline';
+        conn.reason = 'rebind_deadline_expired';
+      }
+      for (const event of s.events) {
+        if (event.status === 'received') {
+          event.status = 'failed';
+          event.reason = 'origin_offline';
+          commit(s, `${event.eventId} → failed(origin_offline)`);
+        }
+      }
+      s.recovery.rebindDeadlineAt = null;
+      s.recovery.mode = 'failed_closed';
+    }
+
+    scheduleIdleIfEligible(s);
+    if (s.daemon.idleShutdownAt !== null && s.clockSec >= s.daemon.idleShutdownAt) {
+      s.daemon.phase = 'absent';
+      s.daemon.runningVersion = null;
+      s.daemon.runningProtocolMajor = null;
+      s.daemon.health = 'unknown';
+      s.daemon.marker = 'none';
+      s.daemon.admission = 'closed';
+      s.daemon.idleShutdownAt = null;
+      s.discovery = { status: 'absent', detail: '符合 idle shutdown：零連線且無 received Event。' };
+    }
+  }
+
+  function reduce(state, action) {
+    if (action.type === 'RESET') return initialState();
+    const s = clone(state);
+
+    switch (action.type) {
+      case 'SET_VERSION': {
+        s.requested = { runtimeVersion: action.version, protocolMajor: action.protocolMajor };
+        return finish(s, action, true, `呼叫端現在期待 Runtime ${action.version}`, `protocol major = ${action.protocolMajor}；尚未改動既有 Daemon。`);
+      }
+
+      case 'DISCOVER': {
+        if (s.daemon.phase === 'absent') {
+          s.discovery = { status: 'absent', detail: '沒有 live marker；可由 open-connect 按需啟動。' };
+        } else if (s.daemon.phase === 'crashed') {
+          s.discovery = { status: 'stale', detail: '找到 stale marker；下次啟動必須先做 WAL recovery。' };
+        } else if (['starting', 'draining'].includes(s.daemon.phase)) {
+          s.discovery = { status: 'busy', detail: `Daemon 正在 ${s.daemon.phase}，不可另開第二個。` };
+        } else if (s.daemon.runningVersion === s.requested.runtimeVersion) {
+          s.discovery = { status: 'found_same_version', detail: `找到同版本 ${s.daemon.runningVersion}；應重用 generation ${s.daemon.generation}。` };
+        } else {
+          s.discovery = {
+            status: 'incompatible_version',
+            detail: `現有 ${s.daemon.runningVersion}，呼叫端要求 ${s.requested.runtimeVersion}；禁止自動 restart。`,
+          };
+        }
+        return finish(s, action, true, `discovery：${s.discovery.status}`, s.discovery.detail);
+      }
+
+      case 'START': {
+        if (s.daemon.phase === 'online') {
+          if (s.daemon.runningVersion === s.requested.runtimeVersion) {
+            return finish(s, action, true, '重用同版本 Daemon', `generation 仍為 ${s.daemon.generation}，沒有啟動第二個 process。`);
+          }
+          return finish(s, action, false, '版本不相容，fail closed', `現有 ${s.daemon.runningVersion}；要求 ${s.requested.runtimeVersion}。請先明確 drain/restart。`);
+        }
+        if (!['absent', 'crashed'].includes(s.daemon.phase)) {
+          return finish(s, action, false, '目前不能啟動', `Daemon phase=${s.daemon.phase}。`);
+        }
+        s.daemon.phase = 'starting';
+        s.daemon.targetVersion = s.requested.runtimeVersion;
+        s.daemon.targetProtocolMajor = s.requested.protocolMajor;
+        s.daemon.bootMode = s.journal.recoveryRequired ? 'crash-recovery' : 'on-demand';
+        s.daemon.admission = 'closed';
+        s.daemon.health = 'starting';
+        return finish(s, action, true, `進入 starting（${s.daemon.bootMode}）`, '鎖住 per-user marker；完成啟動前不接受新 App Event。');
+      }
+
+      case 'COMPLETE_START': {
+        if (s.daemon.phase !== 'starting') return finish(s, action, false, '沒有待完成的啟動', `Daemon phase=${s.daemon.phase}。`);
+        s.daemon.phase = 'online';
+        s.daemon.runningVersion = s.daemon.targetVersion;
+        s.daemon.runningProtocolMajor = s.daemon.targetProtocolMajor;
+        s.daemon.installedVersion = s.daemon.targetVersion;
+        s.daemon.generation += 1;
+        s.daemon.marker = `live:g${s.daemon.generation}`;
+        s.daemon.health = 'healthy';
+        s.daemon.admission = 'open';
+        if (s.journal.recoveryRequired) {
+          s.journal.recoveryRequired = false;
+          s.journal.integrity = 'clean_after_wal_recovery';
+          s.journal.recoveryCount += 1;
+          s.recovery.mode = 'awaiting_rebind';
+          s.recovery.recoveredReceivedEvents = s.events.filter(e => e.status === 'received').length;
+          s.recovery.recoveredFeedback = s.feedback.filter(f => !f.observed).length;
+        }
+        if (reconnectingConnections(s).length) {
+          s.recovery.mode = 'awaiting_rebind';
+          s.recovery.rebindDeadlineAt = s.clockSec + DEFAULTS.rebindGraceSec;
+        } else {
+          s.recovery.mode = 'none';
+        }
+        scheduleIdleIfEligible(s);
+        return finish(s, action, true, `Daemon ${s.daemon.runningVersion} online`, s.recovery.mode === 'awaiting_rebind' ? `journal 已復原；同 connectionId 有 ${DEFAULTS.rebindGraceSec} 秒 rebind。` : 'health healthy；可接受新連線。');
+      }
+
+      case 'HEALTH_CHECK': {
+        const healthy = s.daemon.phase === 'online' && s.daemon.marker.startsWith('live:');
+        s.daemon.health = healthy ? 'healthy' : s.daemon.phase === 'crashed' ? 'unreachable' : 'not_ready';
+        return finish(s, action, healthy, `health=${s.daemon.health}`, healthy ? `Runtime ${s.daemon.runningVersion}、protocol ${s.daemon.runningProtocolMajor}、journal ${s.journal.integrity}。` : '不可將 discovery marker 當成健康證明。');
+      }
+
+      case 'OPEN_CONNECTION': {
+        if (s.daemon.phase !== 'online' || s.daemon.admission !== 'open') return finish(s, action, false, 'Daemon 未開放新連線', `phase=${s.daemon.phase}，admission=${s.daemon.admission}。`);
+        if (s.daemon.runningVersion !== s.requested.runtimeVersion) return finish(s, action, false, 'Runtime exact version mismatch', `現有 ${s.daemon.runningVersion}；要求 ${s.requested.runtimeVersion}。`);
+        s.counters.connection += 1;
+        const id = `conn-${String(s.counters.connection).padStart(3, '0')}`;
+        s.connections.push({
+          connectionId: id,
+          callsign: `LS-${String(s.counters.connection).padStart(2, '0')}`,
+          status: 'online',
+          originOnline: true,
+          protocolMajor: s.requested.protocolMajor,
+          adapterVersion: s.requested.runtimeVersion,
+          appConnected: true,
+          reason: null,
+          lastFeedbackCursor: 0,
+        });
+        s.daemon.idleShutdownAt = null;
+        return finish(s, action, true, `建立 ${id}`, 'Callsign 只供顯示；routing 與 rebind 使用 opaque connectionId。');
+      }
+
+      case 'SUBMIT_EVENT': {
+        const conn = firstConnection(s, ['online']);
+        if (s.daemon.phase !== 'online' || s.daemon.admission !== 'open' || !conn) return finish(s, action, false, '拒絕收件', '必須有 healthy Daemon 與 online Agent Connection；offline 時不排隊。');
+        s.counters.event += 1;
+        const eventId = `event-${String(s.counters.event).padStart(3, '0')}`;
+        s.events.push({
+          eventId,
+          connectionId: conn.connectionId,
+          sequence: s.counters.event,
+          status: 'received',
+          reason: null,
+          receiptTx: s.journal.transactionSeq + 1,
+          receivedAt: s.clockSec,
+          deliveryDeadlineAt: s.clockSec + DEFAULTS.deliveryDeadlineSec,
+        });
+        commit(s, `${eventId} durable receipt`);
+        return finish(s, action, true, `${eventId} 已 durable received`, `先 commit tx，再回 Receipt；delivery deadline 為 t+${s.clockSec + DEFAULTS.deliveryDeadlineSec}s。`);
+      }
+
+      case 'ACCEPT_EVENT': {
+        const event = firstReceived(s);
+        if (!event) return finish(s, action, false, '沒有 received Event', '只有 adapter 真正接受後才能產生 Delivery Ack。');
+        const conn = s.connections.find(c => c.connectionId === event.connectionId);
+        if (!conn || conn.status !== 'online') return finish(s, action, false, 'Adapter 尚未 online', 'Event 保持 received；不可假裝 delivered。');
+        event.status = 'delivered';
+        event.reason = null;
+        commit(s, `${event.eventId} → delivered`);
+        scheduleIdleIfEligible(s);
+        return finish(s, action, true, `${event.eventId} delivered`, '這只代表 Adapter 接受，不代表模型 processing-complete。');
+      }
+
+      case 'WRITE_FEEDBACK': {
+        const conn = firstConnection(s, ['online', 'reconnecting']);
+        if (!conn) return finish(s, action, false, '沒有可關聯的 Agent Connection', 'closed/offline connection 不可新增 Feedback。');
+        s.counters.feedback += 1;
+        const feedbackId = `feedback-${String(s.counters.feedback).padStart(3, '0')}`;
+        const related = [...s.events].reverse().find(e => e.connectionId === conn.connectionId);
+        s.feedback.push({
+          feedbackId,
+          connectionId: conn.connectionId,
+          inReplyToEventId: related?.eventId ?? null,
+          observed: conn.appConnected,
+          journaledAt: s.clockSec,
+          retainUntil: s.clockSec + DEFAULTS.retentionSec,
+        });
+        commit(s, `${feedbackId} journaled before SSE`);
+        if (conn.appConnected) conn.lastFeedbackCursor = s.counters.feedback;
+        return finish(s, action, true, `${feedbackId} 已先寫 journal`, conn.appConnected ? 'App 在線，SSE 可立即觀察。' : 'App 離線，保留至重連 replay。');
+      }
+
+      case 'APP_DISCONNECT': {
+        const conn = firstConnection(s, ['online', 'reconnecting']);
+        if (!conn) return finish(s, action, false, '沒有 App Instance 可斷線', 'Agent Connection 狀態不因單純 SSE 斷線而改綁。');
+        conn.appConnected = false;
+        return finish(s, action, true, `${conn.connectionId} 的 App SSE 已斷線`, '後續 Feedback 仍先 journal；App 重連時以 cursor replay。');
+      }
+
+      case 'APP_RECONNECT': {
+        const conn = firstConnection(s, ['online', 'reconnecting']);
+        if (!conn) return finish(s, action, false, '沒有可重連的 App Instance', 'closed connection 的 capability 已撤銷。');
+        conn.appConnected = true;
+        let replayed = 0;
+        for (const item of s.feedback) {
+          if (item.connectionId === conn.connectionId && !item.observed) {
+            item.observed = true;
+            replayed += 1;
+          }
+        }
+        conn.lastFeedbackCursor = s.counters.feedback;
+        return finish(s, action, true, `App 重連，replay ${replayed} 則 Feedback`, 'SSE cursor 只做 transport replay，不取代 feedbackId。');
+      }
+
+      case 'REQUEST_RESTART': {
+        if (s.daemon.phase !== 'online') return finish(s, action, false, 'Daemon 不是可 restart 的 online 狀態', `phase=${s.daemon.phase}。`);
+        const count = activeConnections(s).length;
+        if (count > 0) return finish(s, action, false, `restart 被 ${count} 個 active connection 擋下`, '禁止自動中斷其他 session；請先明確 drain。');
+        s.daemon.phase = 'starting';
+        s.daemon.targetVersion = s.requested.runtimeVersion;
+        s.daemon.targetProtocolMajor = s.requested.protocolMajor;
+        s.daemon.bootMode = 'explicit-restart';
+        s.daemon.admission = 'closed';
+        return finish(s, action, true, '沒有 active connection，開始 explicit restart', 'journal 保留；完成啟動後再接受新 work。');
+      }
+
+      case 'BEGIN_DRAIN': {
+        if (s.daemon.phase !== 'online') return finish(s, action, false, '只有 online Daemon 可 drain', `phase=${s.daemon.phase}。`);
+        s.daemon.phase = 'draining';
+        s.daemon.admission = 'closed';
+        s.recovery.mode = 'draining';
+        s.recovery.drainDeadlineAt = s.clockSec + DEFAULTS.drainDeadlineSec;
+        for (const conn of activeConnections(s)) {
+          conn.status = 'reconnecting';
+          conn.reason = 'explicit_drain';
+        }
+        return finish(s, action, true, '進入 draining', `停止新 Receipt；保存 journal；drain deadline=t+${s.recovery.drainDeadlineAt}s。`);
+      }
+
+      case 'RESTART_AFTER_DRAIN': {
+        if (s.daemon.phase !== 'draining') return finish(s, action, false, '必須先明確 drain', '版本切換不能繞過 active connection gate。');
+        s.daemon.phase = 'starting';
+        s.daemon.targetVersion = s.requested.runtimeVersion;
+        s.daemon.targetProtocolMajor = s.requested.protocolMajor;
+        s.daemon.bootMode = 'drain-version-switch';
+        s.daemon.health = 'starting';
+        s.daemon.marker = 'switching';
+        s.recovery.drainDeadlineAt = null;
+        s.journal.recoveryRequired = true;
+        return finish(s, action, true, `明確切換至 ${s.requested.runtimeVersion}`, '不是自動 restart；既有 connection 只能在 protocol 相容時 rebind。');
+      }
+
+      case 'REBIND': {
+        const conn = firstConnection(s, ['reconnecting']);
+        if (!conn) {
+          const closed = firstConnection(s, ['closed']);
+          return finish(s, action, false, closed ? `${closed.connectionId} 已 closed，terminal 不可復活` : '沒有 reconnecting connection', '必須建立新 Agent Connection，不能重用已撤銷 capability。');
+        }
+        if (s.daemon.phase !== 'online') return finish(s, action, false, 'Daemon 尚未 online', '保持 reconnecting。');
+        if (!conn.originOnline) return finish(s, action, false, 'Origin process offline', '不 cold resume、不建立替代 session。');
+        if (conn.protocolMajor !== s.daemon.runningProtocolMajor) {
+          conn.status = 'offline';
+          conn.reason = 'protocol_major_mismatch';
+          for (const event of s.events) {
+            if (event.connectionId === conn.connectionId && event.status === 'received') {
+              event.status = 'failed'; event.reason = 'origin_offline'; commit(s, `${event.eventId} → failed(origin_offline)`);
+            }
+          }
+          return finish(s, action, false, 'protocol major 不相容，fail closed', '舊 connection 不可 rebind 到新 major。');
+        }
+        conn.status = 'online';
+        conn.adapterVersion = s.daemon.runningVersion;
+        conn.reason = null;
+        s.recovery.rebindDeadlineAt = reconnectingConnections(s).length ? s.recovery.rebindDeadlineAt : null;
+        s.recovery.mode = reconnectingConnections(s).length ? 'awaiting_rebind' : 'rebound';
+        s.daemon.idleShutdownAt = null;
+        return finish(s, action, true, `${conn.connectionId} rebind 成功`, `同一 connectionId、同一 Origin Session；adapter version 更新為 ${conn.adapterVersion}。`);
+      }
+
+      case 'CRASH': {
+        if (!['online', 'draining'].includes(s.daemon.phase)) return finish(s, action, false, '目前沒有可 crash 的 live Daemon', `phase=${s.daemon.phase}。`);
+        s.daemon.phase = 'crashed';
+        s.daemon.health = 'unreachable';
+        s.daemon.admission = 'closed';
+        s.daemon.marker = `stale:g${s.daemon.generation}`;
+        s.journal.integrity = 'wal_needs_recovery';
+        s.journal.recoveryRequired = true;
+        s.recovery.mode = 'daemon_crashed';
+        s.recovery.rebindDeadlineAt = null;
+        for (const conn of activeConnections(s)) {
+          conn.status = 'reconnecting';
+          conn.reason = 'daemon_crash';
+        }
+        return finish(s, action, true, 'Daemon crash；durable journal 保留', 'online connections → reconnecting；received Event 與未觀察 Feedback 不遺失。');
+      }
+
+      case 'ORIGIN_OFFLINE': {
+        const conn = firstConnection(s, ['online', 'reconnecting']);
+        if (!conn) return finish(s, action, false, '沒有可標記 offline 的 Origin', 'closed terminal 不再轉移。');
+        conn.status = 'offline';
+        conn.originOnline = false;
+        conn.reason = 'origin_process_offline';
+        for (const event of s.events) {
+          if (event.connectionId === conn.connectionId && event.status === 'received') {
+            event.status = 'failed';
+            event.reason = 'origin_offline';
+            commit(s, `${event.eventId} → failed(origin_offline)`);
+          }
+        }
+        scheduleIdleIfEligible(s);
+        return finish(s, action, true, `${conn.connectionId} → offline`, 'received Event 立即 failed(origin_offline)；不排隊等新 session。');
+      }
+
+      case 'CLOSE_CONNECTION': {
+        const conn = s.connections.find(c => c.status !== 'closed');
+        if (!conn) return finish(s, action, false, '沒有可 close 的 connection', 'closed 是 terminal。');
+        conn.status = 'closed';
+        conn.originOnline = false;
+        conn.appConnected = false;
+        conn.reason = 'explicit_close';
+        for (const event of s.events) {
+          if (event.connectionId === conn.connectionId && event.status === 'received') {
+            event.status = 'failed'; event.reason = 'connection_closed'; commit(s, `${event.eventId} → failed(connection_closed)`);
+          }
+        }
+        scheduleIdleIfEligible(s);
+        return finish(s, action, true, `${conn.connectionId} → closed（terminal）`, 'capability 已撤銷；後續 rebind/request 全部 fail closed。');
+      }
+
+      case 'ADVANCE': {
+        s.clockSec += action.seconds;
+        expireDeadlines(s);
+        return finish(s, action, true, `模擬時間前進 ${action.seconds} 秒`, `現在 t+${s.clockSec}s；已檢查 delivery、rebind 與 idle shutdown deadline。`);
+      }
+
+      default:
+        return finish(s, action, false, '未知 action', String(action.type));
+    }
+  }
+
+  return { DEFAULTS, initialState, reduce };
+})();
+
+// 以下只是 throwaway HTML shell。
+let state = DaemonMachine.initialState();
+let activeScenario = 'happy';
+const scenarioProgress = { happy: 0, version: 0, crash: 0 };
+
+const scenarios = {
+  happy: {
+    title: '正常路徑',
+    intro: '觀察按需啟動、health、同版本重用、durable Receipt、Delivery Ack、Feedback replay，以及 closed terminal。',
+    steps: [
+      ['DISCOVER', '先找 Daemon', '應得到 absent，不自動啟動。'],
+      ['START', '第一次 open-connect 按需啟動', 'phase 只到 starting。'],
+      ['COMPLETE_START', '完成啟動', 'online、healthy、generation=1。'],
+      ['HEALTH_CHECK', '驗證 health', 'marker 不能取代 health。'],
+      ['OPEN_CONNECTION', '建立 Agent Connection', '得到 opaque connectionId。'],
+      ['DISCOVER', '另一個呼叫端 discovery', '找到同版本。'],
+      ['START', '同版本要求啟動', '應重用，不增加 generation。'],
+      ['SUBMIT_EVENT', '送 App Event', '先 journal，再出 Receipt。'],
+      ['ACCEPT_EVENT', 'Adapter 接受', 'received → delivered。'],
+      ['APP_DISCONNECT', 'App SSE 暫斷', 'Agent Connection 仍 online。'],
+      ['WRITE_FEEDBACK', '產生 Feedback', '先 journal，尚未 observed。'],
+      ['APP_RECONNECT', 'App 重連', 'replay 未觀察 Feedback。'],
+      ['CLOSE_CONNECTION', '明確 close', 'closed terminal。'],
+      ['REBIND', '嘗試復活 closed', '必須拒絕。'],
+    ],
+  },
+  version: {
+    title: '版本衝突',
+    intro: '觀察 exact-version mismatch 不會偷偷 restart；active connection 擋下 restart；只有明確 drain 後才能切換並 rebind。',
+    steps: [
+      ['START', '啟動 1.0.0', '進入 starting。'],
+      ['COMPLETE_START', '1.0.0 online', 'generation=1。'],
+      ['OPEN_CONNECTION', '建立既有 connection', '它綁定 protocol major 1。'],
+      ['SET_VERSION_1_1', '新呼叫端期待 1.1.0', '只改期待值。'],
+      ['DISCOVER', '發現 exact mismatch', '回 incompatible_version。'],
+      ['START', '嘗試自動換版', 'fail closed。'],
+      ['REQUEST_RESTART', '要求 restart', 'active connection 擋下。'],
+      ['BEGIN_DRAIN', 'operator 明確 drain', '停止新 Receipt；connection → reconnecting。'],
+      ['RESTART_AFTER_DRAIN', '明確切到 1.1.0', '保留 journal。'],
+      ['COMPLETE_START', '完成 WAL recovery', 'online，等待 rebind 30 秒。'],
+      ['REBIND', '同 connectionId rebind', 'protocol major 相容，恢復 online。'],
+      ['HEALTH_CHECK', '新版本 health', '應為 healthy。'],
+    ],
+  },
+  crash: {
+    title: 'Crash 與復原',
+    intro: '觀察 received Event 與未觀察 Feedback 留在 journal；stale discovery 後 recovery；同 connection rebind；Origin offline 不排隊。',
+    steps: [
+      ['START', '按需啟動', 'phase=starting。'],
+      ['COMPLETE_START', 'Daemon online', 'journal clean。'],
+      ['OPEN_CONNECTION', '建立 connection', 'Origin online。'],
+      ['SUBMIT_EVENT', '建立 durable received Event', '尚未 delivered。'],
+      ['APP_DISCONNECT', 'App SSE 斷線', '準備測 Feedback replay。'],
+      ['WRITE_FEEDBACK', 'journal 未觀察 Feedback', '不依賴 SSE 在線。'],
+      ['CRASH', 'Daemon crash', 'Event/Feedback 不消失。'],
+      ['DISCOVER', '發現 stale marker', '必須 WAL recovery。'],
+      ['START', '重新按需啟動', 'bootMode=crash-recovery。'],
+      ['COMPLETE_START', '完成 WAL recovery', 'received Event 恢復，等待 rebind。'],
+      ['REBIND', 'Adapter rebind', '同 connectionId online。'],
+      ['ACCEPT_EVENT', '恢復投遞', '原 Event → delivered。'],
+      ['APP_RECONNECT', 'App 重連', 'Feedback replay。'],
+      ['SUBMIT_EVENT', '再收一個 Event', '先 durable received。'],
+      ['ORIGIN_OFFLINE', 'Origin process 離線', 'Event → failed(origin_offline)，不排隊。'],
+      ['CLOSE_CONNECTION', '明確 close', 'terminal。'],
+      ['REBIND', '嘗試 rebind', 'terminal 必須拒絕。'],
+    ],
+  },
+};
+
+function scenarioAction(key) {
+  if (key === 'SET_VERSION_1_1') return { type: 'SET_VERSION', version: '1.1.0', protocolMajor: 1 };
+  return { type: key };
+}
+
+function dispatch(action) {
+  state = DaemonMachine.reduce(state, action);
+  render();
+}
+
+function pill(value) {
+  const good = ['online', 'healthy', 'clean', 'clean_after_wal_recovery', 'found_same_version', 'delivered', 'rebound'];
+  const bad = ['crashed', 'unreachable', 'offline', 'closed', 'failed', 'incompatible_version', 'failed_closed'];
+  const cls = good.includes(value) ? 'ok' : bad.includes(value) ? 'bad' : 'warn';
+  return `<span class="pill ${cls}">${value}</span>`;
+}
+
+function row(label, value) { return `<dt>${label}</dt><dd>${value ?? '—'}</dd>`; }
+
+function renderCards() {
+  const d = state.daemon, r = state.recovery, j = state.journal;
+  const active = state.connections.filter(c => c.status === 'online').length;
+  document.getElementById('state-cards').innerHTML = `
+    <div class="card"><h3>Daemon</h3><dl>
+      ${row('phase', pill(d.phase))}${row('health', pill(d.health))}${row('admission', pill(d.admission))}
+      ${row('running', d.runningVersion)}${row('protocol', d.runningProtocolMajor)}${row('generation', d.generation)}${row('marker', d.marker)}
+    </dl></div>
+    <div class="card"><h3>Discovery／Caller</h3><dl>
+      ${row('result', pill(state.discovery.status))}${row('detail', state.discovery.detail)}
+      ${row('期待 Runtime', state.requested.runtimeVersion)}${row('期待 major', state.requested.protocolMajor)}${row('active connections', active)}
+    </dl></div>
+    <div class="card"><h3>Journal</h3><dl>
+      ${row('integrity', pill(j.integrity))}${row('tx / WAL', `${j.transactionSeq} / ${j.walFrames}`)}${row('last commit', j.lastCommit)}
+      ${row('recovery count', j.recoveryCount)}${row('retention', `${state.defaults.retentionSec / 86400} 天`)}
+    </dl></div>
+    <div class="card"><h3>Recovery／Deadlines</h3><dl>
+      ${row('mode', pill(r.mode))}${row('clock', `t+${state.clockSec}s`)}${row('rebind 到期', r.rebindDeadlineAt === null ? '—' : `t+${r.rebindDeadlineAt}s`)}
+      ${row('drain 到期', r.drainDeadlineAt === null ? '—' : `t+${r.drainDeadlineAt}s`)}${row('recovered Event', r.recoveredReceivedEvents)}${row('recovered Feedback', r.recoveredFeedback)}
+    </dl></div>`;
+}
+
+function renderTable(id, headers, rows) {
+  document.getElementById(id).innerHTML = `<thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.length ? rows.join('') : `<tr><td class="empty" colspan="${headers.length}">目前沒有資料</td></tr>`}</tbody>`;
+}
+
+function renderTables() {
+  renderTable('connections-table', ['connectionId', 'Callsign', '狀態', 'Origin', 'Adapter', 'App SSE', '原因'], state.connections.map(c => `<tr>
+    <td><code>${c.connectionId}</code></td><td>${c.callsign}</td><td>${pill(c.status)}</td><td>${c.originOnline ? 'online' : 'offline'}</td>
+    <td>${c.adapterVersion} / p${c.protocolMajor}</td><td>${c.appConnected ? 'connected' : 'disconnected'}</td><td>${c.reason ?? '—'}</td></tr>`));
+  renderTable('events-table', ['eventId', 'connectionId', 'seq', '狀態', '原因', 'Receipt tx', 'delivery deadline'], state.events.map(e => `<tr>
+    <td><code>${e.eventId}</code></td><td>${e.connectionId}</td><td>${e.sequence}</td><td>${pill(e.status)}</td><td>${e.reason ?? '—'}</td><td>${e.receiptTx}</td><td>t+${e.deliveryDeadlineAt}s</td></tr>`));
+  renderTable('feedback-table', ['feedbackId', 'connectionId', '回應 Event', 'App 已觀察', 'journal t', '保留至'], state.feedback.map(f => `<tr>
+    <td><code>${f.feedbackId}</code></td><td>${f.connectionId}</td><td>${f.inReplyToEventId ?? '主動回報'}</td><td>${f.observed ? '是' : '否，待 replay'}</td><td>t+${f.journaledAt}s</td><td>t+${f.retainUntil}s</td></tr>`));
+}
+
+function renderScenarios() {
+  document.getElementById('scenario-tabs').innerHTML = Object.entries(scenarios).map(([key, s]) => `<button class="tab ${key === activeScenario ? 'active' : ''}" data-scenario="${key}">${s.title}</button>`).join('');
+  const scenario = scenarios[activeScenario];
+  const progress = scenarioProgress[activeScenario];
+  document.getElementById('scenario-body').innerHTML = `
+    <p class="scenario-intro">${scenario.intro}</p>
+    <p><button class="secondary" id="restart-scenario">從頭開始這個情境</button></p>
+    <div class="steps">${scenario.steps.map((step, i) => `<div class="step ${i < progress ? 'done' : i === progress ? 'current' : ''}">
+      <span class="step-number">${i + 1}</span><div><b>${step[1]}</b><small>${step[2]}</small></div>
+      <button data-step="${i}" ${i !== progress ? 'disabled' : ''}>執行這一步</button></div>`).join('')}</div>`;
+
+  document.querySelectorAll('[data-scenario]').forEach(btn => btn.addEventListener('click', () => {
+    activeScenario = btn.dataset.scenario;
+    renderScenarios();
+  }));
+  document.getElementById('restart-scenario').addEventListener('click', () => {
+    scenarioProgress[activeScenario] = 0;
+    state = DaemonMachine.initialState();
+    render();
+  });
+  document.querySelectorAll('[data-step]').forEach(btn => btn.addEventListener('click', () => {
+    const i = Number(btn.dataset.step);
+    dispatch(scenarioAction(scenario.steps[i][0]));
+    scenarioProgress[activeScenario] = i + 1;
+    renderScenarios();
+  }));
+}
+
+function render() {
+  const result = document.getElementById('last-result');
+  result.className = `result ${state.lastAction.accepted ? '' : 'rejected'}`;
+  result.innerHTML = `<div class="action">${state.lastAction.accepted ? '✓' : '✕'} ${state.lastAction.summary}</div><div class="detail">${state.lastAction.detail}</div>`;
+  renderCards();
+  renderTables();
+  document.getElementById('state-json').textContent = JSON.stringify(state, null, 2);
+  document.getElementById('event-log').innerHTML = state.log.map(item => `<li>${item}</li>`).join('');
+  renderScenarios();
+}
+
+document.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', () => {
+  const type = button.dataset.action;
+  if (type === 'SET_VERSION') dispatch({ type, version: button.dataset.version, protocolMajor: Number(button.dataset.major) });
+  else if (type === 'ADVANCE') dispatch({ type, seconds: Number(button.dataset.seconds) });
+  else dispatch({ type });
+}));
+
+render();
+</script>
+</body>
+</html>

@@ -2,7 +2,7 @@
 name: link-start
 description: Connects an interactive HTML or localhost app back to the same Claude Code session or Codex thread that produced it through LinkStart v1 Preview. Use when the user wants an agent-generated app to keep exchanging events and feedback after the current response.
 metadata:
-  version: "0.2.3"
+  version: "0.3.0"
 ---
 
 # Link Start
@@ -35,7 +35,7 @@ Generated App pages must implement the app-side protocol in `${CLAUDE_PLUGIN_ROO
 1. **Runtime** — validate the App Manifest with `scripts/validate_manifest.py`; verify the platform artifact; discover and reuse an exact compatible per-user daemon or start it on demand. Version/protocol conflicts fail closed unless the user explicitly authorizes the Runtime's drain/restart/rebind operation.
 2. **Origin attach/rebind** — apply the selected host reference, prove this is the current Origin Session, establish or rebind one Agent Connection, and inject its bearer into the helper's private `0600` session context. Callsign is display-only; `connectionId` is a locator, not authentication.
 3. **App register/launch** — validate the fixed Manifest v1, bind one App Instance to the online connection, and optionally open it. A self-contained HTML uses a one-time fragment launch grant; a localhost app uses an exact loopback Origin. Browser launch failure does not erase durable registration. Launch pages served by the Runtime play a LINK START boot animation that holds until the App dispatches `window.dispatchEvent(new CustomEvent("linkstart:connected"))` after a successful grant redeem (a bounded fallback timer ends it otherwise); generated Apps should dispatch that event on connect, and may opt out of the animation entirely with a `data-linkstart-boot="off"` attribute anywhere in their HTML.
-4. **Monitor** — use the helper's stable `arm` and `respond` contract. `arm` loads connection identity from private context. One `respond --payload <json>` call infers the pending Event/App identities, records Delivery Ack, sends Feedback with a stable generated `feedbackId`, and enters the next bounded wait. Do not manually compose three Runtime commands.
+4. **Monitor** — apply the selected host reference. Codex uses the helper's persistent `adapter start/status/feedback/close` host-lease contract so an idle Origin thread can be awakened after the producing turn ends. Claude and explicit Codex compatibility mode retain the stable foreground `arm`/`respond` contract. Do not mix both monitor owners for one context.
 
 Stop immediately on missing assets, unsupported target or Origin mode, unknown adapter version, failed live capability probe, schema drift, version conflict, or `origin_offline`.
 
@@ -43,6 +43,6 @@ Stop immediately on missing assets, unsupported target or Origin mode, unknown a
 
 Return a redacted JSON `LinkStartReceipt` plus a short Traditional Chinese summary. Include exact Runtime version, protocol major, daemon status, opaque `connectionId`, display-only Callsign, App `instanceId`, adapter, preview grade, and launch status. Never include bearer or launch-grant material.
 
-On explicit close, delete the private context with `runtime.py close`. This removes the locally persisted ephemeral capability; it does not claim Runtime-side connection revocation unless a later Runtime schema reports it.
+On explicit close, use the selected host reference's close command. It stops any monitor lease before deleting the private context. This removes the locally persisted ephemeral capability; it does not claim Runtime-side connection revocation unless a later Runtime schema reports it.
 
 Do not claim completion from build, health, or Receipt evidence alone. MOP proves the mechanism ran; MOE requires a real App Event to arrive in this same Origin Session and real Agent Feedback to return to the same App Instance.

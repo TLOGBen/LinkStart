@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wayfinder 共識地圖</title>
+<style>
+  :root{
+    --sea:#101C26; --panel:#17283420; --card:#16242F; --line:#24384633;
+    --ink:#E8EDF2; --muted:#8FA3B0; --faint:#5C7280;
+    --beacon:#FFB454; --charted:#4FD6BE; --claimed:#7FB8E8; --blocked:#46606F;
+    --serif:Georgia,'Times New Roman',serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}*{animation:none!important;transition:none!important}}
+  body{
+    background:var(--sea);color:var(--ink);
+    font:15px/1.65 var(--serif);
+    background-image:
+      radial-gradient(1100px 500px at 85% -10%, #1B3040 0%, transparent 60%),
+      repeating-linear-gradient(0deg, transparent 0 59px, #FFFFFF06 59px 60px),
+      repeating-linear-gradient(90deg, transparent 0 59px, #FFFFFF06 59px 60px);
+    min-height:100vh;
+  }
+  .wrap{max-width:1060px;margin:0 auto;padding:48px 28px 96px}
+  .eyebrow{font:11px/1 var(--mono);letter-spacing:.28em;text-transform:uppercase;color:var(--faint)}
+  header .eyebrow{color:var(--beacon)}
+  h1{font-size:34px;font-weight:400;letter-spacing:.01em;margin:10px 0 6px}
+  .dest{border-left:2px solid var(--beacon);padding:6px 0 6px 18px;margin:22px 0 8px;font-size:18px;font-style:italic;color:var(--ink)}
+  .meta{font:12px var(--mono);color:var(--muted);margin-top:10px}
+
+  section{margin-top:52px}
+  h2{font-size:13px;font-weight:400;font-family:var(--mono);letter-spacing:.24em;text-transform:uppercase;color:var(--muted);
+     display:flex;align-items:center;gap:14px;margin-bottom:20px}
+  h2::after{content:"";flex:1;height:1px;background:linear-gradient(90deg,#2E4656,transparent)}
+
+  /* chart */
+  .chart{position:relative;border:1px solid #223644;border-radius:6px;background:#0C161E;overflow-x:auto}
+  .chart svg{display:block;min-width:640px}
+  .edge{stroke:#33505F;stroke-width:1.2;fill:none}
+  .edge.dest-edge{stroke-dasharray:4 5;stroke:#3B5A54}
+  .node{cursor:pointer}
+  .node rect{fill:#132430;stroke:var(--blocked);stroke-width:1.2;rx:7}
+  .node text{font:11px var(--mono);fill:var(--muted)}
+  .node .nid{font-size:12px;fill:var(--ink)}
+  .node.frontier rect{stroke:var(--beacon);fill:#211C10}
+  .node.frontier .halo{fill:var(--beacon);opacity:.14;animation:pulse 2.6s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.10}50%{opacity:.26}}
+  .node.resolved rect{stroke:var(--charted);fill:#0F211F}
+  .node.resolved .nid{fill:var(--charted)}
+  .node.claimed rect{stroke:var(--claimed)}
+  .node.dim,.edge.dim{opacity:.18}
+  .node.lit rect{stroke-width:2}
+  .edge.lit{stroke:var(--beacon);opacity:1}
+  .destflag text{font:12px var(--serif);font-style:italic;fill:var(--beacon)}
+  .destflag path{fill:var(--beacon)}
+  .fogveil{pointer-events:none}
+  .chart-cap{font:11px var(--mono);color:var(--faint);padding:10px 14px;border-top:1px solid #1B2C38;display:flex;gap:18px;flex-wrap:wrap}
+  .chart-cap b{font-weight:400}
+  .k{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;vertical-align:baseline}
+
+  /* filters + cards */
+  .chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+  .chip{font:11px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);
+        background:none;border:1px solid #2A4150;border-radius:99px;padding:5px 13px;cursor:pointer}
+  .chip[aria-pressed="true"]{color:var(--sea);background:var(--ink);border-color:var(--ink)}
+  .chip:focus-visible,.node:focus-visible rect,summary:focus-visible,a:focus-visible{outline:2px solid var(--beacon);outline-offset:2px}
+  .cards{display:grid;gap:10px}
+  details.card{background:var(--card);border:1px solid #223644;border-left-width:3px;border-radius:5px}
+  details.card[data-s="frontier"]{border-left-color:var(--beacon)}
+  details.card[data-s="resolved"]{border-left-color:var(--charted)}
+  details.card[data-s="claimed"]{border-left-color:var(--claimed)}
+  details.card[data-s="blocked"]{border-left-color:var(--blocked)}
+  summary{list-style:none;display:flex;gap:14px;align-items:baseline;padding:13px 18px;cursor:pointer;flex-wrap:wrap}
+  summary::-webkit-details-marker{display:none}
+  .tid{font:12px var(--mono);color:var(--faint);min-width:2.2em}
+  .ttitle{font-size:16px;flex:1;min-width:200px}
+  .badge{font:10px var(--mono);letter-spacing:.14em;text-transform:uppercase;padding:2px 9px;border-radius:3px;border:1px solid}
+  .badge.s-frontier{color:var(--beacon);border-color:var(--beacon)}
+  .badge.s-resolved{color:var(--charted);border-color:var(--charted)}
+  .badge.s-claimed{color:var(--claimed);border-color:var(--claimed)}
+  .badge.s-blocked{color:var(--blocked);border-color:var(--blocked)}
+  .badge.t{color:var(--faint);border-color:#2A4150}
+  .card-body{padding:2px 18px 18px;border-top:1px solid #1D303C;color:#C7D3DC}
+  .card-body h4{font:11px var(--mono);letter-spacing:.2em;text-transform:uppercase;color:var(--faint);margin:16px 0 6px}
+  .card-body p{margin:8px 0}
+  .card-body code{font:.85em var(--mono);background:#0C161E;padding:1px 6px;border-radius:3px}
+  .card-body a,li a,.dest a{color:var(--charted)}
+  .blockline{font:11px var(--mono);color:var(--faint)}
+
+  /* map sections */
+  .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:28px}
+  ul.plain{list-style:none;display:grid;gap:10px}
+  ul.plain li{padding-left:16px;position:relative;color:#C7D3DC}
+  ul.plain li::before{content:"—";position:absolute;left:0;color:var(--faint)}
+  .fogbox{position:relative;border:1px dashed #33505F;border-radius:6px;padding:20px 22px;overflow:hidden}
+  .fogbox::after{content:"";position:absolute;inset:0;pointer-events:none;
+    background:linear-gradient(105deg,transparent 30%,#8FA3B012 60%,#8FA3B022 100%)}
+  .oos li{color:var(--faint)}
+  .oos li::before{content:"✕";font-family:var(--mono);font-size:11px}
+  footer{margin-top:70px;font:11px var(--mono);color:#41566417;color:var(--faint);opacity:.7}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Wayfinder · 共識地圖</div>
+    <h1 id="effort-name"></h1>
+    <div class="dest" id="destination"></div>
+    <div class="meta" id="meta"></div>
+  </header>
+
+  <section aria-label="決策路線圖">
+    <h2>決策路線圖</h2>
+    <div class="chart">
+      <svg id="graph" role="img" aria-label="票券阻擋關係圖"></svg>
+      <div class="chart-cap">
+        <b><span class="k" style="background:var(--beacon)"></span>前線 — 現在可處理</b>
+        <b><span class="k" style="background:var(--claimed)"></span>已認領</b>
+        <b><span class="k" style="background:var(--charted)"></span>已解決</b>
+        <b><span class="k" style="background:var(--blocked)"></span>受阻</b>
+        <b style="margin-left:auto">滑過：標亮依賴鏈 · 點擊：開啟票券</b>
+      </div>
+    </div>
+  </section>
+
+  <section aria-label="決策票券">
+    <h2>決策票券</h2>
+    <div class="chips" id="chips" role="group" aria-label="依狀態篩選"></div>
+    <div class="cards" id="cards"></div>
+  </section>
+
+  <section>
+    <h2>目前已定案</h2>
+    <ul class="plain" id="decisions"></ul>
+  </section>
+
+  <section class="cols">
+    <div>
+      <h2>尚未釐清</h2>
+      <div class="fogbox"><ul class="plain" id="fog"></ul></div>
+    </div>
+    <div>
+      <h2>範圍外</h2>
+      <ul class="plain oos" id="oos"></ul>
+    </div>
+  </section>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+const DATA = {"effort": "linkstart-v1-formal-release", "destination": "正式發布 LinkStart v1 與 common-dev 的 `linkstart` Integration Plugin：本機 HTML／localhost App 能在原 turn 結束後，透過每位使用者一個的 LinkStart Daemon，持續把互動送回同一條 Claude Code Origin Session 或 Codex Origin Session，並在同一 App 收到回饋。", "notes": ["Canonical project：`https://github.com/TLOGBen/LinkStart`；Runtime、protocol、browser client 與 release artifacts 的 source of truth 在此 repo。", "Sibling integration repo：`/home/vakarve/projects/common-dev-plugin`；只承載薄的 `linkstart` Integration Plugin，Claude source canonical、Codex output generated。", "Wayfinder 只解決決策；route 清楚後才交棒實作與正式發布，不在 tickets 裡偷做 destination。", "最後一張 decision ticket 關閉時自動評估 `$strategic-advance` admission；只有 `OBJECTIVE_LOCKED + MULTI_TRANSITION_CAMPAIGN` 且同時出現 execution stall、live-state risk 或 session saturation 才開 campaign，否則用普通 contract-banded execution。", "預設繁體中文；grilling tickets 使用 `$grilling` + `$domain-modeling`，research tickets 使用 `$research` subagent，prototype tickets使用 `$prototype`。", "使用者已授權後續 HITL decisions 採 operator 的 recommended default，不再逐題停問；只有沒有安全預設、會改變 Destination 或需要新權限時才暫停。", "第一版：單機、單 OS 使用者、loopback；每位使用者最多一個 Daemon；Origin Session 的 agent process 離線時回 `origin_offline`，不排隊、不建立新 session。", "App Instance 只綁一個 Agent Connection；App Event 在 instance 內有序，以 `eventId` 去重；Delivery Ack 只代表 adapter 接受。", "Public skills：`open-connect`、`link-in`、`register-app`；Callsign 只供顯示，routing 使用 opaque `connectionId`。", "App Manifest 只描述 App；Claude/Codex plugin manifest 沿用各平台標準。", "LinkStart Runtime artifacts 由 GitHub Actions 建置：Windows x64、Linux x64 musl、macOS universal；第一版 unsigned + SHA-256。", "平台 binary 直接放在 `open-connect/assets/bin/<target>/` 並由 skill-local launcher 執行，不採首次下載或系統預裝。", "Runtime 已決定採 Rust；protocol 使用 major version（先 `v1`），Runtime 使用 SemVer，Plugin 內嵌確切 Runtime tag。", "不同 protocol/runtime 的既有 Daemon 必須 fail closed，經明確操作才 restart；不得自動中斷其他 session。", "LinkStart release workflow 自動建立 common-dev 同步 PR，不得直接 push common-dev main。", "License：MIT。", "驗收必須分開 MOP（mechanism 有執行）與 MOE（同一 Origin Session 與同一 App 真正完成往返）。"], "decisions": ["[Rust Runtime 與本機 Transport 選型](issues/01-rust-runtime-and-local-transport.md) — v1 採 Rust + loopback HTTP/1.1 JSON/SSE；不加入 WebSocket 或 OS-specific IPC。", "[Claude Origin Session Adapter 契約](issues/02-claude-origin-session-adapter.md) — Channel 為 canonical、Monitor + MCP reply 為 current-session compatibility，file/background 只作 diagnostic。", "[Codex Origin Session Adapter 契約](issues/03-codex-origin-session-adapter.md) — Origin thread 必須由同一 LinkStart-owned app-server 從開始持有；standalone TUI 不可 hot takeover。", "[Protocol 狀態機與傳遞語意](issues/04-protocol-state-machine-and-delivery.md) — durable Receipt 與 Delivery Ack 分離；instance 單一 in-flight、有序去重，公開狀態不假裝模型 processing-complete。", "[Loopback Trust 與 Capability 邊界](issues/05-loopback-trust-and-capability-boundary.md) — 每 App Instance bearer capability + exact Origin/Host gate；App input 永不具 approval／擴權語意。", "[Platform Preview／Experimental Admission Policy](issues/12-platform-preview-admission-policy.md) — 發布 `LinkStart v1 Preview`，stable core 與 preview adapters 分標，unknown capability/version 一律 fail closed。", "[App Manifest 與 Browser Client 契約](issues/06-app-manifest-and-browser-client.md) — v1 支援 self-contained HTML／localhost App，使用 vanilla fetch-authenticated client，明確顯示 Receipt/Ack/Feedback 而不暴露 routing secret。", "[Daemon 發現、生命週期與版本切換](issues/07-daemon-lifecycle-and-version-switch.md) — on-demand 單一 Daemon、SQLite/WAL durable journal、版本衝突 fail closed、明確 drain/restart/rebind。", "[三個公開 Skill 的責任與 UX](issues/08-public-skill-responsibilities.md) — open-connect 編排全流程，link-in 只接 Origin Session，register-app 只建立／啟動 App；Runtime protocol 是唯一 delivery authority。", "[Skill-local Binary 與雙平台 Port 契約](issues/09-skill-local-binary-and-port-contract.md) — 唯一 binary copy 在 open-connect assets；direct execution 前驗 exact version/SHA，Codex 只由 transfer 生成並做 byte/mode parity gate。", "[GitHub Actions Release 與跨 Repo 同步](issues/10-release-and-cross-repo-sync.md) — LinkStart tag 建三平台 canonical assets/SBOM/checksums；最小權限 workflow 只開 common-dev 同步 PR，經 transfer/install/parity gates 後人工合併。", "[MOP／MOE 跨平台驗收矩陣](issues/11-mop-moe-release-gate.md) — Windows/Linux/macOS × Claude/Codex 六格分開驗 MOP/MOE；真 Origin Session evidence 不得由 build、mock或別的平台替代。"], "fog": [], "outOfScope": ["第一版不支援區網、遠端、多使用者或跨裝置連線。", "第一版不支援 Origin Session process 離線期間的 durable queue，也不自動建立替代 session。", "第一版不支援一個 App Instance fan-out 多個 Agent Connection。", "第一版不發布 Windows ARM64 或 Linux ARM64 artifacts。", "第一版不以 macOS notarization 或 Windows code signing 作 release gate；只發布 unsigned artifacts 與 SHA-256。", "第一版不提供 React、Vue、Svelte 等 framework-specific browser bindings；只發布 vanilla client。", "LinkStart workflow 不得直接 push common-dev main。"], "tickets": [{"id": "01", "title": "Rust Runtime 與本機 Transport 選型", "type": "research", "status": "resolved", "blockedBy": ["## Question"], "question": "在「每位使用者一個 Daemon、skill-local binary 直接執行、Windows x64／Linux x64 musl／macOS universal」的限制下，Rust 是否仍是 LinkStart Runtime 的最佳選擇；若是，v1 應採哪組本機 transport、HTTP/SSE/WebSocket 或 IPC primitives，才能同時滿足 browser App、Claude adapter、Codex app-server adapter、單一 binary 與低維運成本？", "answer": "LinkStart v1 Runtime 採 Rust，公開面只使用 loopback TCP 的 HTTP/1.1：client → Daemon 採 JSON request/response，Daemon → client 採 SSE。v1 不加入 WebSocket、Unix socket 或 Windows named pipe；Go 只在 Rust 維護能力成為已證明 execution risk 時作 fallback。三平台 artifacts 必須逐 target 執行 smoke/linkage 驗證，macOS 兩個 slices 經 `lipo` 合成 universal。Browser capability auth、CORS/LNA、`file://` 與 SSE cursor 留給後續 protocol/App tickets。\n\nEvidence：[Rust Runtime 與本機 Transport 選型研究](../research/01-rust-runtime-and-local-transport.md)。", "comments": "", "file": "issues/01-rust-runtime-and-local-transport.md"}, {"id": "02", "title": "Claude Origin Session Adapter 契約", "type": "research", "status": "resolved", "blockedBy": ["## Question"], "question": "LinkStart Integration Plugin 應以 Claude Code Channels、Monitor/background completion、Agent SDK 或其明確組合作為 canonical adapter，才能在 Origin Session idle 後接收 App Event、保持 Callsign/connectionId 關係、回傳 agent feedback，並在 Daemon restart 後恢復而不另開 session？", "answer": "Two-way Claude Code Channel 是 canonical semantic adapter，以 `notifications/claude/channel` 接收 App Event、以同 plugin MCP `send_feedback` tool 回覆；對已開啟且未 opt-in Channel 的 Origin Session，採 plugin Monitor + 同一 MCP reply protocol 作 compatibility adapter。File-mailbox/background completion 只保留 diagnostic fallback；Agent SDK、Remote Control 與自動 session resume 不符合 Origin running-session contract。Claude process offline 時 fail closed；Daemon restart 只做同 connection rebind，不另開 session。\n\nEvidence：[Claude Origin Session Adapter 研究](../research/02-claude-origin-session-adapter.md)。", "comments": "", "file": "issues/02-claude-origin-session-adapter.md"}, {"id": "03", "title": "Codex Origin Session Adapter 契約", "type": "research", "status": "resolved", "blockedBy": ["## Question"], "question": "LinkStart Integration Plugin 如何讓產出 App 的 Codex Origin Session 從一開始就可由 app-server 持續控制，並正確使用 active-turn steering、idle-turn start、thread resume 與 streamed events；對已經以 standalone TUI 開啟、未由 app-server 擁有的 session，v1 應宣告什麼限制？", "answer": "Codex Origin thread 必須從建立或明確 resume 起就由同一個 LinkStart-owned app-server process 持有，Codex TUI 從開始即以 `--remote` 加入。App Event 在 active turn 使用 `turn/steer(expectedTurnId)`，idle 使用 `turn/start`；feedback 與完成狀態由 subscribed item/turn events 回傳。已開啟的 standalone embedded TUI 不支援 hot takeover；必須先結束，再由 LinkStart launcher 明確 resume。Origin app-server process offline 時回 `origin_offline`，不得為投遞而自動 cold resume。\n\nEvidence：[Codex Origin Session Adapter 研究](../research/03-codex-origin-session-adapter.md)。", "comments": "", "file": "issues/03-codex-origin-session-adapter.md"}, {"id": "04", "title": "Protocol 狀態機與傳遞語意", "type": "grilling", "status": "resolved", "blockedBy": ["01", "02", "03"], "question": "LinkStart protocol v1 應定義哪些 Agent Connection、App Registration、App Instance、App Event、Delivery Ack 與 agent feedback 狀態及合法轉移，才能誠實保證 instance 內有序、`eventId` 去重、idle Origin Session 喚醒與 `origin_offline`，而不誤稱 exactly-once 或 processing-complete？", "answer": "Protocol v1 採以下 platform-neutral state contract；Claude/Codex adapter 只能把平台事件映射進這個 contract，不得新增另一套 delivery 語意。\n\n### Agent Connection\n\n公開狀態為 `online`、`reconnecting`、`offline`、`closed`：\n\n- attach 成功後進入 `online`。\n- Daemon／adapter transport 暫時中斷、但 Origin process 仍可能存活時進入 `reconnecting`；同一 `connectionId` rebind 成功後回 `online`。\n- Origin process 結束、rebind deadline 到期或 adapter fatal failure 時進入 `offline`。使用者明確 resume 同一 Origin Session 並再次 `link-in` 時，才可用原 capability rebind 回 `online`。\n- 明確 detach／revoke 進入 terminal `closed`，不可復活。\n\n### App Registration 與 App Instance\n\n- App Registration 為 `registered → revoked`；`revoked` terminal。\n- App Instance 為 `connected ↔ disconnected → closed`。\n- App Instance 建立時綁定恰好一個 Agent Connection，生命週期中不可換綁；要換 Origin Session 必須建立新 instance。\n\n### App Event、Receipt 與 Delivery Ack\n\n提交時先驗 protocol major、App capability、schema、Origin／Connection 狀態與 payload limit；驗證失敗不建立 App Event。Origin 已 offline 時直接回 `origin_offline`，不收件、不排隊。\n\n驗證成功後，Daemon 以 durable journal 原子寫入 App Event、配置 instance-local monotonic sequence，回傳 Event Receipt，公開狀態由 `received` 開始：\n\n```text\nreceived ──adapter accepts──> delivered\n    ├────terminal error─────> failed\n    └────cancel before ack──> cancelled\n```\n\n- 每個 App Instance 同時只允許一個 In-flight App Event，其餘 `received` events 依 sequence 等候。\n- `delivered` 只表示 Agent adapter 已接受事件；不是模型開始處理、完成處理或 tool approval。\n- `failed` terminal reason 至少包含 `origin_offline`、`delivery_timeout`、`adapter_rejected`、`connection_closed`。\n- App 只能取消仍為 `received` 的 Event；`delivered` 後不能撤回，只能送新的修正 Event。\n- 相同 `eventId` + 相同 canonical payload 回傳既有 Receipt 與目前狀態，不配置新 sequence；相同 ID + 不同 payload 回 `event_id_conflict`。\n- Origin 仍 online、但 adapter 暫時不可投遞時，Event 保持 `received` 並等候安全 delivery boundary；超過 Daemon 定義的 deadline 才 `failed(delivery_timeout)`。精確 deadline、retention 與 restart recovery 由「Daemon 發現、生命週期與版本切換」決定。\n- Daemon restart 後只恢復 durable `received` events；若同一 Agent Connection 未能 rebind 為 online，這些 Event 轉 `failed(origin_offline)`，不等待新的替代 session。\n- Adapter acceptance 本身必須以 `eventId` idempotent；結果未知時先 reconcile，再決定是否 retry。LinkStart 只保證一個 logical Event record 與去重投遞，不宣稱跨模型 context 的 exactly-once。\n\nEvent Receipt 可由 HTTP response 返回；Event 狀態變更與 Delivery Ack 經 SSE 推送。SSE transport cursor 只用於 stream resume，不取代 domain `eventId`。\n\n### Agent Feedback\n\n- 每則 Agent Feedback 有 opaque `feedbackId`，並可選擇攜帶 `inReplyToEventId`；因此既能回應 App Event，也能主動回報進度。\n- Feedback 先持久寫入 journal，再經 App Instance 的 SSE stream 送出；App reconnect 以 transport cursor replay 尚未觀察的 Feedback。\n- Feedback 不把所關聯 App Event 改成 `completed`；Delivery Ack、Agent Feedback 與模型處理完成是三個不同概念。\n\n### Adapter mapping\n\n- Claude Channel／Monitor 只有在 channel notification 或 Monitor adapter 確認接收後才能產生 Delivery Ack。\n- Codex active turn 以 `turn/steer(expectedTurnId)` 接受，idle thread 以 `turn/start` 接受；race／non-steerable 必須重新同步或保持 `received`，不得靜默換成新 session。\n- Adapter process offline 一律映射為 Agent Connection `offline`；不得以 SDK subprocess、cold resume 或另一條 session 代打。\n\n此 contract 保證 instance-local ordering、eventId idempotency、idle Origin Session delivery 與可觀測失敗；明確不保證 model processing-complete、tool approval、全域 ordering 或 exactly-once。", "comments": "", "file": "issues/04-protocol-state-machine-and-delivery.md"}, {"id": "05", "title": "Loopback Trust 與 Capability 邊界", "type": "grilling", "status": "resolved", "blockedBy": ["04"], "question": "在單機 loopback 範圍內，v1 最小必須如何建立 App Instance capability、Origin/Host/sender gate、connectionId 保護與 replay 防線，並明文禁止 App Event 被當成 tool approval、permission grant 或 scope expansion？", "answer": "- 每個 App Instance 使用 CSPRNG 產生、不可推導且與該 instance/Agent Connection 綁定的 bearer capability；`connectionId` 只作 locator，不是 authentication secret。\n- 所有 JSON requests 與 SSE 都由 browser client 使用 `fetch` + `Authorization`；v1 不把長效 secret 放 query string、cookie，也不使用無法帶自訂 header 的 native `EventSource`。\n- Daemon 同時驗 exact `Host`、已註冊的 exact `Origin`、method、content type、body limit 與 capability；CORS/LNA 只是 browser policy，不能代替 sender capability。\n- Self-contained HTML 由 Daemon 提供 loopback launch URL；若支援 `file://`／`Origin: null`，只能透過一次性、短效 launch grant，且必須列入真 browser MOP，不能把 `null` origin 當身份。\n- SSE reconnect 每次重新驗 capability；transport cursor 只能在同 App Instance/restart epoch 內 resume。Domain `eventId` 仍依既定同-ID同-payload idempotency，異 payload 回 conflict。\n- App Event 永遠是不可信 user/application input，不能代表 tool approval、permission grant、scope expansion 或 sandbox escalation。v1 不宣告 Claude permission relay，也不替 Codex 回 approval request。\n- State directory 在 Unix 建立為 `0700`、檔案 `0600`；Windows 使用 current-user-only DACL。不得持久記錄 bearer、credentials 或 app secrets 超過必要生命週期。\n- Capability revoke、App Instance close 或 Agent Connection close 後，所有後續 request/reconnect fail closed。\n\n此 contract 防同瀏覽器其他 origin、重放與 locator 猜測；同一 OS 使用者下的惡意 process 明列為 v1 threat-model 外，不冒充已隔離。", "comments": "", "file": "issues/05-loopback-trust-and-capability-boundary.md"}, {"id": "06", "title": "App Manifest 與 Browser Client 契約", "type": "prototype", "status": "resolved", "blockedBy": ["04", "05"], "question": "App Manifest、vanilla browser client 與 `register-app` 的最小可感知 contract 應長什麼樣，才能同時接 self-contained HTML 與既有 localhost web app，讓使用者看見連線狀態、Callsign、Event Receipt／Delivery Ack、可 replay 的 Agent Feedback，以及 agent 主動發起的 structured question／elicitation，而不暴露 routing credentials或把回答誤當 tool approval？", "answer": "- App Manifest v1 欄位固定為 `protocolMajor`、`appId`、`displayName`、`appVersion`、`entry`、`originPolicy`、`requestedCapabilities`、`structuredInputs`；Manifest 不含 bearer、connectionId、tool approval 或 permission relay。\n- `entry.kind` 支援 `self_contained_html` 與 `localhost_app`；前者以一次性 fragment launch grant 換 App Instance capability，後者綁 exact scheme/host/port Origin。\n- Browser client v1 採 vanilla JavaScript，公開 connect/register/send/cancel/reconnect 與 state/feedback/question subscriptions；所有 JSON/SSE 使用 `fetch + Authorization`，capability 只留記憶體。\n- UI 必須分別呈現 App Instance／Origin Connection、Callsign、Event Receipt、Delivery Ack、failed/cancelled、Feedback replay 與 `origin_offline`；Callsign 不顯示 routing credential。\n- Structured question 是 Agent Feedback；使用者回答會建立新的 App Event。即使回答文字為「同意」，也不能映射成 tool approval 或 permission verdict。\n- v1 只交付 vanilla client；React/Vue/Svelte bindings 不進 v1。\n\nPrototype 已由真 browser 驅動 happy/error/reconnect scenarios，狀態在操作中改變且無 console/page errors。", "comments": "", "file": "issues/06-app-manifest-and-browser-client.md"}, {"id": "07", "title": "Daemon 發現、生命週期與版本切換", "type": "prototype", "status": "resolved", "blockedBy": ["01", "04", "05"], "question": "每位使用者一個 LinkStart Daemon 的 discovery、start、health、idle、restart、crash 與 version-conflict 狀態機應如何運作；Event/Feedback journal 採何種 retention、delivery/rebind deadline 與 recovery；才能讓 `open-connect` 找到既有 Daemon、對不相容版本 fail closed，並只在明確操作後安全 restart 而不破壞其他 Agent Connection？", "answer": "- Daemon 採 on-demand start，不註冊 OS login auto-start。Discovery record 只作 locator；`open-connect` 必須再做 authenticated health/version/protocol handshake。\n- 每位 OS 使用者最多一個 Daemon；同 exact Runtime version + protocol major 直接重用。Version 不同時 fail closed，active/reconnecting connections 存在時禁止自動 restart。\n- 明確 upgrade 流程為 `request → drain（停止新 Receipt）→ journal commit → stop → start target → WAL recovery → same connectionId rebind`；protocol major 不相容時舊 connection 不可 rebind。\n- Durable state 採 SQLite-style single journal、WAL、`synchronous=FULL`、receipt-first commit。Unix state dir `0700`／DB-WAL-lock `0600`；Windows current-user-only DACL。\n- Defaults：delivery deadline 120 秒、rebind grace 30 秒、drain deadline 30 秒、Event/Feedback retention 7 天、零 live/reconnecting connection 且無 received Event 時 idle 15 分鐘自動停止。\n- Crash 後保留 received Event 與未觀察 Feedback；重啟執行 WAL recovery並等待同 connectionId rebind。Grace 到期則 connection → offline、received Event → `failed(origin_offline)`，不 cold resume。\n- `closed` connection terminal，capability revoke；Feedback 先 journal 後 SSE，App reconnect 以 cursor replay。\n\nPrototype 已由真 browser 驅動 happy/version-conflict/crash scenarios，狀態在操作中改變且無 console/page errors。", "comments": "", "file": "issues/07-daemon-lifecycle-and-version-switch.md"}, {"id": "08", "title": "三個公開 Skill 的責任與 UX", "type": "grilling", "status": "resolved", "blockedBy": ["02", "03", "06", "07", "12"], "question": "`open-connect`、`link-in`、`register-app` 三個 public skills 的前置條件、輸入、可觀測輸出、失敗語意與互相協調方式應如何切分，才能讓一般入口簡單、進階操作可組合，且 Claude/Codex 只在 adapter 層分歧？", "answer": "- `open-connect` 是一般使用者的 composite entry。輸入 App Manifest；選取 `open-connect/assets/bin/<target>/` 的 exact-version Runtime；完成 discovery + authenticated health/version handshake。同版重用、缺席則 on-demand start、版本衝突 fail closed，只有明示 `explicit_drain_restart` 才切換。之後依序呼叫 `link-in` 與 `register-app`，回傳不含 bearer 的 `OpenConnectReceipt`。\n- `link-in` 只建立／rebind 目前 Origin Session 的 Agent Connection，輸出 opaque `connectionId`、display-only Callsign、adapter、`previewGrade` 與 connection status。Claude：Channel → 通過 self-test 的 Monitor → `claude_adapter_unavailable`；Codex：只接受 allowlisted LinkStart-owned app-server remote thread，standalone embedded TUI 回 `codex_origin_mode_unsupported`。它不啟動 Daemon、不註冊 App、不管理 Event queue。\n- `register-app` 只接受固定 App Manifest v1 與 online `connectionId`，驗證後建立 durable App Registration；`launch=open` 時核發一次性 grant並交 OS browser，只回 redacted receipt。它不 attach Origin、不啟動 Daemon，也不把 App 回答視為 tool approval。\n- 固定 orchestration 為 `open-connect → resolve/start/reuse Daemon → link-in → register-app → composite receipt`；任一步失敗即停止後續步驟。Durable registration 不假裝 rollback；browser launch failure 回 registration receipt + `browser_launch_failed`。\n- Skills 只擁有使用者 workflow；Receipt、Delivery Ack、Feedback、ordering/dedupe 與 delivery errors 全屬 LinkStart Runtime protocol，不得在 skill 層定義第二套。\n- 唯一 binary owner 為 `plugins/linkstart/skills/open-connect/assets/bin/<target>/linkstart[.exe]`；另外兩個 skills 共用同 launcher，不複製 binary、不首次下載、不要求 system install。\n\n公開 receipts：`OpenConnectReceipt`、`AgentConnectionReceipt`、`AppRegistrationReceipt`；所有成功輸出帶 `previewGrade`，所有 secrets 只以 redacted/存在性呈現。", "comments": "", "file": "issues/08-public-skill-responsibilities.md"}, {"id": "09", "title": "Skill-local Binary 與雙平台 Port 契約", "type": "grilling", "status": "resolved", "blockedBy": ["01", "07", "08"], "question": "`plugins/linkstart/skills/open-connect/assets/bin/<target>/` 應如何放置、選擇、驗 checksum 並直接執行各平台 binary，Claude source 如何引用 skill-local assets，Codex generated output 如何保證完整複製與 executable behavior，而不重複 binary 或手改 generated subtree？", "answer": "唯一 binary source layout：\n\n```text\nplugins/linkstart/skills/open-connect/assets/\n├── bin/\n│   ├── linux-x64-musl/linkstart\n│   ├── windows-x64/linkstart.exe\n│   └── macos-universal/linkstart\n└── checksums.json\n```\n\n- Binary 來源必須是 exact LinkStart Runtime tag 的 GitHub Release assets；`checksums.json` 記錄 Runtime SemVer、protocol major、target、size、SHA-256 與 build provenance。Plugin 不自行重編 binary。\n- Target resolution 依**執行環境**而非外層 OS：Linux/WSL → `linux-x64-musl`、Windows native → `windows-x64`、macOS → `macos-universal`；unsupported arch fail closed。\n- 執行前以 target path + `checksums.json` 驗 SHA-256、Runtime exact version 與 protocol major；不符回 `runtime_binary_invalid`，不得找 PATH 或下載替代品。\n- Unix/macOS binary 以 Git mode `100755` 追蹤；Windows `.exe` 不依賴 POSIX mode。若 plugin cache 無 executable permission或被 noexec/quarantine 阻擋，fail closed並回可診斷錯誤，不偷偷複製到別處。\n- Claude source 透過 skill-local root 引用 `open-connect/assets/...`；Codex skill 由 transfer 產生其對應 root resolver，skills 不硬編 user cache/version path。\n- `assets/` 是 transfer 的標準遞迴 copy surface；binary 不放 plugin-root assets。Transfer 後必須 machine-check source/generated 每個 binary SHA-256、size、相對 path 與 Unix mode；不得只信 closure existence。\n- `link-in`、`register-app` 不攜帶 binary，只呼叫 `open-connect` 定義的同一 resolver／launcher contract。\n- `codex/` 永遠由 Claude source transfer 生成；不得手改 generated binary subtree。兩個 marketplace catalogs 手動新增 `linkstart` entry並與生成 tree 對齊。\n- common-dev `AGENTS.md` 應同步修正 transfer copy-surface drift（目前實作亦含 `evals/`），並新增 binary parity validation；README/CHANGELOG、plugin version 與 catalog version跟隨 distributed change 更新。", "comments": "", "file": "issues/09-skill-local-binary-and-port-contract.md"}, {"id": "10", "title": "GitHub Actions Release 與跨 Repo 同步", "type": "grilling", "status": "resolved", "blockedBy": ["09"], "question": "LinkStart tag 到 GitHub Release、三平台 artifacts、SHA-256、macOS universal 組裝、MIT source release，再到 common-dev 自動同步 PR、plugin version bump、Claude→Codex regeneration 與 install verification 的 release contract 應如何設計，才能保持 LinkStart artifact canonical 且不讓 workflow 直接改 common-dev main？", "answer": "### LinkStart release\n\n- Runtime tag `vMAJOR.MINOR.PATCH` 觸發 GitHub Actions；tag 必須指向 main 的 clean、測試通過 commit。\n- Native matrix：Windows x64 MSVC、Linux x64 musl、macOS arm64、macOS Intel；每個 slice先 test + executable smoke + linkage inspection，macOS 再以 `lipo` 合成並驗證 universal。\n- Release assets 固定為三個 target binary archives/raw artifacts、`SHA256SUMS`、`release-manifest.json`、SPDX JSON SBOM、MIT LICENSE 與 source archive。`release-manifest.json` 記錄 Runtime SemVer、protocol major、commit、target、size、SHA-256、runner image與 build timestamp。\n- v1 要求 deterministic inputs／locked dependencies／documented toolchain，但不以跨 runner bit-for-bit reproducibility 作 gate；差異以 provenance 顯示，不冒充 reproducible build。\n- 只有 all-target gates 綠才建立 GitHub Release；Preview Adapter MOE gate由 ticket 11 管理，未通過不得 tag。\n\n### common-dev 同步 PR\n\n- Release publish 成功後，以最小權限 GitHub App token（fallback fine-grained PAT）建立／更新 `linkstart/runtime-v<version>` branch 與 PR；token 只允許 common-dev contents/pull-request必要權限，不得直接 push main。\n- Workflow 從剛發布的 exact release下載 artifacts，先驗 `SHA256SUMS`／manifest，再更新 `plugins/linkstart/skills/open-connect/assets/bin/<target>/` 與 `checksums.json`。\n- 同步 PR 同時 bump `linkstart` plugin version、common-dev marketplace/catalog version，更新兩個 marketplace catalogs、README、CHANGELOG、AGENTS binary/transfer規則。\n- 以 pinned Baransu transfer 版本從 Claude source 生成 `codex/plugins/linkstart/`；不得手改 generated subtree。\n- PR gate：全部 JSON parse、Claude/Codex manifest shape、source/generated binary SHA/size/mode parity、transfer closure、temporary Codex HOME Layout A install/list/add、README/CHANGELOG/version consistency。\n- Branch/PR creation 必須 idempotent；同 Runtime tag 重跑只更新同一 branch／PR，不建立重複 PR。PR body 列 source tag/commit、artifact checksums、protocol major、Preview maturity 與完整 validation receipts。\n- common-dev reviewer/CI 合併後才算 Integration Plugin 發布；LinkStart Release 存在只算 Runtime MOP，不算雙 repo release MOE。\n\n### Recovery\n\n- LinkStart release 失敗：不建立 release、不觸發 sync。\n- Sync 驗證失敗：保留 LinkStart release，PR 標 failed/blocked，不推 main、不回滾 canonical assets。\n- common-dev 拒絕／延後：Runtime release仍有效，但不得宣稱該版本已內嵌於 Integration Plugin。", "comments": "", "file": "issues/10-release-and-cross-repo-sync.md"}, {"id": "11", "title": "MOP／MOE 跨平台驗收矩陣", "type": "grilling", "status": "resolved", "blockedBy": ["02", "03", "06", "07", "08", "09", "10", "12"], "question": "正式發布前必須有哪些 Windows、Linux、macOS × Claude Code、Codex 的真實驗收案例，才能分別證明 MOP 與 MOE：App Event 進入同一 Origin Session、idle 後仍可互動、Daemon restart 可恢復、feedback 回到同一 App、不同版本 fail closed，且全程沒有另開未綁定 session？", "answer": "正式 tag 前建立 Windows、Linux、macOS × Claude Code、Codex 六格 evidence matrix；每格分開記 MOP 與 MOE，任何 MOE 空白都不得以 build、mock、curl 或另一平台結果代填。\n\n### 每格 MOP\n\n- exact target binary SHA/version/protocol、native executable smoke、authenticated health、private state-dir permissions。\n- self-contained HTML 與 localhost App 的真 browser registration、launch grant redemption、JSON Receipt、fetch-SSE connect/reconnect、Feedback replay、CORS/LNA/error diagnostics。\n- Claude/Codex capability detection、minimum/allowlisted version、adapter label、schema/help handshake；unknown version与 unsupported mode fail closed。\n- common-dev Claude source／Codex generated assets parity、temporary plugin install/list/add、skill-local binary direct execution。\n\n### 每格 MOE\n\n每次測試記錄不可變的 `sessionId/thread.id`、`connectionId`、`appInstanceId`、`eventId`、`feedbackId` 與 browser DOM evidence：\n\n1. Agent 產 App，turn 結束；App 再送 Event，idle Origin Session 被喚醒且 identity 不變。\n2. Origin busy 時連送兩個 Event；instance sequence 有序、同 `eventId` 不重複、adapter 接受才 Delivery Ack。\n3. Agent Feedback 回同一 App；browser 斷線期間 feedback 先 journal，重連後以 cursor replay，DOM 恰好顯示一次。\n4. Daemon crash/restart；WAL recovery 後同 connectionId rebind，received Event/Feedback不遺失、不另開 session。\n5. Origin process offline；App 得 `origin_offline`，沒有 `claude -p`、SDK代打、Codex cold resume或替代 session。\n6. Runtime/protocol/adapter version mismatch；清楚 fail closed，無自動 restart或不受支援 fallback。\n7. App 的「同意」／structured answer 無法批准任何工具或擴權；原生 approval仍是唯一 authority。\n\n### Adapter-specific gates\n\n- Claude：Channel-enabled canonical path、busy queue、`send_feedback`；另驗 current-session Monitor compatibility path。兩者皆保留同 session ID；unsupported provider/policy回 unavailable。\n- Codex Unix（Linux/macOS）：LinkStart-owned app-server + Unix remote TUI，active `turn/steer(expectedTurnId)`／idle `turn/start`／running `thread/resume`。\n- Codex Windows：loopback WebSocket remote TUI，明標 experimental/production unsupported；standalone embedded TUI hot takeover 必須拒絕。\n\n### Evidence authority\n\n- GitHub-hosted CI 可證明 build、unit/integration、browser MOP與mock adapter contract，不能證明登入後的真 Origin Session MOE。\n- 六格真 MOE 必須在受控 native host 上執行並保存 runner/OS/CLI version、raw protocol receipts與browser screenshot/DOM。缺少 macOS/Windows host或登入權限時，terminal 是 `NEW_AUTHORITY_REQUIRED`，不可降級 gate。\n- Runtime GitHub Release、common-dev 同步 PR與 main push是 release MOP；只有六格 matrix全 PASS、兩 repo version/README/changelog一致、無 blocking cleanup，才是正式發布 MOE。", "comments": "", "file": "issues/11-mop-moe-release-gate.md"}, {"id": "12", "title": "Platform Preview／Experimental Admission Policy", "type": "grilling", "status": "resolved", "blockedBy": ["02", "03"], "question": "LinkStart v1 的「正式發布」是否允許依賴 Claude Channels／Monitor 與 Codex Windows app-server WebSocket 這些 preview／experimental surfaces；若允許，支援聲明、能力偵測、fail-closed fallback、最低版本與退出條件應如何寫，才能誠實發布而不把 preview MOP 說成穩定 MOE？", "answer": "允許發布版本化 artifacts，但產品名稱與支援聲明固定為 **「LinkStart v1 Preview：Stable core + Preview platform adapters」**；「正式」描述 release discipline，不代表 Claude/Codex adapters 已 GA 或 production-ready。\n\n- Claude product floor 設 `2.1.105+`：Channel 標示 `Research Preview`，Monitor 標示 `Experimental compatibility`。Channel 未 opt-in/allowlist 時可降到通過 self-test 的 Monitor；兩者皆不成立則 `claude_adapter_unavailable`，不自動落 file-mailbox。\n- Codex 初始只 allowlist 已實測 `0.149.1`，每個新版本須重跑 CLI help、generated schema 與完整 MOE 才加入；不得以 `>=` 自動放行 preview protocol。\n- Codex Unix remote app-server 標 `Experimental Preview`；Windows loopback WebSocket 明標 `Experimental, not supported for production`。Standalone embedded TUI 標 `Unsupported origin mode`。\n- Capability detection 必須以實際 initialize/handshake、必要 methods/events、live subscription 與 nonce round-trip 證明，不能只看 version 或「Connected」文字。\n- 任一 schema drift、transport mismatch、unknown version、Origin process offline 或 live-thread join 失敗都 fail closed，不 cold resume、不猜 fallback。\n- Adapter 升 Stable 的必要條件：上游移除 preview/experimental/production-unsupported 標籤；Claude custom Channel 有一般 marketplace admission；Codex app-server/remote transport 有 production contract；連續兩個受支援版本完成全平台 MOP/MOE，且 LinkStart 不再依賴 undocumented source behavior。\n\n在上述 admission gate 尚未全綠前，不得使用 `Stable Claude integration`、`Stable Codex integration` 或 `Production-ready Windows Codex` 字樣。", "comments": "", "file": "issues/12-platform-preview-admission-policy.md"}], "generatedAt": "2026-08-27 03:15 UTC", "source": "/home/vakarve/projects/LinkStart/.claude/wayfinder/linkstart-v1-formal-release", "language": "zh-TW", "labels": {"htmlLang": "zh-Hant", "pageTitle": "Wayfinder 共識地圖", "eyebrow": "Wayfinder · 共識地圖", "routeChartAria": "決策路線圖", "routeChart": "決策路線圖", "graphAria": "票券阻擋關係圖", "legendFrontier": "前線 — 現在可處理", "legendClaimed": "已認領", "legendResolved": "已解決", "legendBlocked": "受阻", "legendHint": "滑過：標亮依賴鏈 · 點擊：開啟票券", "ticketsAria": "決策票券", "tickets": "決策票券", "filterAria": "依狀態篩選", "decisions": "目前已定案", "fog": "尚未釐清", "outOfScope": "範圍外", "status": {"frontier": "可處理", "claimed": "已認領", "blocked": "受阻", "resolved": "已解決"}, "type": {"research": "研究", "prototype": "原型", "grilling": "決策釐清", "task": "任務"}, "metaTemplate": "{total} 張票券 — {resolved} 張已解決 · {frontier} 張現在可處理 · {claimed} 張已認領 · {blocked} 張受阻", "generated": "產生時間", "source": "來源", "documentTitle": "Wayfinder 共識地圖", "destination": "目的地", "prerequisite": "前置", "question": "要回答的問題", "answer": "定案", "comments": "補充", "openTicket": "開啟 Markdown 票券", "all": "全部", "empty": "目前沒有內容"}};
+const L = DATA.labels;
+const STATUS_LABEL = L.status;
+const TYPE_LABEL = L.type;
+const format = (template, values) => template.replace(/\{(\w+)\}/g, (_, key) => values[key]);
+
+/* ---------- tiny markdown-lite ---------- */
+const esc = s => s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const safeUrl = u => {
+  const t = String(u).trim();
+  return /^(https?:|mailto:|#|\/|\.\/|\.\.\/)/i.test(t) ? t.replace(/["'<>]/g, c => ({'"':'&quot;',"'":'&#39;','<':'&lt;','>':'&gt;'}[c])) : '#';
+};
+const md = s => esc(s)
+  .replace(/`([^`]+)`/g,'<code>$1</code>')
+  .replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>')
+  .replace(/\[([^\]]+)\]\(([^)]+)\)/g,(_,txt,url)=>`<a href="${safeUrl(url)}" rel="noreferrer noopener">${txt}</a>`);
+const mdBlock = s => s.trim().split(/\n{2,}/).map(p=>'<p>'+md(p).replace(/\n/g,'<br>')+'</p>').join('');
+
+/* ---------- status ---------- */
+const byId = {}; DATA.tickets.forEach(t=>byId[t.id]=t);
+function status(t){
+  if(t.status==='resolved') return 'resolved';
+  if(t.status==='claimed') return 'claimed';
+  const blocked = t.blockedBy.some(b => byId[b] && byId[b].status!=='resolved');
+  return blocked ? 'blocked' : 'frontier';
+}
+DATA.tickets.forEach(t=>t.s=status(t));
+
+/* ---------- header ---------- */
+document.getElementById('effort-name').textContent = DATA.effort;
+document.getElementById('destination').innerHTML = md(DATA.destination);
+const n = s => DATA.tickets.filter(t=>t.s===s).length;
+document.getElementById('meta').textContent =
+  format(L.metaTemplate,{total:DATA.tickets.length,resolved:n('resolved'),frontier:n('frontier'),claimed:n('claimed'),blocked:n('blocked')});
+document.getElementById('foot').textContent = `${L.generated} ${DATA.generatedAt} · ${L.source}: ${DATA.source}`;
+document.title = `${L.documentTitle} — ${DATA.effort}`;
+
+/* ---------- graph layout: columns by longest blocking depth ---------- */
+const depth = {};
+function d(t){ if(depth[t.id]!=null) return depth[t.id];
+  depth[t.id] = t.blockedBy.length ? 1+Math.max(...t.blockedBy.map(b=>byId[b]?d(byId[b]):0)) : 0;
+  return depth[t.id]; }
+DATA.tickets.forEach(d);
+const maxD = Math.max(0,...Object.values(depth));
+const cols = Array.from({length:maxD+1},()=>[]);
+DATA.tickets.forEach(t=>cols[depth[t.id]].push(t));
+const CW=208, NW=156, NH=44, PAD=46;
+/* CJK glyphs render ~2× a latin cell in monospace — truncate by display width, not char count */
+const cut=(s,max)=>{let u=0,out='';for(const c of s){u+=c.charCodeAt(0)>0x2E7F?2:1;if(u>max)return out+'…';out+=c;}return s;};
+const rows = Math.max(...cols.map(c=>c.length));
+const H = Math.max(230, rows*74+70), W = PAD*2 + (maxD+1)*CW + 150;
+const svg = document.getElementById('graph');
+svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
+const pos = {};
+cols.forEach((col,ci)=>col.forEach((t,ri)=>{
+  const x = PAD + ci*CW;
+  const y = H/2 + (ri - (col.length-1)/2)*74 - NH/2;
+  pos[t.id]={x,y};
+}));
+const S = 'http://www.w3.org/2000/svg';
+const el=(n,a)=>{const e=document.createElementNS(S,n);for(const k in a)e.setAttribute(k,a[k]);return e};
+const edges=[];
+/* blocking edges */
+DATA.tickets.forEach(t=>t.blockedBy.forEach(b=>{ if(!byId[b])return;
+  const p1=pos[b],p2=pos[t.id];
+  const x1=p1.x+NW,y1=p1.y+NH/2,x2=p2.x,y2=p2.y+NH/2,mx=(x1+x2)/2;
+  const path=el('path',{d:`M${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`,class:'edge'});
+  path.dataset.a=b; path.dataset.b=t.id; svg.appendChild(path); edges.push(path);
+}));
+/* destination flag: dashed edges from tickets nothing depends on */
+const hasDependent = new Set(); DATA.tickets.forEach(t=>t.blockedBy.forEach(b=>hasDependent.add(b)));
+const fx = PAD+(maxD+1)*CW+26, fy = H/2;
+DATA.tickets.filter(t=>!hasDependent.has(t.id)).forEach(t=>{
+  const p=pos[t.id],x1=p.x+NW,y1=p.y+NH/2,mx=(x1+fx)/2;
+  svg.appendChild(el('path',{d:`M${x1} ${y1} C ${mx} ${y1}, ${mx} ${fy}, ${fx-14} ${fy}`,class:'edge dest-edge'}));
+});
+const flag=el('g',{class:'destflag'});
+flag.appendChild(el('path',{d:`M${fx} ${fy-26} v52 M${fx} ${fy-26} l30 9 -30 9`,stroke:'var(--beacon)','stroke-width':'2',fill:'var(--beacon)'}));
+const ftxt=el('text',{x:fx+6,y:fy+38,'text-anchor':'middle'}); ftxt.textContent=L.destination; flag.appendChild(ftxt);
+svg.appendChild(flag);
+/* nodes */
+DATA.tickets.forEach(t=>{
+  const p=pos[t.id];
+  const g=el('g',{class:'node '+t.s,transform:`translate(${p.x},${p.y})`,tabindex:'0',role:'button','aria-label':`${t.id} ${t.title} — ${STATUS_LABEL[t.s]}`});
+  if(t.s==='frontier') g.appendChild(el('circle',{class:'halo',cx:NW/2,cy:NH/2,r:56}));
+  g.appendChild(el('rect',{width:NW,height:NH,rx:7}));
+  const l1=el('text',{x:12,y:19,class:'nid'}); l1.textContent=t.id+' · '+(TYPE_LABEL[t.type]||t.type);
+  const l2=el('text',{x:12,y:35}); l2.textContent=cut(t.title,20);
+  const tip=el('title',{}); tip.textContent=`${t.id} ${t.title} [${STATUS_LABEL[t.s]}]`;
+  g.append(tip,l1,l2);
+  g.addEventListener('mouseenter',()=>light(t.id)); g.addEventListener('mouseleave',unlight);
+  g.addEventListener('focus',()=>light(t.id)); g.addEventListener('blur',unlight);
+  const open=()=>{const c=document.getElementById('card-'+t.id); if(c){c.open=true; c.scrollIntoView({block:'center'});}};
+  g.addEventListener('click',open);
+  g.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();open();}});
+  svg.appendChild(g); t._node=g;
+});
+/* fog veil over the chart's right edge */
+const veil=el('rect',{class:'fogveil',x:W-120,y:0,width:120,height:H,fill:'url(#fogGrad)'});
+const defs=el('defs',{}); const gr=el('linearGradient',{id:'fogGrad',x1:0,x2:1});
+gr.appendChild(el('stop',{offset:'0','stop-color':'#8FA3B0','stop-opacity':'0'}));
+gr.appendChild(el('stop',{offset:'1','stop-color':'#8FA3B0','stop-opacity':'.13'}));
+defs.appendChild(gr); svg.appendChild(defs); svg.appendChild(veil);
+
+function chain(id,dir,acc){ acc.add(id);
+  DATA.tickets.forEach(t=>{
+    if(dir==='up'&&t.id===id) t.blockedBy.forEach(b=>chain(b,'up',acc));
+    if(dir==='down'&&t.blockedBy.includes(id)) chain(t.id,'down',acc);
+  }); return acc; }
+function light(id){
+  const lit=chain(id,'up',chain(id,'down',new Set()));
+  DATA.tickets.forEach(t=>t._node.classList.toggle('dim',!lit.has(t.id))||t._node.classList.toggle('lit',lit.has(t.id)));
+  edges.forEach(e=>{const on=lit.has(e.dataset.a)&&lit.has(e.dataset.b);
+    e.classList.toggle('lit',on); e.classList.toggle('dim',!on);});
+}
+function unlight(){ DATA.tickets.forEach(t=>t._node.classList.remove('dim','lit'));
+  edges.forEach(e=>e.classList.remove('dim','lit')); }
+
+/* ---------- cards + filters ---------- */
+const order=['frontier','claimed','blocked','resolved'];
+const cardsEl=document.getElementById('cards');
+[...DATA.tickets].sort((a,b)=>order.indexOf(a.s)-order.indexOf(b.s)||a.id.localeCompare(b.id)).forEach(t=>{
+  const dts=document.createElement('details');
+  dts.className='card'; dts.id='card-'+t.id; dts.dataset.s=t.s;
+  const blk=t.blockedBy.length?`<span class="blockline">⛔ ${L.prerequisite}: ${t.blockedBy.join(', ')}</span>`:'';
+  dts.innerHTML=`<summary><span class="tid">${t.id}</span><span class="ttitle">${esc(t.title)}</span>${blk}
+    <span class="badge t">${TYPE_LABEL[t.type]||t.type}</span><span class="badge s-${t.s}">${STATUS_LABEL[t.s]}</span></summary>
+    <div class="card-body"><h4>${L.question}</h4>${mdBlock(t.question)}
+    ${t.answer?`<h4>${L.answer}</h4>${mdBlock(t.answer)}`:''}
+    ${t.comments?`<h4>${L.comments}</h4>${mdBlock(t.comments)}`:''}
+    <h4><a href="${esc(t.file)}">${L.openTicket} →</a></h4></div>`;
+  cardsEl.appendChild(dts);
+});
+const chipsEl=document.getElementById('chips');
+const active=new Set(order);
+['all',...order].forEach(s=>{
+  const b=document.createElement('button');
+  b.className='chip'; b.textContent=s==='all'?`${L.all} ${DATA.tickets.length}`:`${STATUS_LABEL[s]} ${n(s)}`;
+  b.setAttribute('aria-pressed', s==='all');
+  b.onclick=()=>{ chipsEl.querySelectorAll('.chip').forEach(c=>c.setAttribute('aria-pressed','false'));
+    b.setAttribute('aria-pressed','true');
+    cardsEl.querySelectorAll('details').forEach(c=>c.style.display=(s==='all'||c.dataset.s===s)?'':'none'); };
+  chipsEl.appendChild(b);
+});
+
+/* ---------- map sections ---------- */
+const li=(target,items)=>{const u=document.getElementById(target);
+  items.forEach(x=>{const l=document.createElement('li');l.innerHTML=md(x);u.appendChild(l);});
+  if(!items.length){const l=document.createElement('li');l.style.opacity=.5;l.textContent=`— ${L.empty}`;u.appendChild(l);}};
+li('decisions',DATA.decisions); li('fog',DATA.fog); li('oos',DATA.outOfScope);
+</script>
+</body>
+</html>

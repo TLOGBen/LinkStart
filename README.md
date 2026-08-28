@@ -1,6 +1,6 @@
 # LinkStart
 
-讓互動式 HTML／localhost App 在原 turn 結束後，仍能把事件送回產出它的同一條 Claude Code session 或 Codex thread，並收到 Agent Feedback。
+讓互動式 HTML／localhost App 在原 turn 結束後，仍能把事件送回產出它的同一條 Claude Code session 或 Codex thread，並收到 Agent Feedback。Codex 掛機喚醒由持續連到同一個 app-server 的 Origin Adapter 負責；foreground `arm` 只保留相容用途。
 
 [![Release](https://img.shields.io/github/v/release/TLOGBen/LinkStart?label=release)](https://github.com/TLOGBen/LinkStart/releases/latest)
 [![Build](https://github.com/TLOGBen/LinkStart/actions/workflows/release.yml/badge.svg)](https://github.com/TLOGBen/LinkStart/actions/workflows/release.yml)
@@ -46,14 +46,14 @@ codex plugin add linkstart@linkstart
 
 Repo 使用單一 shared package：`plugins/linkstart/` 同時含 `.claude-plugin/plugin.json`、`.codex-plugin/plugin.json` 與一份 `skills/link-start/**`；沒有重複的 Codex skill/assets tree。
 
-目前 marketplace plugin version 是 `0.2.3`，內嵌 Runtime `0.1.5`。
+目前 marketplace plugin version 是 `0.3.0`，內嵌 Runtime `0.1.5`。
 
 ## Quick start
 
 1. 準備 App Manifest v1 與 HTML／localhost App。
 2. 在產出 App 的 Origin Session 呼叫 Claude `/linkstart:link-start <manifest.json>` 或 Codex `$link-start <manifest.json>`。
 3. Skill 驗證 bundled Runtime `0.1.5`，啟動／重用 daemon，attach 當前 session，註冊並開啟 App。
-4. App 送出互動後，`arm` 讓同一 Origin Session 收到 Event；模型只需一次 `respond --payload ...`，wrapper 會自動 Ack、Feedback 並進入下一次 wait。
+4. Codex 由 `runtime.py adapter start` 建立 host lease；App 送出互動後，adapter 對 idle thread 使用 `turn/start`、對 active turn 使用 `turn/steer`，Host 接受後才 Ack。Agent 用 `adapter feedback` 非阻塞排入 private ledger，由 Host Adapter flush 回 Runtime；未明確排入時以 completed turn 的 final message 補送，monitor 自動延續。
 
 CLI smoke：
 
@@ -94,6 +94,10 @@ SSE 依 durable notification cursor 持續讀取 SQLite，因此由另一個 CLI
 | `runtime.py context create` | 將 state dir、connection ID、capability 寫入 private `0600` context |
 | `runtime.py arm` | 從 context 注入身份並進入 bounded monitor wait |
 | `runtime.py respond` | 一次完成 pending Event Ack、stable-ID Feedback 與下一次 wait |
+| `runtime.py adapter start` | 啟動常駐 Codex host lease，timeout 自動 re-arm |
+| `runtime.py adapter status` | 回傳 redacted lease 與同一 Origin thread 狀態 |
+| `runtime.py adapter feedback` | 對已投遞 Event 非阻塞排入 Feedback，由 Host Adapter flush |
+| `runtime.py adapter close` | 停止 lease、刪除 private context，不冒稱 Runtime revoke |
 | `runtime.py close` | 刪除本機 ephemeral capability context |
 
 `runtime.py` 位於 plugin 的 `skills/link-start/scripts/`。它不把 capability 印到 stdout；`close` 只刪除本機 secret，不冒稱已做 Runtime-side revoke。
@@ -115,7 +119,7 @@ $link-start ./app-manifest.json
 Skill 會先辨識 host，再只讀一份對應 reference：
 
 - `references/claude-code.md`：Channel canonical path；Monitor compatibility 使用 attached background `arm`／`respond-and-wait`，completion 回到同一 session。
-- `references/codex.md`：LinkStart-owned app-server／same-thread boundary；使用相同 wrapper 做 bounded foreground wait。
+- `references/codex.md`：LinkStart-owned app-server／same-thread boundary；Codex `0.150.1` 使用 persistent host lease，foreground wait 只保留相容用途。
 
 兩份 reference 都以 Runtime `help --json` 為 schema authority，包含 attach、register、launch、context、arm、respond 的 exact request／command 與輸出欄位；不需要讀 Rust source，也不使用 `claude -p`、`codex -p`、SDK subprocess 或替代 session。
 
@@ -126,11 +130,11 @@ Skill 會先辨識 host，再只讀一份對應 reference：
 | Rust Runtime／protocol v1 | Stable core |
 | Claude Channel | Research Preview |
 | Claude Monitor compatibility | Experimental compatibility |
-| Codex Unix app-server／remote TUI | Experimental Preview |
+| Codex 0.150.1 app-server／host lease | Experimental Preview |
 | Codex Windows loopback WebSocket | Experimental；不宣稱 production-ready |
 | Standalone Codex TUI hot takeover | 不支援 |
 
-**Status：** build、protocol 與 marketplace 安裝已可機械驗證；真實 Origin Session 往返仍必須依上述 host-specific Preview 路徑各自驗證，不能用 mock 或另一平台結果代替。
+**Status：** build、protocol、marketplace 與 Codex adapter state machine 可機械驗證；真實 Origin Session 掛機喚醒仍必須以 LinkStart-owned app-server 做 same-thread MOE，不能用 mock、另一 thread 或 foreground wait 代替。
 
 ## 安全
 
@@ -148,6 +152,7 @@ cargo fmt --check
 cargo check --locked
 cargo test --locked --all-targets
 python3 -m unittest -v scripts/release/test_release.py
+python3 -m unittest -v tests/test_codex_adapter.py
 ```
 
 `.github/workflows/release.yml` 在原生 Windows／Linux／macOS runners 建置；Linux 驗 static musl，macOS 組 universal binary，assembly 重算 manifest SHA-256。只有與 Cargo version 完全一致的 `v*` tag 且所有 gates 通過才建立 Release。

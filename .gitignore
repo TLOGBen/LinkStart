@@ -7,3 +7,4 @@ incoming/
 dist/
 version.json
 scripts/release/__pycache__/
+/.codex/archived/
