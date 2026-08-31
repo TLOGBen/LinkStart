@@ -1,4 +1,3 @@
-mod boot_page;
 mod cli;
 mod daemon;
 mod help;

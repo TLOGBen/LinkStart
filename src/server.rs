@@ -17,7 +17,6 @@ use std::{collections::VecDeque, convert::Infallible, fs, net::SocketAddr, path:
 use tower_http::limit::RequestBodyLimitLayer;
 use uuid::Uuid;
 
-use crate::boot_page::with_link_start_boot;
 use crate::cli::{DaemonRecord, StartArgs};
 use crate::daemon::process_alive;
 use crate::store::Store;
@@ -566,7 +565,7 @@ pub(crate) async fn serve_launch_page(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    Ok((response_headers, with_link_start_boot(html)))
+    Ok((response_headers, html))
 }
 pub(crate) async fn redeem_grant(
     State(s): State<AppState>,
