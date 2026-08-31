@@ -593,7 +593,7 @@ class ChannelServer:
                             "experimental": {"claude/channel": {}},
                             "tools": {},
                         },
-                        "serverInfo": {"name": "linkstart", "version": "0.4.0"},
+                        "serverInfo": {"name": "linkstart", "version": "0.5.0"},
                         "instructions": SERVER_INSTRUCTIONS,
                     },
                 }

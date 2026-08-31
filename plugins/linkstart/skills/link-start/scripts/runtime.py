@@ -573,6 +573,7 @@ def parser() -> argparse.ArgumentParser:
     start_adapter.add_argument("--host", choices=("codex", "claude"), default="codex")
     start_adapter.add_argument("--mode", choices=("channel", "monitor"))
     start_adapter.add_argument("--thread-id")
+    start_adapter.add_argument("--app-server-url")
     start_adapter.add_argument("--json", action="store_true")
     status_adapter = adapter_sub.add_parser("status")
     status_adapter.add_argument("--context", type=Path, default=default_context_path())
@@ -678,10 +679,16 @@ def main() -> None:
                     thread_id = codex_adapter.require_thread_id(
                         args.thread_id or os.environ.get("CODEX_THREAD_ID")
                     )
+                    app_server_command = (
+                        codex_adapter.websocket_bridge_command(args.app_server_url)
+                        if args.app_server_url
+                        else None
+                    )
                     payload = codex_adapter.start_background(
                         context_path=args.context,
                         thread_id=thread_id,
                         lease_path=codex_lease,
+                        app_server_command=app_server_command,
                     )
             elif args.adapter_command == "status":
                 if claude_lease.exists():

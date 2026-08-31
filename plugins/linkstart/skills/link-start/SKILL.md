@@ -2,7 +2,7 @@
 name: link-start
 description: Connects an interactive HTML or localhost app back to the same Claude Code session or Codex thread that produced it through LinkStart v1 Preview. Use when the user wants an agent-generated app to keep exchanging events and feedback after the current response.
 metadata:
-  version: "0.4.0"
+  version: "0.5.0"
 ---
 
 # Link Start
@@ -37,7 +37,7 @@ Generated App pages must implement the app-side protocol in `${CLAUDE_PLUGIN_ROO
 3. **App register/launch** — validate the fixed Manifest v1, bind one App Instance to the online connection, and optionally open it. A self-contained HTML uses a one-time fragment launch grant; a localhost app uses an exact loopback Origin. Browser launch failure does not erase durable registration. Launch pages served by the Runtime play a LINK START boot animation that holds until the App dispatches `window.dispatchEvent(new CustomEvent("linkstart:connected"))` after a successful grant redeem (a bounded fallback timer ends it otherwise); generated Apps should dispatch that event on connect, and may opt out of the animation entirely with a `data-linkstart-boot="off"` attribute anywhere in their HTML.
 4. **Monitor** — apply the selected host reference. Both hosts use the helper's persistent `adapter` host-lease contract so an idle Origin Session can be awakened after the producing turn ends: Codex through `adapter start/status/feedback/close` against its owned app-server, Claude Code through `adapter start --host claude` with the channel (canonical) or monitor (compatibility) wake surface plus a live `adapter probe`. Explicit foreground compatibility on either host retains the stable `arm`/`respond` contract. Do not mix two monitor owners for one context.
 
-Stop immediately on missing assets, unsupported target or Origin mode, unknown adapter version, failed live capability probe, schema drift, version conflict, or `origin_offline`.
+Stop immediately on missing assets, unsupported target or Origin mode, failed required capability probe, schema drift, Runtime version conflict, or `origin_offline`. A Codex CLI version or `userAgent` label is diagnostic information, never an admission rule by itself.
 
 ## Receipt and evidence
 
@@ -45,4 +45,4 @@ Return a redacted JSON `LinkStartReceipt` plus a short Traditional Chinese summa
 
 On explicit close, use the selected host reference's close command. It stops any monitor lease before deleting the private context. This removes the locally persisted ephemeral capability; it does not claim Runtime-side connection revocation unless a later Runtime schema reports it.
 
-Do not claim completion from build, health, or Receipt evidence alone. MOP proves the mechanism ran; MOE requires a real App Event to arrive in this same Origin Session and real Agent Feedback to return to the same App Instance.
+Do not claim completion from build, health, capability-probe, `armed`, or Receipt evidence alone. These are MOP. MOE requires a real App Event to arrive in this same Origin Session and real Agent Feedback to return to the same App Instance. Only that round trip may be reported as `LINKSTART_ACTIVE`.

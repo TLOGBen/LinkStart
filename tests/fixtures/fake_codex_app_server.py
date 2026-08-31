@@ -6,6 +6,8 @@ import sys
 
 
 thread = {"id": "thread-origin", "status": {"type": "idle"}, "turns": []}
+version_label = sys.argv[1] if len(sys.argv) > 1 else "0.150.1"
+missing_thread_read = len(sys.argv) > 2 and sys.argv[2] == "no-thread-read"
 
 
 for line in sys.stdin:
@@ -16,10 +18,10 @@ for line in sys.stdin:
     if request_id is None:
         continue
     if method == "initialize":
-        result = {"userAgent": "codex-cli/0.150.1", "platformFamily": "unix"}
+        result = {"userAgent": f"codex-cli/{version_label}", "platformFamily": "unix"}
     elif method == "thread/resume":
         result = {"thread": thread}
-    elif method == "thread/read":
+    elif method == "thread/read" and not missing_thread_read:
         result = {"thread": thread}
     elif method == "turn/start":
         turn = {

@@ -18,14 +18,15 @@ import threading
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
-CODEX_ALLOWLIST = {"0.150.1"}
 ADAPTER_NAME = "codex-app-server"
 MONITOR_MODE = "host-lease"
 EVENT_MARKER = "linkstart:event:{eventId}"
 ERROR_UNSUPPORTED = "codex_origin_mode_unsupported"
+ERROR_INVALID_URL = "codex_app_server_url_invalid"
 _CHILDREN: dict[str, subprocess.Popen[Any]] = {}
 
 
@@ -57,6 +58,32 @@ def require_thread_id(thread_id: str | None) -> str:
     if not isinstance(thread_id, str) or not thread_id.strip():
         raise AdapterAdmissionError(ERROR_UNSUPPORTED)
     return thread_id.strip()
+
+
+def websocket_bridge_command(url: str) -> list[str]:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise AdapterAdmissionError(ERROR_INVALID_URL)
+    if (
+        parsed.scheme != "ws"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or port is None
+        or port < 1
+        or parsed.netloc != f"127.0.0.1:{port}"
+    ):
+        raise AdapterAdmissionError(ERROR_INVALID_URL)
+    return [
+        sys.executable,
+        os.fspath(Path(__file__).with_name("codex_ws_bridge.py")),
+        url,
+    ]
 
 
 def error_payload(error: AdapterAdmissionError) -> dict[str, Any]:
@@ -718,6 +745,8 @@ class JsonlAppServerClient:
         )
         self.next_id = 1
         self.request_timeout = request_timeout
+        self.compatibility_grade: str | None = None
+        self.user_agent = ""
         self.messages: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self.reader = threading.Thread(target=self._read_messages, daemon=True)
         self.reader.start()
@@ -775,19 +804,19 @@ class JsonlAppServerClient:
                 "clientInfo": {
                     "name": "linkstart",
                     "title": "LinkStart Codex Origin Adapter",
-                    "version": "0.3.0",
+                    "version": "0.5.0",
                 }
             },
         )
         user_agent = str(initialized.get("userAgent", ""))
-        versions = set(re.findall(r"\d+\.\d+\.\d+", user_agent))
-        if not versions.intersection(CODEX_ALLOWLIST):
-            raise AppServerError(-32002, ERROR_UNSUPPORTED)
+        self.user_agent = user_agent
         self._send({"method": "initialized", "params": {}})
         resumed = self._request("thread/resume", {"threadId": thread_id})
         thread = resumed.get("thread")
         if not isinstance(thread, dict) or thread.get("id") != thread_id:
             raise AppServerError(-32002, ERROR_UNSUPPORTED)
+        self.read_thread(thread_id)
+        self.compatibility_grade = "probed"
         return thread
 
     def read_thread(self, thread_id: str) -> dict[str, Any]:

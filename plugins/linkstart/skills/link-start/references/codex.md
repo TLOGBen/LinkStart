@@ -4,8 +4,8 @@ Use this reference only when the current host is Codex. Resolve `HELPER` from th
 
 ## Admission and Runtime schema
 
-- Accept only an allowlisted LinkStart-owned app-server that has owned the Origin thread since creation or explicit resume, with any TUI joined through `--remote`.
-- Initial allowlist: Codex 0.150.1 only. Prove initialize/handshake, required methods/events, live subscription, event-marker round trip, and same-thread ownership. Standalone embedded TUI returns `codex_origin_mode_unsupported`.
+- Accept only a LinkStart-owned app-server that has owned the Origin thread since creation or explicit resume, with any TUI joined through `--remote`.
+- Codex version and `userAgent` are diagnostic only. Admission requires live `initialize`/`initialized`, exact-thread `thread/resume`, and `thread/read`; later `turn/start`, `turn/steer(expectedTurnId)`, live subscription, event-marker reconciliation, and same-thread ownership remain fail-closed runtime capabilities. Do not maintain a version allowlist, denylist, minimum, or `>=` shortcut.
 - Label Unix remote app-server `Experimental Preview`; label native Windows loopback WebSocket `Experimental, not supported for production`.
 - Never use `codex -p`, an SDK subprocess, cold resume, or a replacement process/thread.
 
@@ -64,13 +64,22 @@ Never log the returned fragment grant. Unset temporary capability/grant variable
 
 ## Same-thread host-lease Monitor flow
 
-After context creation, start the persistent Origin Adapter. `CODEX_THREAD_ID` is used when `--thread-id` is omitted:
+After context creation, start the persistent Origin Adapter. `CODEX_THREAD_ID` is used when `--thread-id` is omitted. A managed control-socket Origin uses the default command:
 
 ```console
 "$HELPER" adapter start --context "$CONTEXT" --json
 ```
 
-Require the exact redacted receipt fields `adapter:"codex-app-server"`, `monitorMode:"host-lease"`, the same opaque `threadId`, and `leaseStatus:"armed"`. The adapter connects through `codex app-server proxy`; the Origin must therefore belong to that managed app-server/control socket. A hidden or unrelated Host app-server fails closed with `codex_origin_mode_unsupported`.
+For a LinkStart-owned loopback WebSocket app-server that already owns the same Origin thread, pass its exact endpoint:
+
+```console
+"$HELPER" adapter start --context "$CONTEXT" \
+  --app-server-url "ws://127.0.0.1:<port>" --json
+```
+
+Only the exact form `ws://127.0.0.1:<port>` is accepted. The helper directly executes the checked-in `scripts/codex_ws_bridge.py`; never generate, copy, patch, or install a bridge at runtime. The bridge has no third-party Python dependency. An endpoint does not grant ownership and cannot hot-takeover an embedded or unrelated thread.
+
+Require the exact redacted receipt fields `adapter:"codex-app-server"`, `monitorMode:"host-lease"`, the same opaque `threadId`, and `leaseStatus:"armed"`. The default path connects through `codex app-server proxy`; that Origin must belong to the managed app-server/control socket. A hidden or unrelated Host app-server fails closed with `codex_origin_mode_unsupported`.
 
 The adapter continuously re-arms outside Agent turns. It reads the durable Runtime queue, reconciles a stable `linkstart:event:{eventId}` marker, uses `turn/steer(expectedTurnId)` for an active turn or `turn/start` for an idle thread, and records Delivery Ack only after app-server acceptance. Active/idle races are re-read once; never redirect to another thread.
 
@@ -103,3 +112,5 @@ Close must report `credentialDeleted:true`, `connectionRevoked:false`, and `leas
 ```
 
 If the owned app-server or Origin process is offline, return `origin_offline`. Do not claim Runtime-side revoke.
+
+`leaseStatus:"armed"` and capability admission are MOP only. Report `LINKSTART_ACTIVE` only after a real App Event is delivered to this exact `threadId` and real Agent Feedback is observed by the same App Instance.

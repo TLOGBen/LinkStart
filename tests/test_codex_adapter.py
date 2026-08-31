@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
 import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -24,11 +27,49 @@ MODULE_PATH = (
     / "codex_adapter.py"
 )
 RUNTIME_HELPER = MODULE_PATH.with_name("runtime.py")
+WEBSOCKET_BRIDGE = MODULE_PATH.with_name("codex_ws_bridge.py")
 FAKE_APP_SERVER = Path(__file__).with_name("fixtures") / "fake_codex_app_server.py"
 SPEC = importlib.util.spec_from_file_location("linkstart_codex_adapter", MODULE_PATH)
 assert SPEC and SPEC.loader
 adapter = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(adapter)
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise EOFError("socket closed")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _recv_client_frame(sock: socket.socket) -> tuple[int, bytes, bool]:
+    first, second = _recv_exact(sock, 2)
+    masked = bool(second & 0x80)
+    length = second & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", _recv_exact(sock, 2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", _recv_exact(sock, 8))[0]
+    mask = _recv_exact(sock, 4) if masked else b""
+    payload = _recv_exact(sock, length)
+    if masked:
+        payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+    return first & 0x0F, payload, masked
+
+
+def _server_frame(opcode: int, payload: bytes, *, final: bool = True) -> bytes:
+    first = (0x80 if final else 0) | opcode
+    length = len(payload)
+    if length < 126:
+        return bytes((first, length)) + payload
+    if length < 65536:
+        return bytes((first, 126)) + struct.pack("!H", length) + payload
+    return bytes((first, 127)) + struct.pack("!Q", length) + payload
 
 
 class FakeAppServer:
@@ -303,6 +344,130 @@ class CodexOriginAdapterTest(unittest.TestCase):
             self.assertTrue(client.contains_marker("thread-origin", "linkstart:event:evt-jsonl"))
         finally:
             client.close()
+
+    def test_version_label_does_not_replace_live_capability_admission(self) -> None:
+        client = adapter.JsonlAppServerClient(
+            [sys.executable, str(FAKE_APP_SERVER), "future-build"]
+        )
+        try:
+            resumed = client.connect("thread-origin")
+        finally:
+            client.close()
+
+        self.assertEqual(resumed["id"], "thread-origin")
+        self.assertEqual(client.compatibility_grade, "probed")
+
+    def test_capability_admission_fails_closed_when_thread_read_is_missing(self) -> None:
+        client = adapter.JsonlAppServerClient(
+            [sys.executable, str(FAKE_APP_SERVER), "future-build", "no-thread-read"]
+        )
+        try:
+            with self.assertRaises(adapter.AppServerError) as caught:
+                client.connect("thread-origin")
+        finally:
+            client.close()
+
+        self.assertEqual(caught.exception.code, -32601)
+        self.assertIsNone(client.compatibility_grade)
+
+    def test_websocket_url_gate_is_exact(self) -> None:
+        command = adapter.websocket_bridge_command("ws://127.0.0.1:4510")
+
+        self.assertEqual(command[-1], "ws://127.0.0.1:4510")
+        self.assertEqual(Path(command[-2]).name, "codex_ws_bridge.py")
+        for rejected in (
+            "wss://127.0.0.1:4510",
+            "ws://localhost:4510",
+            "ws://127.0.0.2:4510",
+            "ws://user@127.0.0.1:4510",
+            "ws://127.0.0.1:4510/path",
+            "ws://127.0.0.1:4510?query=1",
+            "ws://127.0.0.1:4510#fragment",
+            "ws://127.0.0.1",
+            "ws://127.0.0.1:0",
+        ):
+            with self.subTest(url=rejected):
+                with self.assertRaises(adapter.AdapterAdmissionError) as caught:
+                    adapter.websocket_bridge_command(rejected)
+                self.assertEqual(caught.exception.code, "codex_app_server_url_invalid")
+
+    def test_websocket_bridge_roundtrips_jsonl_fragment_ping_close_and_eof(self) -> None:
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(5)
+        port = listener.getsockname()[1]
+        observed: dict[str, object] = {}
+
+        def serve() -> None:
+            connection = None
+            try:
+                connection, _ = listener.accept()
+                connection.settimeout(5)
+                request = b""
+                while b"\r\n\r\n" not in request:
+                    request += connection.recv(4096)
+                headers = {}
+                for line in request.decode("ascii").split("\r\n")[1:]:
+                    if ":" in line:
+                        name, value = line.split(":", 1)
+                        headers[name.lower()] = value.strip()
+                accept = base64.b64encode(
+                    hashlib.sha1(
+                        (headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+                    ).digest()
+                ).decode()
+                connection.sendall(
+                    (
+                        "HTTP/1.1 101 Switching Protocols\r\n"
+                        "Upgrade: websocket\r\n"
+                        "Connection: Upgrade\r\n"
+                        f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                    ).encode("ascii")
+                )
+                opcode, payload, masked = _recv_client_frame(connection)
+                observed.update(opcode=opcode, payload=payload, masked=masked)
+                connection.sendall(_server_frame(0x9, b"probe"))
+                connection.sendall(_server_frame(0x1, b'{"id":1,', final=False))
+                connection.sendall(_server_frame(0x0, b'"result":{}}', final=True))
+                while True:
+                    reply_opcode, reply_payload, reply_masked = _recv_client_frame(connection)
+                    if reply_opcode == 0xA:
+                        observed.update(
+                            pong=reply_payload,
+                            pongMasked=reply_masked,
+                        )
+                        break
+                connection.sendall(_server_frame(0x8, struct.pack("!H", 1000)))
+                close_opcode, _, close_masked = _recv_client_frame(connection)
+                observed.update(closeOpcode=close_opcode, closeMasked=close_masked)
+            finally:
+                if connection is not None:
+                    connection.close()
+                listener.close()
+
+        worker = threading.Thread(target=serve)
+        worker.start()
+        result = subprocess.run(
+            [sys.executable, str(WEBSOCKET_BRIDGE), f"ws://127.0.0.1:{port}"],
+            input='{"method":"initialize","id":1,"params":{}}\n',
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+        )
+        worker.join(timeout=5)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(observed["opcode"], 0x1)
+        self.assertEqual(observed["payload"], b'{"method":"initialize","id":1,"params":{}}')
+        self.assertEqual(observed["masked"], True)
+        self.assertEqual(observed["pong"], b"probe")
+        self.assertEqual(observed["pongMasked"], True)
+        self.assertEqual(observed["closeOpcode"], 0x8)
+        self.assertEqual(observed["closeMasked"], True)
+        self.assertEqual(result.stdout.splitlines(), ['{"id":1,"result":{}}'])
 
     def test_jsonl_client_times_out_instead_of_leaving_false_armed_lease(self) -> None:
         client = adapter.JsonlAppServerClient(
@@ -685,6 +850,111 @@ class CodexOriginAdapterTest(unittest.TestCase):
         )
         self.assertTrue(context_deleted)
 
+    def test_adapter_cli_parent_exit_keeps_lease_armed_until_explicit_close(self) -> None:
+        capability = "a" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            (state_dir / "daemon.json").write_text(
+                json.dumps(
+                    {
+                        "address": "127.0.0.1:45831",
+                        "pid": 123,
+                        "version": "0.1.5",
+                        "protocolMajor": "v1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            db = sqlite3.connect(state_dir / "linkstart.sqlite3")
+            db.executescript(
+                """
+                CREATE TABLE connections(id TEXT PRIMARY KEY, capability_hash TEXT, status TEXT);
+                CREATE TABLE apps(id TEXT PRIMARY KEY, connection_id TEXT);
+                CREATE TABLE events(id TEXT PRIMARY KEY, app_id TEXT, sequence INTEGER,
+                    payload TEXT, status TEXT, receipt_id TEXT, created_at INTEGER);
+                """
+            )
+            db.execute(
+                "INSERT INTO connections VALUES(?,?,?)",
+                ["conn-cli", hashlib.sha256(capability.encode()).hexdigest(), "online"],
+            )
+            db.commit()
+            db.close()
+            context_path = state_dir / "context.json"
+            context_path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "runtimeVersion": "0.1.5",
+                        "protocolMajor": "v1",
+                        "contextId": "ctx-cli",
+                        "stateDir": str(state_dir),
+                        "connectionId": "conn-cli",
+                        "connectionCapability": capability,
+                        "pendingEvent": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            if os.name != "nt":
+                context_path.chmod(0o600)
+            environment = os.environ.copy()
+            environment["LINKSTART_CODEX_COMMAND_JSON"] = json.dumps(
+                [sys.executable, str(FAKE_APP_SERVER)]
+            )
+            start = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "start",
+                    "--context",
+                    str(context_path),
+                    "--thread-id",
+                    "thread-origin",
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=environment,
+                timeout=10,
+            )
+            status = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "status",
+                    "--context",
+                    str(context_path),
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=10,
+            )
+            closed = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "close",
+                    "--context",
+                    str(context_path),
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=10,
+            )
+
+        self.assertEqual(json.loads(start.stdout)["leaseStatus"], "armed")
+        self.assertEqual(json.loads(status.stdout)["leaseStatus"], "armed")
+        self.assertEqual(json.loads(closed.stdout)["leaseStatus"], "closed")
+
     def test_runtime_helper_exposes_adapter_without_removing_foreground_commands(self) -> None:
         top = subprocess.run(
             [sys.executable, str(RUNTIME_HELPER), "--help"],
@@ -708,6 +978,17 @@ class CodexOriginAdapterTest(unittest.TestCase):
         self.assertIn("status", adapter_help)
         self.assertIn("feedback", adapter_help)
         self.assertIn("close", adapter_help)
+
+    def test_runtime_adapter_start_exposes_explicit_app_server_url(self) -> None:
+        start_help = subprocess.run(
+            [sys.executable, str(RUNTIME_HELPER), "adapter", "start", "--help"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        ).stdout
+
+        self.assertIn("--app-server-url", start_help)
 
     def test_event_input_carries_nonblocking_feedback_action_without_secret(self) -> None:
         event = {
