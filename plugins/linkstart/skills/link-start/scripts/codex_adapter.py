@@ -348,7 +348,7 @@ class RuntimeStoreClient:
         self.capability = capability
         record = json.loads((self.state_dir / "daemon.json").read_text(encoding="utf-8"))
         if (
-            record.get("version") != "0.1.5"
+            record.get("version") != "0.1.6"
             or record.get("protocolMajor") != "v1"
             or not re.fullmatch(r"127\.0\.0\.1:\d{1,5}", str(record.get("address", "")))
         ):
@@ -526,7 +526,7 @@ def load_private_context(path: Path) -> dict[str, Any]:
     if (
         set(data) != required
         or data.get("schemaVersion") != 1
-        or data.get("runtimeVersion") != "0.1.5"
+        or data.get("runtimeVersion") != "0.1.6"
         or data.get("protocolMajor") != "v1"
         or data.get("pendingEvent") is not None
     ):
@@ -804,7 +804,7 @@ class JsonlAppServerClient:
                 "clientInfo": {
                     "name": "linkstart",
                     "title": "LinkStart Codex Origin Adapter",
-                    "version": "0.5.0",
+                    "version": "0.5.1",
                 }
             },
         )

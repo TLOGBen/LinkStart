@@ -519,7 +519,7 @@ class CodexOriginAdapterTest(unittest.TestCase):
                     {
                         "address": "127.0.0.1:45831",
                         "pid": 123,
-                        "version": "0.1.5",
+                        "version": "0.1.6",
                         "protocolMajor": "v1",
                     }
                 ),
@@ -575,7 +575,7 @@ class CodexOriginAdapterTest(unittest.TestCase):
                     {
                         "address": "127.0.0.1:45831",
                         "pid": 123,
-                        "version": "0.1.5",
+                        "version": "0.1.6",
                         "protocolMajor": "v1",
                     }
                 ),
@@ -706,7 +706,7 @@ class CodexOriginAdapterTest(unittest.TestCase):
                     {
                         "address": "127.0.0.1:45831",
                         "pid": 123,
-                        "version": "0.1.5",
+                        "version": "0.1.6",
                         "protocolMajor": "v1",
                     }
                 ),
@@ -732,7 +732,7 @@ class CodexOriginAdapterTest(unittest.TestCase):
                 json.dumps(
                     {
                         "schemaVersion": 1,
-                        "runtimeVersion": "0.1.5",
+                        "runtimeVersion": "0.1.6",
                         "protocolMajor": "v1",
                         "contextId": "ctx-1",
                         "stateDir": str(state_dir),
@@ -787,7 +787,7 @@ class CodexOriginAdapterTest(unittest.TestCase):
                     {
                         "address": "127.0.0.1:45831",
                         "pid": 123,
-                        "version": "0.1.5",
+                        "version": "0.1.6",
                         "protocolMajor": "v1",
                     }
                 ),
@@ -813,7 +813,7 @@ class CodexOriginAdapterTest(unittest.TestCase):
                 json.dumps(
                     {
                         "schemaVersion": 1,
-                        "runtimeVersion": "0.1.5",
+                        "runtimeVersion": "0.1.6",
                         "protocolMajor": "v1",
                         "contextId": "ctx-bg",
                         "stateDir": str(state_dir),
@@ -859,7 +859,7 @@ class CodexOriginAdapterTest(unittest.TestCase):
                     {
                         "address": "127.0.0.1:45831",
                         "pid": 123,
-                        "version": "0.1.5",
+                        "version": "0.1.6",
                         "protocolMajor": "v1",
                     }
                 ),
@@ -885,7 +885,7 @@ class CodexOriginAdapterTest(unittest.TestCase):
                 json.dumps(
                     {
                         "schemaVersion": 1,
-                        "runtimeVersion": "0.1.5",
+                        "runtimeVersion": "0.1.6",
                         "protocolMajor": "v1",
                         "contextId": "ctx-cli",
                         "stateDir": str(state_dir),

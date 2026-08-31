@@ -17,7 +17,7 @@ Before attach/register/launch, run:
 "$HELPER" start --state-dir "$STATE_DIR" --json
 ```
 
-Require Runtime `0.1.5`, protocol `v1`, and the `operations.attach/register/launch/monitor/ack/feedback` schemas from `help --json`. Do not inspect Rust source or infer missing fields.
+Require Runtime `0.1.6`, protocol `v1`, and the `operations.attach/register/launch/monitor/ack/feedback` schemas from `help --json`. Do not inspect Rust source or infer missing fields.
 
 ## Attach, register, and launch
 

@@ -4,7 +4,7 @@
 LinkStart 可以正式 Skill 內的固定 transport 連上明確指定的 loopback Codex app-server；Codex 升版不因版本字串單獨造成斷線，但任一必要 capability 失敗仍 fail closed。
 
 ## 前提（Premises）
-- `已驗`：Codex `0.151.0` + Runtime `0.1.5` 在 loopback WebSocket 完成真 `received → armed → same-thread delivered → same-App feedback → closed`。
+- `已驗`：Codex `0.151.0` + Runtime `0.1.6` 在 loopback WebSocket 完成真 `received → armed → same-thread delivered → same-App feedback → closed`。
 - `已驗`：既有 JSONL adapter 可由 `LINKSTART_CODEX_COMMAND_JSON` 接入 WebSocket bridge，但發布 Skill 無公開 endpoint 入口。
 - `已驗`：官方 Codex app-server 提供 `initialize`、`thread/resume`、`thread/read`、`turn/start`、`turn/steer`，WebSocket 仍屬 experimental。
 - `已驗`：Feedback command 與 Host supervisor 必須共用 `context.json.codex-adapter.sqlite3`。
@@ -32,7 +32,7 @@ LinkStart 可以正式 Skill 內的固定 transport 連上明確指定的 loopba
 
 ## Verbatim Constants
 ```text
-RUNTIME_VERSION=0.1.5
+RUNTIME_VERSION=0.1.6
 PROTOCOL_MAJOR=v1
 CODEX_APP_SERVER_URL=ws://127.0.0.1:{port}
 ERROR_INVALID_URL=codex_app_server_url_invalid

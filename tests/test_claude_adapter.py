@@ -74,7 +74,7 @@ def write_context(directory: Path) -> Path:
         json.dumps(
             {
                 "schemaVersion": 1,
-                "runtimeVersion": "0.1.5",
+                "runtimeVersion": "0.1.6",
                 "protocolMajor": "v1",
                 "contextId": "ctx-1",
                 "stateDir": os.fspath(directory),

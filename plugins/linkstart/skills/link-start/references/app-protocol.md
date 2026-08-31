@@ -18,7 +18,7 @@ Authorization: Bearer <grant>
 → {"instanceId":"…","capability":"…","origin":"http://127.0.0.1:<port>","status":"connected"}
 ```
 
-The grant is one-time; any second redeem returns 403. Keep `capability` in page memory only — never storage, URL, DOM, or logs. After a successful redeem, dispatch `window.dispatchEvent(new CustomEvent("linkstart:connected"))` so the LINK START boot animation closes in sync with the real connection.
+The grant is one-time; any second redeem returns 403. Keep `capability` in page memory only — never storage, URL, DOM, or logs.
 
 ## 2. Send App Events
 
@@ -53,7 +53,6 @@ const f = new URLSearchParams(location.hash.slice(1));
 const base = f.get("daemon"), grant = f.get("grant");
 history.replaceState(null, "", location.pathname);
 const x = await (await fetch(`${base}/v1/launch-grants/redeem`, {method: "POST", headers: {Authorization: `Bearer ${grant}`}})).json();
-window.dispatchEvent(new CustomEvent("linkstart:connected"));
 await fetch(`${base}/v1/apps/${x.instanceId}/events`, {method: "POST", headers: {Authorization: `Bearer ${x.capability}`, "Content-Type": "application/json"}, body: JSON.stringify({eventId: crypto.randomUUID(), payload: {message: "hello"}})});
 // then hold GET /v1/apps/{instanceId}/stream?cursor=0 open and render delivery_ack / feedback messages
 ```

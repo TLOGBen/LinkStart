@@ -1,6 +1,6 @@
 {
   "name": "linkstart",
-  "version": "0.5.0+codex.20260831035458",
+  "version": "0.5.1+codex.20260831042346",
   "description": "LinkStart v1 Preview integration: reconnect an interactive HTML or localhost app to the same Claude Code session or Codex thread, with a persistent Codex host lease and foreground compatibility. Opt-in.",
   "skills": "./skills/",
   "interface": {
