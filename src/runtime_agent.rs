@@ -80,6 +80,7 @@ pub struct AgentRunner {
     db: Arc<Mutex<Connection>>,
     instance: String,
     active: Arc<AtomicUsize>,
+    unpublished: Arc<Mutex<std::collections::HashMap<String, JobRecord>>>,
 }
 
 fn fail(code: &str, message: impl Into<String>) -> ApiError {
@@ -179,6 +180,9 @@ struct JobRecord {
     instance: String,
 }
 impl JobRecord {
+    fn terminal(&self) -> bool {
+        matches!(self.status.as_str(), "completed" | "failed" | "unknown")
+    }
     fn snapshot(&self) -> JobSnapshot {
         JobSnapshot {
             job_id: self.request.job_id.clone(),
@@ -220,6 +224,7 @@ impl AgentRunner {
             db: Arc::new(Mutex::new(db)),
             instance: uuid::Uuid::new_v4().to_string(),
             active: Arc::new(AtomicUsize::new(0)),
+            unpublished: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
     fn preflight(
@@ -322,6 +327,10 @@ impl AgentRunner {
             return Err(fail("ShuttingDown", "runner no longer accepts jobs"));
         }
         let who = self.current(credential, &request.space_id)?;
+        if let Some(record) = self.unpublished(&request.job_id) {
+            self.check_intent(&record, request, &who)?;
+            return Ok(record.snapshot());
+        }
         self.preflight(credential, request, &who)?;
         let (record, launch) = {
             let mut db = self.db.lock().map_err(internal)?;
@@ -346,11 +355,8 @@ impl AgentRunner {
                 {
                     return Err(fail("RequestConflict", "job id already has another intent"));
                 }
-                let launch = r.status == "queued" && r.instance != self.instance;
-                if launch {
-                    r.instance = self.instance.clone();
-                }
-                (r, launch)
+                self.fence_restarted(&mut r);
+                (r, false)
             } else {
                 (
                     JobRecord {
@@ -382,19 +388,26 @@ impl AgentRunner {
             let runner = self.clone();
             let credential = credential.to_string();
             let request = request.clone();
+            let accepted = record.clone();
             if std::thread::Builder::new()
                 .name("linkstart-decomposer".into())
                 .spawn(move || {
                     let _guard = active;
-                    let _ = runner.run_with_count(&credential, &request, true);
+                    if let Err(error) = runner.run_with_count(&credential, &request, true) {
+                        // Covers errors before execution owns its local record (e.g. revocation
+                        // between admission and the worker's initial authorization).
+                        let mut record = runner.record(&request.job_id).unwrap_or(accepted);
+                        if !record.terminal() {
+                            runner.settle_error(&mut record, &error);
+                        }
+                    }
                 })
                 .is_err()
             {
                 let mut failed = record.clone();
                 failed.status = "failed".into();
                 failed.error = Some("worker thread could not start".into());
-                self.save(&failed)?;
-                return Ok(failed.snapshot());
+                return Ok(self.publish_terminal(failed).snapshot());
             }
         }
         Ok(record.snapshot())
@@ -423,6 +436,12 @@ impl AgentRunner {
         Ok(who)
     }
     fn save(&self, record: &JobRecord) -> Result<(), ApiError> {
+        let mut unpublished = self.unpublished.lock().unwrap_or_else(|e| e.into_inner());
+        self.save_durable(record)?;
+        unpublished.remove(&record.request.job_id);
+        Ok(())
+    }
+    fn save_durable(&self, record: &JobRecord) -> Result<(), ApiError> {
         let mut db = self.db.lock().map_err(internal)?;
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -435,7 +454,7 @@ impl AgentRunner {
             )
             .map_err(internal)?;
         let current: JobRecord = serde_json::from_str(&current).map_err(internal)?;
-        if current.status == "unknown" && record.status != "unknown" {
+        if current.instance != record.instance || current.status == "unknown" {
             return Err(fail(
                 "UnknownEffect",
                 "job was fenced after an uncertain prior outcome",
@@ -452,6 +471,91 @@ impl AgentRunner {
         tx.commit().map_err(internal)?;
         Ok(())
     }
+    fn unpublished(&self, id: &str) -> Option<JobRecord> {
+        self.unpublished
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+    }
+    fn record(&self, id: &str) -> Result<JobRecord, ApiError> {
+        if let Some(record) = self.unpublished(id) {
+            return Ok(record);
+        }
+        let encoded: String = self
+            .db
+            .lock()
+            .map_err(internal)?
+            .query_row("SELECT record FROM agent_jobs WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(internal)?
+            .ok_or_else(|| fail("NotFound", "job not found"))?;
+        serde_json::from_str(&encoded).map_err(internal)
+    }
+    fn check_intent(
+        &self,
+        record: &JobRecord,
+        request: &JobRequest,
+        who: &Value,
+    ) -> Result<(), ApiError> {
+        if who["id"] != record.identity_id {
+            return Err(fail("Denied", "job belongs to another identity"));
+        }
+        if serde_json::to_value(&record.request).map_err(internal)?
+            != serde_json::to_value(request).map_err(internal)?
+        {
+            return Err(fail("RequestConflict", "job id already has another intent"));
+        }
+        Ok(())
+    }
+    fn fence_restarted(&self, record: &mut JobRecord) {
+        if !record.terminal() && record.instance != self.instance {
+            record.status = "unknown".into();
+            record.error = Some("runner restarted; prior worker outcome is unknown; explicit authorized saved-plan recovery required, no automatic retry".into());
+        }
+    }
+    fn publish_terminal(&self, mut record: JobRecord) -> JobRecord {
+        let mut unpublished = self.unpublished.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(error) = self.save_durable(&record) {
+            // A newer instance's fence always wins over a stale worker.
+            if error.code == "UnknownEffect" {
+                return record;
+            }
+            let outcome = format!(
+                "{}: {}",
+                record.status,
+                record
+                    .error
+                    .as_deref()
+                    .unwrap_or("execution returned successfully")
+            );
+            record.status = "unknown".into();
+            record.error = Some(format!("PublicationPending: terminal status could not be persisted ({outcome}); effects and durability are uncertain; no automatic retry"));
+            unpublished.insert(record.request.job_id.clone(), record.clone());
+        } else {
+            unpublished.remove(&record.request.job_id);
+        }
+        record
+    }
+    fn settle_error(&self, record: &mut JobRecord, error: &ApiError) {
+        let previous = record.error.take();
+        record.status = if error.code == "Denied" || error.code == "InvalidPlan" {
+            "failed"
+        } else {
+            "unknown"
+        }
+        .into();
+        record.error = Some(match previous {
+            Some(previous) => format!(
+                "{}: {}; prior outcome: {previous}",
+                error.code, error.message
+            ),
+            None => format!("{}: {}", error.code, error.message),
+        });
+        *record = self.publish_terminal(record.clone());
+    }
     pub fn run(&self, credential: &str, request: &JobRequest) -> Result<JobSnapshot, ApiError> {
         self.run_with_count(credential, request, false)
     }
@@ -465,6 +569,10 @@ impl AgentRunner {
             return Err(fail("ShuttingDown", "runner no longer accepts jobs"));
         }
         let who = self.current(credential, &request.space_id)?;
+        if let Some(record) = self.unpublished(&request.job_id) {
+            self.check_intent(&record, request, &who)?;
+            return Ok(record.snapshot());
+        }
         let mission = self.preflight(credential, request, &who)?;
         let identity = who["id"]
             .as_str()
@@ -492,18 +600,14 @@ impl AgentRunner {
                 {
                     return Err(fail("RequestConflict", "job id already has another intent"));
                 }
+                self.fence_restarted(&mut r);
                 if r.status == "queued" {
                     r.status = "running".into();
                     r.instance = self.instance.clone();
-                } else if r.status == "running" && r.instance == self.instance {
+                } else if matches!(r.status.as_str(), "running" | "applying")
+                    && r.instance == self.instance
+                {
                     return Ok(r.snapshot());
-                }
-                if r.status == "running" && r.instance != self.instance {
-                    r.status = "unknown".into();
-                    r.error = Some(
-                        "runner restarted while model outcome was unknown; no automatic retry"
-                            .into(),
-                    );
                 }
                 r
             } else {
@@ -537,6 +641,21 @@ impl AgentRunner {
         } else {
             None
         };
+        match self.execute_record(credential, request, &mission, &mut record) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                self.settle_error(&mut record, &error);
+                Err(error)
+            }
+        }
+    }
+    fn execute_record(
+        &self,
+        credential: &str,
+        request: &JobRequest,
+        mission: &Value,
+        record: &mut JobRecord,
+    ) -> Result<JobSnapshot, ApiError> {
         if record.plan.is_none() {
             let workspace = self.dir.join("agent-work").join(digest(&request.job_id));
             std::fs::create_dir_all(&workspace)
@@ -626,25 +745,14 @@ impl AgentRunner {
         Ok(record.snapshot())
     }
     pub fn get(&self, credential: &str, job_id: &str) -> Result<JobSnapshot, ApiError> {
-        let encoded: String = self
-            .db
-            .lock()
-            .map_err(internal)?
-            .query_row("SELECT record FROM agent_jobs WHERE id=?1", [job_id], |r| {
-                r.get(0)
-            })
-            .optional()
-            .map_err(internal)?
-            .ok_or_else(|| fail("NotFound", "job not found"))?;
-        let mut record: JobRecord = serde_json::from_str(&encoded).map_err(internal)?;
+        let mut record = self.record(job_id)?;
         let who = self.current(credential, &record.request.space_id)?;
         if who["id"] != record.identity_id {
             return Err(fail("Denied", "job belongs to another identity"));
         }
-        if record.status == "running" && record.instance != self.instance {
-            record.status = "unknown".into();
-            record.error = Some("runner restarted with model outcome unknown".into());
-            self.save(&record)?;
+        if !record.terminal() && record.instance != self.instance {
+            self.fence_restarted(&mut record);
+            record = self.publish_terminal(record);
         }
         Ok(record.snapshot())
     }
@@ -1133,6 +1241,265 @@ mod tests {
         calls: AtomicUsize,
         started: std::sync::mpsc::Sender<()>,
         release: AtomicBool,
+    }
+    fn wait_for_worker(runner: &AgentRunner) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while runner.active_count() != 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(runner.active_count(), 0, "accepted worker must exit");
+    }
+
+    #[test]
+    fn accepted_worker_settles_after_role_revoked_during_generation() {
+        let (dir, engine, _owner, admin, token, ids) = setup();
+        let (sid, mission) = ids.split_once('|').unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fake = Arc::new(GateProcess {
+            calls: AtomicUsize::new(0),
+            started: tx,
+            release: AtomicBool::new(false),
+        });
+        let runner = AgentRunner::open(dir.path(), engine.clone(), fake.clone()).unwrap();
+        let job = JobRequest {
+            job_id: "revoked-worker".into(),
+            space_id: sid.into(),
+            mission_topic_id: mission.into(),
+        };
+        runner.start(&token, &job).unwrap();
+        rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let who = engine
+            .execute(
+                &token,
+                &request("who", "identity.current", Some(sid), json!({})),
+            )
+            .unwrap();
+        engine
+            .execute(
+                &admin,
+                &request(
+                    "revoke-inflight",
+                    "members.set_roles",
+                    Some(sid),
+                    json!({"member_id":who["id"],"roles":["observer"]}),
+                ),
+            )
+            .unwrap();
+        fake.release.store(true, Ordering::SeqCst);
+        wait_for_worker(&runner);
+        assert_eq!(runner.get(&token, &job.job_id).unwrap_err().code, "Denied");
+        engine
+            .execute(
+                &admin,
+                &request(
+                    "restore-inflight",
+                    "members.set_roles",
+                    Some(sid),
+                    json!({"member_id":who["id"],"roles":["task_decomposer"]}),
+                ),
+            )
+            .unwrap();
+        let settled = runner.get(&token, &job.job_id).unwrap();
+        assert_eq!(settled.status, "failed");
+        assert!(settled.error.unwrap().contains("Denied"));
+        assert!(settled.topic_ids.is_empty());
+        assert_eq!(runner.start(&token, &job).unwrap().status, "failed");
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn public_restart_fences_applying_for_both_get_first_and_start_first() {
+        for get_first in [true, false] {
+            let (dir, engine, _owner, _admin, token, ids) = setup();
+            let (sid, mission) = ids.split_once('|').unwrap();
+            let fake = Arc::new(FakeProcess {
+                calls: AtomicUsize::new(0),
+                output: vec![],
+            });
+            let old = AgentRunner::open(dir.path(), engine.clone(), fake.clone()).unwrap();
+            let job = JobRequest {
+                job_id: "foreign-applying".into(),
+                space_id: sid.into(),
+                mission_topic_id: mission.into(),
+            };
+            let who = old.current(&token, sid).unwrap();
+            let record = JobRecord {
+                request: job.clone(),
+                identity_id: who["id"].as_str().unwrap().into(),
+                status: "applying".into(),
+                plan: Some(Plan {
+                    summary: "saved".into(),
+                    tasks: vec![],
+                }),
+                topic_ids: vec!["already-created-child".into()],
+                error: None,
+                instance: old.instance.clone(),
+            };
+            old.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO agent_jobs(id,record) VALUES(?1,?2)",
+                    rusqlite::params![job.job_id, serde_json::to_string(&record).unwrap()],
+                )
+                .unwrap();
+            let restarted = AgentRunner::open(dir.path(), engine, fake.clone()).unwrap();
+            let settled = if get_first {
+                restarted.get(&token, &job.job_id).unwrap()
+            } else {
+                restarted.start(&token, &job).unwrap()
+            };
+            assert_eq!(settled.status, "unknown", "get_first={get_first}");
+            assert_eq!(settled.topic_ids, record.topic_ids);
+            assert_eq!(
+                restarted.get(&token, &job.job_id).unwrap().status,
+                "unknown"
+            );
+            assert_eq!(restarted.start(&token, &job).unwrap().status, "unknown");
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(restarted.active_count(), 0);
+        }
+    }
+
+    fn two_task_process() -> Arc<FakeProcess> {
+        Arc::new(FakeProcess { calls: AtomicUsize::new(0), output: serde_json::to_vec(&json!({"summary":"two","tasks":[{"key":"one","title":"One","body":"work","acceptance_criteria":["done"],"depends_on":[]},{"key":"two","title":"Two","body":"work","acceptance_criteria":["done"],"depends_on":["one"]}]})).unwrap() })
+    }
+
+    #[test]
+    fn accepted_engine_failure_retains_partial_children_and_terminal_receipt() {
+        let (dir, engine, _owner, _admin, token, ids) = setup();
+        let (sid, mission) = ids.split_once('|').unwrap();
+        // A real Engine commit failure on the second child; the first remains durable.
+        let core = Connection::open(dir.path().join("v2.sqlite3")).unwrap();
+        core.execute_batch("CREATE TRIGGER reject_second_child BEFORE UPDATE ON core_state WHEN json_array_length(json_extract(NEW.json,'$.topics')) > 2 BEGIN SELECT RAISE(FAIL,'injected second child commit failure'); END;").unwrap();
+        let fake = two_task_process();
+        let runner = AgentRunner::open(dir.path(), engine.clone(), fake.clone()).unwrap();
+        let job = JobRequest {
+            job_id: "partial-engine".into(),
+            space_id: sid.into(),
+            mission_topic_id: mission.into(),
+        };
+        runner.start(&token, &job).unwrap();
+        wait_for_worker(&runner);
+        let result = runner.get(&token, &job.job_id).unwrap();
+        assert_eq!(result.status, "unknown");
+        assert_eq!(result.topic_ids.len(), 1);
+        assert!(result.error.as_deref().unwrap().contains("Internal"));
+        let topics = engine
+            .execute(
+                &token,
+                &request(
+                    "list-after-engine-fault",
+                    "topics.list",
+                    Some(sid),
+                    json!({}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(topics["items"].as_array().unwrap().len(), 2);
+        assert!(topics["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == result.topic_ids[0]));
+        core.execute_batch("DROP TRIGGER reject_second_child;")
+            .unwrap();
+        let reopened = AgentRunner::open(dir.path(), engine, fake.clone()).unwrap();
+        assert_eq!(
+            reopened.start(&token, &job).unwrap().topic_ids,
+            result.topic_ids
+        );
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn publication_failure_keeps_readable_authorized_unknown_with_actual_child() {
+        let (dir, engine, _owner, admin, token, ids) = setup();
+        let (sid, mission) = ids.split_once('|').unwrap();
+        let fake = two_task_process();
+        let runner = AgentRunner::open(dir.path(), engine.clone(), fake.clone()).unwrap();
+        // Let generation and its durable plan succeed, then fail all publication
+        // attempts containing the first Engine-created child (including settlement).
+        runner.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_child_publication BEFORE UPDATE ON agent_jobs WHEN json_array_length(json_extract(NEW.record,'$.topic_ids')) > 0 BEGIN SELECT RAISE(FAIL,'injected publication failure'); END;").unwrap();
+        let job = JobRequest {
+            job_id: "partial-publication".into(),
+            space_id: sid.into(),
+            mission_topic_id: mission.into(),
+        };
+        runner.start(&token, &job).unwrap();
+        wait_for_worker(&runner);
+        let result = runner.get(&token, &job.job_id).unwrap();
+        assert_eq!(result.status, "unknown");
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("PublicationPending"));
+        assert_eq!(result.topic_ids.len(), 1);
+        let topics = engine
+            .execute(
+                &token,
+                &request(
+                    "list-after-publication-fault",
+                    "topics.list",
+                    Some(sid),
+                    json!({}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(topics["items"].as_array().unwrap().len(), 2);
+        assert!(topics["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == result.topic_ids[0]));
+        assert_eq!(
+            runner.start(&token, &job).unwrap().topic_ids,
+            result.topic_ids
+        );
+        let who = engine
+            .execute(
+                &token,
+                &request("who-fallback", "identity.current", Some(sid), json!({})),
+            )
+            .unwrap();
+        engine
+            .execute(
+                &admin,
+                &request(
+                    "revoke-fallback",
+                    "members.set_roles",
+                    Some(sid),
+                    json!({"member_id":who["id"],"roles":["observer"]}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(runner.get(&token, &job.job_id).unwrap_err().code, "Denied");
+        assert_eq!(runner.start(&token, &job).unwrap_err().code, "Denied");
+        engine
+            .execute(
+                &admin,
+                &request(
+                    "restore-fallback",
+                    "members.set_roles",
+                    Some(sid),
+                    json!({"member_id":who["id"],"roles":["task_decomposer"]}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            runner.get(&token, &job.job_id).unwrap().topic_ids,
+            result.topic_ids
+        );
+        runner
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_child_publication;")
+            .unwrap();
+        let reopened = AgentRunner::open(dir.path(), engine, fake.clone()).unwrap();
+        assert_eq!(reopened.start(&token, &job).unwrap().status, "unknown");
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
     }
     impl ModelProcess for GateProcess {
         fn generate(
