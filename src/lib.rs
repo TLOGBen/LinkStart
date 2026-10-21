@@ -1,5 +1,6 @@
 pub mod runtime_core;
 pub mod runtime_history;
+pub mod runtime_operations;
 pub mod runtime_participants;
 pub mod runtime_source;
 pub mod runtime_source_jobs;

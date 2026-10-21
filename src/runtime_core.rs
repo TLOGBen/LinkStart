@@ -622,6 +622,132 @@ impl Engine {
         // No post-callback fallible core commit can obscure a committed ledger result.
         action(&snapshot)
     }
+    /// Read an existing forum receipt without dispatch, hydration, or ledger writes.
+    /// Metadata is server-owned; legacy receipts without scope cannot be reconstructed.
+    pub fn forum_operation_receipt(
+        &self,
+        credential: &str,
+        space_id: &str,
+        endpoint_id: &str,
+        operation_request_id: &str,
+    ) -> Result<Option<Value>, ApiError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| err("Internal", "runtime lock poisoned"))?;
+        let owner = hash(credential) == hash(&inner.secret);
+        let tx = inner
+            .db
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(internal)?;
+        let encoded: String = tx
+            .query_row("SELECT json FROM core_state WHERE id=1", [], |r| r.get(0))
+            .map_err(internal)?;
+        let state: State = serde_json::from_str(&encoded).map_err(internal)?;
+        let member = state.members.iter().find(|m| {
+            m["credential_hash"] == hash(credential) && credential_active(m, (self.clock)())
+        });
+        if !owner && member.is_none() {
+            return Err(err("Unauthenticated", "invalid credential"));
+        }
+        if !owner && !member.is_some_and(|m| m["space_id"] == space_id) {
+            return Err(err("Denied", "space membership required"));
+        }
+        let identity = if owner {
+            "owner"
+        } else {
+            member.unwrap()["id"]
+                .as_str()
+                .ok_or_else(|| err("Internal", "invalid identity"))?
+        };
+        let observe = |eid: &str| -> Result<(), ApiError> {
+            let endpoint = state
+                .endpoints
+                .iter()
+                .find(|e| e["id"] == eid && e["space_id"] == space_id)
+                .ok_or_else(|| err("NotFound", "endpoint not found in requested space"))?;
+            if endpoint["kind"] == "github"
+                && (endpoint["source_authority"]["space_id"] != space_id
+                    || !endpoint["source_authority"]["approved_by"].is_string())
+            {
+                return Err(err(
+                    "Denied",
+                    "legacy GitHub endpoint lacks repository approval",
+                ));
+            }
+            if !owner
+                && !member.is_some_and(|m| admin(&m["roles"]))
+                && !endpoint["grants"][identity]
+                    .as_array()
+                    .is_some_and(|ops| ops.iter().any(|op| op == "observe"))
+            {
+                return Err(err("Denied", "current endpoint observe grant required"));
+            }
+            Ok(())
+        };
+        observe(endpoint_id)?;
+        let Some(receipt) = state
+            .receipts
+            .iter()
+            .find(|r| r["identity"] == identity && r["request_id"] == operation_request_id)
+        else {
+            return Ok(None);
+        };
+        let metadata = &receipt["operation_scope"];
+        let tool = metadata["tool"].as_str().ok_or_else(|| {
+            err(
+                "Unsupported",
+                "legacy receipt has no trusted operation scope",
+            )
+        })?;
+        if !matches!(tool, "topics.create" | "task.act") {
+            return Err(err(
+                "Unsupported",
+                "receipt is not a public forum operation",
+            ));
+        }
+        if metadata["space_id"] != space_id {
+            return Err(err("Denied", "receipt belongs to another space"));
+        }
+        if let Some(eid) = metadata["endpoint_id"].as_str() {
+            observe(eid)?;
+        }
+        if let Some(role) = metadata["required_role"].as_str() {
+            if !member.is_some_and(|m| has(&m["roles"], role)) {
+                return Err(err(
+                    "Denied",
+                    "current identity lacks original dispatch role",
+                ));
+            }
+        }
+        let topic_id = metadata["topic_id"]
+            .as_str()
+            .ok_or_else(|| err("Unsupported", "receipt has no trusted topic resource"))?;
+        if !state
+            .topics
+            .iter()
+            .any(|t| t["id"] == topic_id && t["space_id"] == space_id)
+        {
+            return Err(err(
+                "NotFound",
+                "receipt topic no longer exists in requested space",
+            ));
+        }
+        // Match current forum observation permission rather than replaying the mutation.
+        permission(
+            owner,
+            member,
+            &ToolRequest {
+                request_id: "operation:observe".into(),
+                tool: "topics.read".into(),
+                space_id: Some(space_id.into()),
+                args: json!({"topic_id":topic_id}),
+            },
+        )?;
+        Ok(Some(
+            json!({"tool":tool,"topic_id":topic_id,"receipt":receipt["result"]}),
+        ))
+    }
     pub fn execute_requiring_role(
         &self,
         credential: &str,
@@ -917,7 +1043,13 @@ impl Engine {
             return Ok(result);
         }
         if !renewal {
-            s.receipts.push(json!({"identity":identity,"request_id":request.request_id,"fingerprint":fingerprint,"result":result}));
+            let topic_id = if request.tool == "topics.create" {
+                result["id"].clone()
+            } else {
+                request.args["topic_id"].clone()
+            };
+            s.receipts.push(json!({"identity":identity,"request_id":request.request_id,"fingerprint":fingerprint,"result":result,
+                "operation_scope":{"tool":request.tool,"space_id":request.space_id,"topic_id":topic_id,"endpoint_id":required_endpoint.map(|e|e.0),"required_role":required_role}}));
         }
         let encoded = serde_json::to_string(&s).map_err(internal)?;
         tx.execute("UPDATE core_state SET json=?1 WHERE id=1", [encoded])
