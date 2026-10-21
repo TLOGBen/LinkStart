@@ -190,6 +190,60 @@ impl Drop for CallbackLease {
     }
 }
 impl OwnedCodexRegistry {
+    /// Trusted protected-plan recovery only. Never expose persisted to HTTP.
+    pub(crate) fn restore_workspace_approval(
+        &self,
+        space_id: &str,
+        endpoint_id: &str,
+        workspace: &Path,
+        persisted: &Value,
+    ) -> Result<ApprovedWorkspace, HostError> {
+        #[cfg(not(windows))]
+        {
+            let _ = (space_id, endpoint_id, workspace, persisted);
+            return Err(HostError::Unsupported(
+                "workspace-write capability verified only on Windows Codex 0.163.0".into(),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            let fields = [
+                "root",
+                "space_id",
+                "endpoint_id",
+                "approved_by",
+                "codex_version",
+                "capability_evidence",
+            ];
+            let object = persisted
+                .as_object()
+                .filter(|o| o.len() == fields.len())
+                .ok_or_else(|| denied("malformed stored workspace approval"))?;
+            if fields.iter().any(|k| {
+                !object
+                    .get(*k)
+                    .is_some_and(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()))
+            }) || persisted["space_id"] != space_id
+                || persisted["endpoint_id"] != endpoint_id
+                || persisted["codex_version"] != "0.163.0"
+            {
+                return Err(denied("stored workspace approval mismatch"));
+            }
+            let root = workspace.canonicalize().map_err(io)?;
+            let stored_root = PathBuf::from(persisted["root"].as_str().unwrap());
+            if !root.is_dir() || root != workspace || stored_root != root {
+                return Err(denied("exact canonical approved workspace required"));
+            }
+            Ok(ApprovedWorkspace {
+                root,
+                space_id: space_id.into(),
+                endpoint_id: endpoint_id.into(),
+                approved_by: persisted["approved_by"].as_str().unwrap().into(),
+                codex_version: "0.163.0".into(),
+                capability_evidence: persisted["capability_evidence"].as_str().unwrap().into(),
+            })
+        }
+    }
     /// Trusted management entry point; never deserialize an approval from HTTP.
     pub fn approve_workspace(
         &self,
