@@ -1,0 +1,61 @@
+   Compiling linkstart v0.1.6 (C:\Users\jimts\workspace\Gits\Vakarve\LinkStart-launch-policy)
+warning: fields `credential` and `facade` are never read
+   --> src\runtime_launch_policy.rs:171:5
+    |
+169 | pub struct ApprovedLaunch {
+    |            -------------- fields in this struct
+170 |     config: OwnedHostConfig,
+171 |     credential: String,
+    |     ^^^^^^^^^^
+172 |     facade: Arc<dyn RuntimeToolFacade>,
+    |     ^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: method `into_parts` is never used
+   --> src\runtime_launch_policy.rs:186:19
+    |
+176 | impl ApprovedLaunch {
+    | ------------------- method in this implementation
+...
+186 |     pub(crate) fn into_parts(
+    |                   ^^^^^^^^^^
+
+warning: field `stderr` is never read
+   --> src\runtime_source.rs:421:9
+    |
+418 | pub(crate) struct BoundedProcessOutput {
+    |                   -------------------- field in this struct
+...
+421 |     pub stderr: Vec<u8>,
+    |         ^^^^^^
+
+warning: `linkstart` (lib) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.37s
+     Running tests\runtime_launch_policy.rs (target\debug\deps\runtime_launch_policy-79ac62624f677211.exe)
+
+running 21 tests
+test rotation_never_recreates_or_replaces_private_slot ... ok
+test actor_may_use_explicit_manage_without_becoming_installer ... ok
+test identifier_and_persisted_timeout_boundaries ... ok
+test worker_slots_cross_endpoint ... ok
+test scope_namespaces_cross_space ... ok
+test scope_namespaces_cross_endpoint ... ok
+test exact_space_is_required_even_for_owner ... ok
+test missing_slot_nonadmin_and_borrowed_manager_are_rejected ... ok
+test revocation_advances_revision_and_replay_does_not_restore_it ... ok
+test credential_cannot_leak_through_public_plan_or_fake_argv ... ok
+test worker_slots_cross_space ... ok
+test malformed_plan_and_unknown_target_fail_closed ... ok
+test extreme_timeout_obeys_platform_deadline_without_panic ... ok
+test unknown_future_schema_is_rejected_without_mutation ... ok
+test malformed_legacy_document_rolls_back_both_tables_and_unrelated_state ... ok
+test durable_exact_plan_and_private_slot ... ok
+test workspace_write_keeps_approved_profile_across_reopen ... ok
+test expired_worker_remains_expired_after_reopen ... ok
+test installer_admission_precedes_private_slot_and_preflight_observation ... ok
+test provisioning_admission_precedes_worker_validation ... ok
+test legacy_migration_preserves_rows_secrets_revisions_and_reopen_is_idempotent ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.29s
+

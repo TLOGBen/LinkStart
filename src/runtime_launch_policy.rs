@@ -317,6 +317,9 @@ impl LaunchPolicyStore {
         {
             return Err(error("Invalid", "nonempty slot and credential required"));
         }
+        // Admit the actor before disclosing worker validation results. Keep Engine
+        // checks separate: authorization callbacks must not reenter Engine.
+        self.admin(actor, &binding, || Ok(()))?;
         self.worker(&binding, credential)?;
         self.admin(actor, &binding, || {
             let mut db = self.db()?;
@@ -363,6 +366,9 @@ impl LaunchPolicyStore {
         {
             return Err(error("Invalid", "invalid trusted launch plan"));
         }
+        // Private slot existence and preflight results require current admission.
+        // The final admin callback below still fences the actual mutation.
+        self.admin(actor, &plan.binding, || Ok(()))?;
         let worker_credential = self.slot(&plan.worker_slot, &plan.binding)?;
         let executable = plan
             .executable

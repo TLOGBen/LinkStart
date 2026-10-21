@@ -5,6 +5,139 @@ use linkstart::{
 };
 use serde_json::{json, Value};
 use std::time::Duration;
+
+fn rejected_installer(f: &Fixture, case: &str) -> String {
+    match case {
+        "invalid" => "invalid-actor".into(),
+        "cross-space" => alternate_scope(f, true).0,
+        "no-manage" => f.worker.clone(),
+        "revoked" => {
+            let invite = call(
+                &f.e,
+                &f.admin,
+                Some(&f.binding.space_id),
+                "members.invite",
+                json!({"roles":["manager"]}),
+            );
+            let manager = call(
+                &f.e,
+                invite["invite_token"].as_str().unwrap(),
+                Some(&f.binding.space_id),
+                "members.register",
+                json!({"name":"revoked-installer"}),
+            );
+            call(
+                &f.e,
+                &f.admin,
+                Some(&f.binding.space_id),
+                "endpoints.grant",
+                json!({"endpoint_id":f.binding.endpoint_id,"member_id":manager["id"],"operations":["manage"]}),
+            );
+            call(
+                &f.e,
+                &f.admin,
+                Some(&f.binding.space_id),
+                "members.revoke_credential",
+                json!({"member_id":manager["id"],"expected_epoch":0}),
+            );
+            manager["credential"].as_str().unwrap().into()
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn installer_admission_precedes_private_slot_and_preflight_observation() {
+    for case in ["invalid", "cross-space", "no-manage", "revoked"] {
+        let f = Fixture::new();
+        f.provision();
+        f.store
+            .install(&f.admin, "existing-plan", None, f.plan())
+            .unwrap();
+        let actor = rejected_installer(&f, case);
+        let expected =
+            f.e.with_endpoint_authorization(
+                &actor,
+                &f.binding.space_id,
+                &f.binding.endpoint_id,
+                "manage",
+                |_| Ok(()),
+            )
+            .unwrap_err();
+        let db = rusqlite::Connection::open(f.dir.path().join("v2-launch-policy.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE unrelated_state(id INTEGER PRIMARY KEY,value TEXT NOT NULL); INSERT INTO unrelated_state VALUES(17,'must remain unchanged');").unwrap();
+        let before = storage_snapshot(&db);
+        for slot in [
+            "absent",
+            "existing-wrong-linkage",
+            "existing-exact-linkage",
+            "invalid-preflight",
+        ] {
+            let mut plan = f.plan();
+            match slot {
+                "absent" => plan.worker_slot = "absent-slot".into(),
+                "existing-wrong-linkage" => {
+                    plan.binding.identity_id = "probe-identity".into();
+                    plan.binding.attachment_id = "probe-attachment".into();
+                }
+                "invalid-preflight" => plan.workspace = f.dir.path().join("absent-directory"),
+                _ => {}
+            }
+            let observed = f
+                .store
+                .install(&actor, "existing-plan", None, plan)
+                .unwrap_err();
+            assert_eq!(
+                (&observed.code, &observed.message),
+                (&expected.code, &expected.message),
+                "{case}/{slot}"
+            );
+            assert!(
+                before == storage_snapshot(&db),
+                "write after rejected {case}/{slot}"
+            );
+        }
+    }
+}
+
+#[test]
+fn provisioning_admission_precedes_worker_validation() {
+    for case in ["invalid", "cross-space", "no-manage", "revoked"] {
+        let f = Fixture::new();
+        f.provision();
+        let actor = rejected_installer(&f, case);
+        let expected =
+            f.e.with_endpoint_authorization(
+                &actor,
+                &f.binding.space_id,
+                &f.binding.endpoint_id,
+                "manage",
+                |_| Ok(()),
+            )
+            .unwrap_err();
+        let db = rusqlite::Connection::open(f.dir.path().join("v2-launch-policy.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE unrelated_state(id INTEGER PRIMARY KEY,value TEXT NOT NULL); INSERT INTO unrelated_state VALUES(17,'must remain unchanged');").unwrap();
+        let before = storage_snapshot(&db);
+        for id in ["absent-slot", "worker-slot"] {
+            for credential in [&f.worker[..], "invalid-worker"] {
+                let observed = f
+                    .store
+                    .provision_worker_slot(&actor, id, f.binding.clone(), credential)
+                    .unwrap_err();
+                assert_eq!(
+                    (&observed.code, &observed.message),
+                    (&expected.code, &expected.message),
+                    "{case}/{id}"
+                );
+                assert!(
+                    before == storage_snapshot(&db),
+                    "write after rejected {case}/{id}"
+                );
+            }
+        }
+    }
+}
+
 fn alternate_scope(f: &Fixture, other_space: bool) -> (String, String, WorkerBinding) {
     let (admin, worker, mut binding) = if other_space {
         let owner = std::fs::read_to_string(owner_token_path(f.dir.path())).unwrap();
