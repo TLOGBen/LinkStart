@@ -216,7 +216,6 @@ impl Drop for CallbackLease {
     }
 }
 impl OwnedCodexRegistry {
-<<<<<<< HEAD
     /// Refresh only an actual held, unfenced host's existing attachment. The
     /// liveness lease participates in lifecycle drain but never holds facts
     /// across Engine I/O. Initialization need not have created a thread yet.
@@ -291,7 +290,7 @@ impl OwnedCodexRegistry {
             )
             .map_err(|_| denied("attachment renewal denied"))?;
         Ok(())
-=======
+    }
     /// Trusted protected-plan recovery only. Never expose persisted to HTTP.
     pub(crate) fn restore_workspace_approval(
         &self,
@@ -345,7 +344,6 @@ impl OwnedCodexRegistry {
                 capability_evidence: persisted["capability_evidence"].as_str().unwrap().into(),
             })
         }
->>>>>>> origin/main
     }
     /// Trusted management entry point; never deserialize an approval from HTTP.
     pub fn approve_workspace(
