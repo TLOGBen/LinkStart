@@ -49,6 +49,12 @@ pub struct HostScope {
     pub session_id: String,
     pub binding_generation: u64,
 }
+/// Read-only trusted registry evidence; never accepted from a wire caller.
+pub(crate) struct DurableThreadMetadata {
+    pub provider_thread_id: String,
+    pub model: String,
+    pub profile: Value,
+}
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderTurnOutcome {
@@ -492,6 +498,59 @@ impl OwnedCodexRegistry {
         let db = Connection::open(self.dir.join("v2-codex-host.sqlite")).map_err(io)?;
         db.busy_timeout(Duration::from_secs(5)).map_err(io)?;
         Ok(db)
+    }
+    pub(crate) fn durable_thread_metadata(
+        &self,
+        expected: &HostScope,
+    ) -> Result<Option<DurableThreadMetadata>, HostError> {
+        let db = self.db()?;
+        let mut statement=db.prepare("SELECT thread,scope,model,workspace,profile FROM owned_threads WHERE json_extract(scope,'$.session_id')=?1 LIMIT 2").map_err(io)?;
+        let rows = statement
+            .query_map([&expected.session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(io)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        if rows.len() != 1 {
+            return Err(denied("ambiguous durable owned thread"));
+        }
+        let (thread, scope, model, workspace, profile) = rows.into_iter().next().unwrap();
+        let scope: HostScope = serde_json::from_str(&scope).map_err(io)?;
+        let generation: Option<u64> = db
+            .query_row(
+                "SELECT generation FROM host_generations WHERE session=?1",
+                [&expected.session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(io)?;
+        let profile: Value = serde_json::from_str(&profile).map_err(io)?;
+        if scope != *expected
+            || generation != Some(expected.binding_generation)
+            || thread.trim().is_empty()
+            || model.trim().is_empty()
+            || (profile.get("WorkspaceWrite").is_some()
+                && profile["WorkspaceWrite"]["root"] != workspace)
+        {
+            return Err(denied(
+                "durable thread identity/profile/generation mismatch",
+            ));
+        }
+        Ok(Some(DurableThreadMetadata {
+            provider_thread_id: thread,
+            model,
+            profile,
+        }))
     }
     /// Config is trusted Runtime configuration. Scope is independently authenticated;
     /// arbitrary HTTP config, argv, executable and workspace must never reach here.

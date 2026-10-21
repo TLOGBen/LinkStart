@@ -172,8 +172,21 @@ pub struct ApprovedLaunch {
     facade: Arc<dyn RuntimeToolFacade>,
     plan_id: String,
     revision: u64,
+    policy: LaunchPolicyStore,
 }
 impl ApprovedLaunch {
+    pub(crate) fn refresh(&self, actor: &str) -> Result<Self, ApiError> {
+        self.policy.approve(
+            actor,
+            &self.config.scope.space_id,
+            &self.config.scope.endpoint_id,
+            &self.plan_id,
+            self.revision,
+        )
+    }
+    pub(crate) fn scope(&self) -> &HostScope {
+        &self.config.scope
+    }
     pub fn plan_id(&self) -> &str {
         &self.plan_id
     }
@@ -193,6 +206,7 @@ impl ApprovedLaunch {
         (self.config, self.credential, self.facade)
     }
 }
+#[derive(Clone)]
 pub struct LaunchPolicyStore {
     path: PathBuf,
     engine: Engine,
@@ -558,6 +572,7 @@ impl LaunchPolicyStore {
             credential,
             plan_id: id.into(),
             revision,
+            policy: self.clone(),
         })
     }
     /// Revocation advances the revision and cannot be undone by replaying installation.

@@ -279,6 +279,7 @@ pub struct OwnedSessionSupervisor {
     registry: OwnedCodexRegistry,
     options: SupervisorOptions,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    draining: AtomicBool,
 }
 
 fn authorize(
@@ -353,6 +354,7 @@ impl OwnedSessionSupervisor {
             registry,
             options,
             sessions: Mutex::new(HashMap::new()),
+            draining: AtomicBool::new(false),
         })
     }
     pub fn start(
@@ -361,6 +363,39 @@ impl OwnedSessionSupervisor {
         credential: String,
         facade: Arc<dyn RuntimeToolFacade>,
         admission: ThreadAdmission,
+    ) -> Result<Accepted, SupervisorError> {
+        self.start_internal(config, credential, facade, admission, None)
+    }
+    /// Trusted bridge admission. The sealed plan is resolved again on the worker,
+    /// immediately before spawn, with the original actor and current worker grant.
+    pub fn start_as(
+        &self,
+        actor: &str,
+        launch: crate::runtime_launch_policy::ApprovedLaunch,
+        session_id: String,
+        generation: u64,
+        admission: ThreadAdmission,
+    ) -> Result<Accepted, SupervisorError> {
+        if session_id.trim().is_empty() || generation == 0 {
+            return Err(SupervisorError::Invalid);
+        }
+        let fresh = launch.refresh(actor).map_err(|_| SupervisorError::Denied)?;
+        let (config, credential, facade) = fresh.into_parts(session_id, generation);
+        self.start_internal(
+            config,
+            credential,
+            facade,
+            admission,
+            Some((actor.to_string(), launch)),
+        )
+    }
+    fn start_internal(
+        &self,
+        config: OwnedHostConfig,
+        credential: String,
+        facade: Arc<dyn RuntimeToolFacade>,
+        admission: ThreadAdmission,
+        launch: Option<(String, crate::runtime_launch_policy::ApprovedLaunch)>,
     ) -> Result<Accepted, SupervisorError> {
         let scope = config.scope.clone();
         authorize(&self.engine, &credential, &scope, "send")?;
@@ -389,6 +424,9 @@ impl OwnedSessionSupervisor {
         });
         {
             let mut sessions = self.sessions.lock().map_err(|_| SupervisorError::Closed)?;
+            if self.draining.load(Ordering::Acquire) {
+                return Err(SupervisorError::Closed);
+            }
             if sessions.contains_key(&scope.session_id) {
                 return Err(SupervisorError::Conflict);
             }
@@ -402,6 +440,20 @@ impl OwnedSessionSupervisor {
             .name("runtime-owned-session".into())
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if owned.stop.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let (config, credential, facade) = if let Some((actor, launch)) = launch {
+                        let fresh = launch.refresh(&actor).map_err(|_| {
+                            HostError::Denied("current launch authority denied".into())
+                        })?;
+                        fresh.into_parts(
+                            config.scope.session_id.clone(),
+                            config.scope.binding_generation,
+                        )
+                    } else {
+                        (config, credential, facade)
+                    };
                     run_worker(
                         engine, registry, config, credential, facade, admission, rx, &owned,
                         options,
@@ -742,6 +794,18 @@ impl OwnedSessionSupervisor {
                         return Err(SupervisorError::Conflict);
                     }
                 } else {
+                    if session.stop.load(Ordering::Acquire) {
+                        return Err(SupervisorError::Closed);
+                    }
+                    if session
+                        .status
+                        .lock()
+                        .map_err(|_| SupervisorError::Closed)?
+                        .phase
+                        != SessionPhase::Running
+                    {
+                        return Err(SupervisorError::Conflict);
+                    }
                     if operations.len() >= 1024 {
                         return Err(SupervisorError::QueueFull);
                     }
@@ -945,13 +1009,13 @@ impl OwnedSessionSupervisor {
             .count()
     }
     pub fn request_shutdown(&self) {
-        let sessions: Vec<_> = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .cloned()
-            .collect();
+        let sessions: Vec<_> = {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            // The same map lock fences every legacy/actor start registration.
+            // No provider I/O is performed under this admission transaction.
+            self.draining.store(true, Ordering::Release);
+            sessions.values().cloned().collect()
+        };
         for s in sessions {
             s.stop.store(true, Ordering::Release);
             // Immediate local fence; Pending only means an existing callback
@@ -987,6 +1051,9 @@ fn run_worker(
     options: SupervisorOptions,
 ) -> Result<(), HostError> {
     let scope = config.scope.clone();
+    if session.stop.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let mut host = registry.spawn(config, &credential, facade)?;
     session
         .status
