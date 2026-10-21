@@ -4,6 +4,72 @@ ROOT=pathlib.Path(__file__).resolve().parents[1]
 BIN=pathlib.Path(os.environ.get('LINKSTART_BIN',str(ROOT/'target/debug/linkstart.exe')))
 
 class RuntimeHttp(unittest.TestCase):
+    def native_fixture_args(self, name, marker=None):
+        # One local Python child, no provider/model or executable-specific shell.
+        # Restart reuses these args and appends its actual PID to the same log.
+        release=pathlib.Path(self.tmp.name)/(name+'-cleanup-release')
+        pids=pathlib.Path(self.tmp.name)/(name+'-native-pids')
+        script=pathlib.Path(self.tmp.name)/(name+'-child.py')
+        script.write_text("""import os,pathlib,queue,sys,threading,time
+release=pathlib.Path(sys.argv[1])
+with pathlib.Path(sys.argv[2]).open('a',encoding='utf-8') as log:
+ log.write(str(os.getpid())+'\\n');log.flush()
+if len(sys.argv)>3:
+ print(sys.argv[3],flush=True)
+ sys.exit(0)
+commands=queue.Queue()
+def read_commands():
+ for line in sys.stdin:commands.put(line.strip())
+threading.Thread(target=read_commands,daemon=True).start()
+print('NATIVE_READY',flush=True)
+deadline=time.monotonic()+30
+try:
+ while not release.exists() and time.monotonic()<deadline:
+  try:line=commands.get(timeout=.05)
+  except queue.Empty:continue
+  if line=='quit':break
+  if line=='marker':print('RECOVERY_58317',flush=True)
+  elif line.startswith('double '):print(int(line.split()[1])*2,flush=True)
+except KeyboardInterrupt:pass
+print('NATIVE_EXIT',flush=True)
+os._exit(0)  # No interpreter-finalization race with the blocked input daemon thread.
+""",encoding='utf-8')
+        self.native_fixtures.append((release,pids))
+        args=['-u',str(script),str(release),str(pids)]
+        if marker is not None:args.append(marker)
+        return {'command':sys.executable,'args':args,'name':name}
+
+    def wait_terminal(self, call, eid, *, text=None, exited=False):
+        for _ in range(100):
+            status,view=call('terminal.observe',{'endpoint_id':eid,'cursor':0})
+            self.assertEqual(status,200,view)
+            if (text is None or text in view['text']) and (not exited or view['status']=='exited'):
+                return view
+            time.sleep(.05)
+        self.fail('native terminal did not reach expected output/exit: '+repr(view))
+
+    def exit_terminal(self, call, eid):
+        status,lease=call('terminal.acquire',{'endpoint_id':eid})
+        self.assertEqual(status,200,lease)
+        status,result=call('terminal.write',dict(endpoint_id=eid,input='quit\r\n',**lease))
+        self.assertEqual(status,200,result)
+        status,result=call('terminal.release',dict(endpoint_id=eid,**lease))
+        self.assertEqual(status,200,result)
+        self.wait_terminal(call,eid,exited=True)
+
+    def assert_force_platform(self, call, eid):
+        status,result=call('terminal.force',{'endpoint_id':eid})
+        if os.name=='nt':
+            self.assertEqual(status,200,result)
+            self.wait_terminal(call,eid,exited=True)
+        else:
+            self.assertEqual(status,409,result)
+            self.assertEqual(result['error']['code'],'NativeError',result)
+            self.assertIn('Unsupported',result['error']['message'])
+            # Unsupported still fences the old lease. Reacquire for intentional exit.
+            self.assertEqual(self.wait_terminal(call,eid)['status'],'live')
+            self.exit_terminal(call,eid)
+
     def cli_control(self, action):
         args=[str(BIN),'daemon',action,'--json','--state-dir',self.state_dir]
         if action!='stop':args+=['--port',str(self.port)]
@@ -14,6 +80,9 @@ class RuntimeHttp(unittest.TestCase):
         self.cli_control('stop')
 
     def recorded_terminal(self, name, script):
+        pids=pathlib.Path(self.tmp.name)/(name+'-native-pids')
+        self.native_fixtures.append((pathlib.Path(self.tmp.name)/(name+'-cleanup-release'),pids))
+        script="import os,pathlib\nwith pathlib.Path("+repr(str(pids))+").open('a',encoding='utf-8') as log:log.write(str(os.getpid())+'\\n');log.flush()\n"+script
         owner=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()
         status,space=self.post(dict(request_id=name+'-space',tool='spaces.create',args={'name':name}),owner)
         self.assertEqual(status,200,space)
@@ -28,6 +97,7 @@ class RuntimeHttp(unittest.TestCase):
             with self.subTest(action=action):
                 self.addCleanup(self.cli_cleanup)
                 release=pathlib.Path(self.tmp.name)/('release-'+action)
+                self.native_fixtures.append((release,pathlib.Path(self.tmp.name)/('cli-'+action+'-native-pids')))
                 tail_time=pathlib.Path(self.tmp.name)/('tail-time-'+action)
                 marker='CLI_FINAL_TAIL_'+action
                 script="import pathlib,time\np=pathlib.Path("+repr(str(release))+")\nprint('CLI_ACTIVE_READY',flush=True)\ntry:\n while not p.exists():time.sleep(.01)\nexcept KeyboardInterrupt:pass\nprint("+repr(marker)+",flush=True)\npathlib.Path("+repr(str(tail_time))+").write_text(str(time.time_ns()))\n"
@@ -159,6 +229,8 @@ class RuntimeHttp(unittest.TestCase):
         self.assertEqual(status,200,result)
         self.assertEqual(result['items'],[])
     def setUp(self):
+        self.native_fixtures=[]
+        self.owned_terminals=[]
         self.tmp=tempfile.TemporaryDirectory(prefix='linkstart-http-')
         # Python 3.13+ applies explicit Windows ACEs to its private temp root.
         # Give Runtime a new child directory whose storage ACL it owns.
@@ -180,8 +252,30 @@ class RuntimeHttp(unittest.TestCase):
             time.sleep(.1)
         else: self.fail('owned daemon did not become healthy')
     def cleanup(self):
-        if self.child.poll() is None: self.child.terminate();self.child.wait(timeout=10)
-        self.log.close();self.tmp.cleanup()
+        # Independent fixture release survives RED, revoked leases and draining.
+        # Address only files created in this test's private temp directory.
+        for release,_ in self.native_fixtures:release.touch()
+        until=time.monotonic()+8
+        while time.monotonic()<until:
+            for _,sid,eid,token in self.owned_terminals:
+                if self.child.poll() is None:
+                    try:self.post(dict(request_id=str(time.time_ns()),tool='terminal.observe',space_id=sid,args={'endpoint_id':eid}),token)
+                    except OSError:pass
+            pids={pid for pid,_,_,_ in self.owned_terminals if pid is not None}
+            for _,log in self.native_fixtures:
+                if log.exists():pids.update(int(line) for line in log.read_text().splitlines())
+            if not any(self.pid_alive(pid) for pid in pids):break
+            time.sleep(.05)
+        alive=[pid for pid in pids if self.pid_alive(pid)]
+        if self.child.poll() is None:
+            try:self.cli_cleanup()
+            except (OSError,subprocess.TimeoutExpired):pass
+        if self.child.poll() is None:self.child.terminate();self.child.wait(timeout=10)
+        print(json.dumps({'evidence':'http-owned-child-cleanup','tracked_pids':sorted(pids),'alive_before_daemon_cleanup':alive,'alive_after_daemon_cleanup':[pid for pid in pids if self.pid_alive(pid)]}),flush=True)
+        remaining=[pid for pid in pids if self.pid_alive(pid)]
+        self.log.close()
+        if not remaining:self.tmp.cleanup()
+        self.assertEqual(remaining,[],'test-owned native children remain; fixture directory '+self.tmp.name)
     def get(self,path):
         try:
             with urllib.request.urlopen(self.base+path,timeout=5) as r: return r.status,json.load(r)
@@ -252,7 +346,12 @@ class RuntimeHttp(unittest.TestCase):
         if origin:headers['Origin']=origin
         req=urllib.request.Request(self.base+'/v2/tools',data=json.dumps(body).encode(),headers=headers)
         try:
-            with urllib.request.urlopen(req,timeout=5) as r:return r.status,json.load(r)
+            with urllib.request.urlopen(req,timeout=5) as r:
+                value=json.load(r)
+                if body['tool'] in ['terminal.create','terminal.restart']:
+                    item=(value['session']['process_id'],body.get('space_id'),value['endpoint']['id'],credential)
+                    if item not in self.owned_terminals:self.owned_terminals.append(item)
+                return r.status,value
         except urllib.error.HTTPError as e:
             with e:
                 raw=e.read()
@@ -276,20 +375,21 @@ class RuntimeHttp(unittest.TestCase):
             self.assertEqual(status,200,value)
             return value
         sid=call('spaces.create',{'name':'terminal'})['space']['id']
-        args={'command':'cmd.exe','args':['/Q'],'name':'owned shell'}
+        args=self.native_fixture_args('owned arithmetic')
         created=call('terminal.create',args,'create-terminal',sid)
         eid=created['endpoint']['id']
         replay=call('terminal.create',args,'create-terminal',sid)
         self.assertEqual(created['session']['id'],replay['session']['id'])
         lease=call('terminal.acquire',{'endpoint_id':eid},space_id=sid)
-        call('terminal.write',dict(endpoint_id=eid,input='set /a 314159*2\r\n',**lease),space_id=sid)
+        self.wait_terminal(lambda tool,args:self.post(dict(request_id=str(time.time_ns()),tool=tool,space_id=sid,args=args),token),eid,text='NATIVE_READY')
+        call('terminal.write',dict(endpoint_id=eid,input='double 314159\r\n',**lease),space_id=sid)
         for _ in range(60):
             output=call('terminal.observe',{'endpoint_id':eid,'cursor':0},space_id=sid)
             if '628318' in output['text']:break
             time.sleep(.1)
         self.assertIn('628318',output['text'])
         call('terminal.release',dict(endpoint_id=eid,**lease),space_id=sid)
-        call('terminal.force',{'endpoint_id':eid},space_id=sid)
+        self.assert_force_platform(lambda tool,args:self.post(dict(request_id=str(time.time_ns()),tool=tool,space_id=sid,args=args),token),eid)
 
     def test_history_restart_recovery_and_revocation(self):
         token=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()
@@ -297,7 +397,7 @@ class RuntimeHttp(unittest.TestCase):
             return self.post(dict(request_id=rid or str(time.time_ns()),tool=tool,space_id=sid,args=args),credential)
         _,space=self.post(dict(request_id='history-space',tool='spaces.create',args={'name':'history'}),token)
         sid=space['space']['id']
-        status,created=call('terminal.create',{'command':'cmd.exe','args':['/Q','/C','echo HISTORY_71629'],'name':'recorded'})
+        status,created=call('terminal.create',self.native_fixture_args('recorded',marker='HISTORY_71629'))
         self.assertEqual(status,200,created)
         eid=created['endpoint']['id']; old=created['session']['id']
         for _ in range(60):
@@ -306,6 +406,7 @@ class RuntimeHttp(unittest.TestCase):
             time.sleep(.1)
         self.assertEqual(status,200,page)
         self.assertIn(b'HISTORY_71629',bytes(b for e in page['events'] for b in e['bytes']))
+        self.wait_terminal(call,eid,exited=True)
         _,invite=call('members.invite',{'roles':['observer']})
         _,member=call('members.register',{'name':'reader'},invite['invite_token'])
         credential=member['credential']
@@ -323,10 +424,13 @@ class RuntimeHttp(unittest.TestCase):
         self.assertEqual(call('terminal.restart',args,rid='restart-one')[1],restarted)
         _,listing=call('history.list',{'endpoint_id':eid})
         self.assertEqual(len(listing['items']),2)
-        # Close through the public shutdown gate, then restart our owned process handle.
+        self.wait_terminal(call,eid,exited=True)
+        # All owned children exited; use the authenticated normal gate on Linux.
+        # Windows retains runtime.force_shutdown coverage here and in fault recovery.
         for _ in range(10):
             _,prepared=call('runtime.prepare_shutdown')
-            _,result=call('runtime.force_shutdown',{'ticket':prepared['ticket']})
+            status,result=call('runtime.force_shutdown' if os.name=='nt' else 'runtime.confirm_shutdown',{'ticket':prepared['ticket']})
+            self.assertEqual(status,200,result)
             if result['status']=='stopping':break
             time.sleep(.1)
         self.assertEqual(result['status'],'stopping',result)
@@ -390,31 +494,47 @@ class RuntimeHttp(unittest.TestCase):
         _,space=self.post(dict(request_id='restart-space',tool='spaces.create',args={'name':'restart'}),token)
         sid=space['space']['id']
         def call(tool,args={},rid=None):return self.post(dict(request_id=rid or str(time.time_ns()),tool=tool,space_id=sid,args=args),token)
-        _,created=call('terminal.create',{'command':'cmd.exe','args':['/Q']})
+        status,created=call('terminal.create',self.native_fixture_args('restart live'))
+        self.assertEqual(status,200,created)
         eid=created['endpoint']['id']; old=created['session']['id']
         _,lease=call('terminal.acquire',{'endpoint_id':eid})
         status,value=call('terminal.restart',{'endpoint_id':eid,'expected_session_id':old})
         self.assertEqual(status,409,value);self.assertEqual(value['error']['code'],'SessionAlive')
-        call('terminal.force',{'endpoint_id':eid})
+        self.wait_terminal(call,eid,text='NATIVE_READY')
+        self.assert_force_platform(call,eid)
         status,restarted=call('terminal.restart',{'endpoint_id':eid,'expected_session_id':old},'restart-shell')
         self.assertEqual(status,200,restarted)
-        status,value=call('terminal.write',dict(endpoint_id=eid,input='echo stale\r\n',**lease))
+        status,value=call('terminal.write',dict(endpoint_id=eid,input='double 1\r\n',**lease))
         self.assertEqual(status,409,value)
         status,value=call('terminal.restart',{'endpoint_id':eid,'expected_session_id':old})
         self.assertEqual(status,409,value);self.assertEqual(value['error']['code'],'StaleSession')
         status,value=call('terminal.restart',{'endpoint_id':eid,'expected_session_id':old,'extra':1},'restart-shell')
         self.assertEqual(status,409,value);self.assertEqual(value['error']['code'],'RequestConflict')
-        call('terminal.force',{'endpoint_id':eid})
+        self.wait_terminal(call,eid,text='NATIVE_READY')
+        self.assert_force_platform(call,eid)
 
     def test_shutdown_checkpoint_failure_is_pending(self):
         token=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()
         _,space=self.post(dict(request_id='failure-space',tool='spaces.create',args={'name':'checkpoint failure'}),token)
         sid=space['space']['id']
         def call(tool,args={}):return self.post(dict(request_id=str(time.time_ns()),tool=tool,space_id=sid,args=args),token)
-        _,created=call('terminal.create',{'command':'cmd.exe','args':['/Q']})
+        status,created=call('terminal.create',self.native_fixture_args('checkpoint live'))
+        self.assertEqual(status,200,created)
         eid=created['endpoint']['id'];session=created['session']['id']
-        _,lease=call('terminal.acquire',{'endpoint_id':eid})
-        call('terminal.write',dict(endpoint_id=eid,input='echo RECOVERY_58317\r\n',**lease))
+        self.wait_terminal(call,eid,text='NATIVE_READY')
+        if os.name!='nt':
+            # Exercise documented force rejection while still genuinely live.
+            status,result=call('terminal.force',{'endpoint_id':eid})
+            self.assertEqual(status,409,result)
+            self.assertEqual(result['error']['code'],'NativeError',result)
+            self.assertIn('Unsupported',result['error']['message'])
+            self.assertEqual(self.wait_terminal(call,eid)['status'],'live')
+        status,lease=call('terminal.acquire',{'endpoint_id':eid})
+        self.assertEqual(status,200,lease)
+        status,result=call('terminal.write',dict(endpoint_id=eid,input='marker\r\n',**lease))
+        self.assertEqual(status,200,result)
+        status,result=call('terminal.release',dict(endpoint_id=eid,**lease))
+        self.assertEqual(status,200,result)
         for _ in range(50):
             status,page=call('history.read',{'endpoint_id':eid,'session_id':session})
             if status==200 and b'RECOVERY_58317' in bytes(b for e in page['events'] for b in e['bytes']):break
@@ -428,8 +548,13 @@ class RuntimeHttp(unittest.TestCase):
             time.sleep(.1)
         # External filesystem fault: replace the exact checkpoint target with a directory.
         checkpoint.unlink();checkpoint.mkdir()
+        self.addCleanup(lambda: checkpoint.rmdir() if checkpoint.is_dir() else None)
+        if os.name!='nt':
+            # Finish input before draining forbids further acquire/write.
+            self.exit_terminal(call,eid)
+        shutdown_tool='runtime.force_shutdown' if os.name=='nt' else 'runtime.confirm_shutdown'
         _,prepared=call('runtime.prepare_shutdown')
-        status,result=call('runtime.force_shutdown',{'ticket':prepared['ticket']})
+        status,result=call(shutdown_tool,{'ticket':prepared['ticket']})
         self.assertEqual(status,200,result)
         self.assertEqual(result['status'],'pending',result)
         self.assertIn('history_error',result)
@@ -439,7 +564,7 @@ class RuntimeHttp(unittest.TestCase):
         checkpoint.rmdir()
         for _ in range(10):
             _,prepared=call('runtime.prepare_shutdown')
-            status,result=call('runtime.force_shutdown',{'ticket':prepared['ticket']})
+            status,result=call(shutdown_tool,{'ticket':prepared['ticket']})
             if result['status']=='stopping':break
             time.sleep(.1)
         self.assertEqual(result['status'],'stopping',result)
