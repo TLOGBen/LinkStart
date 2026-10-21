@@ -25,11 +25,35 @@ pub(crate) fn run(a: crate::cli::ToolArgs) -> Result<()> {
         bail!("request exceeds 256 KiB")
     }
     let _: linkstart::runtime_core::ToolRequest = serde_json::from_slice(&body)?;
+    let (status, value) = post(address, credential, &body)?;
+    println!("{}", serde_json::to_string(&value)?);
+    if !(200..300).contains(&status) {
+        bail!("runtime tool returned HTTP {status}")
+    }
+    Ok(())
+}
+
+/// The caller owns discovery and credentials; this transport never retries an
+/// uncertain mutation or prints internal lifecycle responses.
+pub(crate) fn post(
+    address: SocketAddr,
+    credential: &str,
+    body: &[u8],
+) -> Result<(u16, serde_json::Value)> {
+    if !address.ip().is_loopback() {
+        bail!("discovery does not name a live loopback daemon")
+    }
+    if credential.is_empty() || credential.contains(['\r', '\n']) {
+        bail!("invalid credential file")
+    }
+    if body.len() > 256 * 1024 {
+        bail!("request exceeds 256 KiB")
+    }
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     write!(stream,"POST /v2/tools HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAuthorization: Bearer {credential}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?;
-    stream.write_all(&body)?;
+    stream.write_all(body)?;
     let mut response = Vec::new();
     stream
         .take(4 * 1024 * 1024 + 1)
@@ -49,9 +73,5 @@ pub(crate) fn run(a: crate::cli::ToolArgs) -> Result<()> {
         .parse::<u16>()?;
     let value: serde_json::Value = serde_json::from_slice(&response[split + 4..])
         .context("invalid JSON response; inspect outcome before retry")?;
-    println!("{}", serde_json::to_string(&value)?);
-    if !(200..300).contains(&status) {
-        bail!("runtime tool returned HTTP {status}")
-    }
-    Ok(())
+    Ok((status, value))
 }

@@ -1,9 +1,129 @@
 """Public CLI -> real HTTP integration; never imports a product internal module."""
-import json, os, pathlib, socket, subprocess, tempfile, time, unittest, urllib.request, urllib.error
+import hashlib, json, os, pathlib, socket, subprocess, sys, tempfile, threading, time, unittest, urllib.request, urllib.error
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 BIN=pathlib.Path(os.environ.get('LINKSTART_BIN',str(ROOT/'target/debug/linkstart.exe')))
 
 class RuntimeHttp(unittest.TestCase):
+    def cli_control(self, action):
+        args=[str(BIN),'daemon',action,'--json','--state-dir',self.state_dir]
+        if action!='stop':args+=['--port',str(self.port)]
+        return subprocess.run(args,capture_output=True,text=True,timeout=12)
+
+    def cli_cleanup(self):
+        # Only this test's fresh state directory is addressed.
+        self.cli_control('stop')
+
+    def recorded_terminal(self, name, script):
+        owner=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()
+        status,space=self.post(dict(request_id=name+'-space',tool='spaces.create',args={'name':name}),owner)
+        self.assertEqual(status,200,space)
+        sid=space['space']['id']
+        status,created=self.post(dict(request_id=name+'-terminal',tool='terminal.create',space_id=sid,args={'command':sys.executable,'args':['-u','-c',script]}),owner)
+        self.assertEqual(status,200,created)
+        return owner,sid,created
+
+    def test_cli_stop_and_restart_drain_active_terminal_and_persist_final_tail(self):
+        print(json.dumps({'evidence':'cli-binary','path':str(BIN.resolve()),'sha256':hashlib.sha256(BIN.read_bytes()).hexdigest()}),flush=True)
+        for action in ['restart','stop']:
+            with self.subTest(action=action):
+                self.addCleanup(self.cli_cleanup)
+                release=pathlib.Path(self.tmp.name)/('release-'+action)
+                tail_time=pathlib.Path(self.tmp.name)/('tail-time-'+action)
+                marker='CLI_FINAL_TAIL_'+action
+                script="import pathlib,time\np=pathlib.Path("+repr(str(release))+")\nprint('CLI_ACTIVE_READY',flush=True)\ntry:\n while not p.exists():time.sleep(.01)\nexcept KeyboardInterrupt:pass\nprint("+repr(marker)+",flush=True)\npathlib.Path("+repr(str(tail_time))+").write_text(str(time.time_ns()))\n"
+                token,sid,created=self.recorded_terminal('cli-'+action,script)
+                eid=created['endpoint']['id']; session=created['session']['id']
+                def call(tool,args):return self.post(dict(request_id=str(time.time_ns()),tool=tool,space_id=sid,args=args),token)
+                for _ in range(80):
+                    status,view=call('terminal.observe',{'endpoint_id':eid,'cursor':0})
+                    if status==200 and 'CLI_ACTIVE_READY' in view['text']:break
+                    time.sleep(.05)
+                self.assertIn('CLI_ACTIVE_READY',view['text'])
+                self.assertEqual(view['status'],'live')
+                before=json.loads((pathlib.Path(self.state_dir)/'daemon.json').read_text())
+                timer=threading.Timer(.15,release.touch);timer.start()
+                cli_started=time.time_ns()
+                result=self.cli_control(action)
+                cli_returned=time.time_ns()
+                timer.join()
+                self.assertEqual(result.returncode,0,result.stderr+' '+result.stdout)
+                control=json.loads(result.stdout)
+                if self.child.pid==before['pid']:self.child.wait(timeout=5)
+                self.assertFalse(self.pid_alive(before['pid']))
+                self.assertFalse(self.pid_alive(created['session']['process_id']))
+                root=pathlib.Path(self.state_dir)/'connections'/eid/'sessions'/session
+                saved=json.loads((root/'checkpoint.json').read_text())
+                self.assertEqual(saved['status'],'exited',saved)
+                events=[json.loads(line) for line in (root/'events.jsonl').read_text().splitlines()]
+                raw=bytes(b for event in events for b in event.get('bytes',[]))
+                self.assertIn(marker.encode(),raw)
+                self.assertGreater(saved['durable_cursor'],0)
+                print(json.dumps({'evidence':'cli-drain','action':action,'old_daemon_pid':before['pid'],'terminal_pid':created['session']['process_id'],'cli_started_ns':cli_started,'tail_flushed_ns':int(tail_time.read_text()),'cli_returned_ns':cli_returned,'exit_observed_ns':time.time_ns(),'prepare_received_ns':'UNKNOWN: no runtime instrumentation','tail_persisted_after_daemon_exit':True,'durable_cursor':saved['durable_cursor'],'checkpoint_status':saved['status']}),flush=True)
+                self.assertEqual((pathlib.Path(self.state_dir)/'v2-owner.token').read_text(),token)
+                if action=='restart':
+                    self.assertEqual(control['state'],'started',control)
+                    self.assertEqual(control['stoppedBeforeRestart'],True)
+                    self.assertNotEqual(before['pid'],control['pid'])
+                    self.assertTrue(self.pid_alive(control['pid']))
+                    status,page=call('history.read',{'endpoint_id':eid,'session_id':session})
+                    self.assertEqual(status,200,page)
+                    self.assertIn(marker.encode(),bytes(b for event in page['events'] for b in event['bytes']))
+                else:
+                    self.assertEqual(control,{'stopped':True})
+                    self.assertFalse((pathlib.Path(self.state_dir)/'daemon.json').exists())
+
+    @staticmethod
+    def pid_alive(pid):
+        if os.name=='nt':
+            import ctypes
+            kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+            kernel.OpenProcess.restype=ctypes.c_void_p
+            kernel.GetExitCodeProcess.argtypes=[ctypes.c_void_p,ctypes.POINTER(ctypes.c_ulong)]
+            kernel.CloseHandle.argtypes=[ctypes.c_void_p]
+            handle=kernel.OpenProcess(0x1000,False,pid)
+            if not handle:return False
+            code=ctypes.c_ulong()
+            ok=kernel.GetExitCodeProcess(handle,ctypes.byref(code));kernel.CloseHandle(handle)
+            return bool(ok) and code.value==259
+        try:os.kill(pid,0);return True
+        except ProcessLookupError:return False
+
+    def test_cli_pending_history_barrier_keeps_old_recorded_daemon_without_replacement(self):
+        print(json.dumps({'evidence':'cli-binary','path':str(BIN.resolve()),'sha256':hashlib.sha256(BIN.read_bytes()).hexdigest()}),flush=True)
+        self.addCleanup(self.cli_cleanup)
+        token,sid,created=self.recorded_terminal('cli-pending',"print('CLI_PENDING_TAIL',flush=True)")
+        eid=created['endpoint']['id'];session=created['session']['id']
+        root=pathlib.Path(self.state_dir)/'connections'/eid/'sessions'/session
+        checkpoint=root/'checkpoint.json'
+        for _ in range(80):
+            self.post(dict(request_id=str(time.time_ns()),tool='terminal.observe',space_id=sid,args={'endpoint_id':eid,'cursor':0}),token)
+            status,page=self.post(dict(request_id=str(time.time_ns()),tool='history.read',space_id=sid,args={'endpoint_id':eid,'session_id':session}),token)
+            if status==200 and page['checkpoint']['status']=='exited' and checkpoint.exists():break
+            time.sleep(.05)
+        self.assertEqual(status,200,page)
+        self.assertEqual(page['checkpoint']['status'],'exited',page)
+        record=(pathlib.Path(self.state_dir)/'daemon.json').read_bytes()
+        old=json.loads(record)['pid']
+        checkpoint.unlink();checkpoint.mkdir()
+        try:
+            for action in ['stop','restart']:
+                result=self.cli_control(action)
+                self.assertNotEqual(result.returncode,0,result.stdout)
+                self.assertEqual(json.loads(result.stdout)['state'],'failed')
+                self.assertTrue(self.pid_alive(old),'pending cleanup must preserve the old daemon')
+                self.assertEqual((pathlib.Path(self.state_dir)/'daemon.json').read_bytes(),record)
+                self.assertEqual((pathlib.Path(self.state_dir)/'v2-owner.token').read_text(),token)
+                print(json.dumps({'evidence':'cli-pending','action':action,'recorded_pid':old,'recorded_pid_alive':True,'discovery_unchanged':True,'exit_code':result.returncode,'result':json.loads(result.stdout)}),flush=True)
+        finally:
+            # Restore only this test-owned checkpoint fault, even after RED.
+            if checkpoint.is_dir():checkpoint.rmdir()
+        result=self.cli_control('stop')
+        self.assertEqual(result.returncode,0,result.stdout+' '+result.stderr)
+        self.assertEqual(json.loads(result.stdout),{'stopped':True})
+        self.child.wait(timeout=5)
+        self.assertFalse(self.pid_alive(old))
+        self.assertEqual(json.loads(checkpoint.read_text())['status'],'exited')
+
     def test_operation_receipt_http_and_cli_share_current_identity_scope(self):
         owner=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()
         status,space=self.post(dict(request_id='receipt-space',tool='spaces.create',args={'name':'receipts','manager_name':'other'}),owner)
@@ -240,6 +360,30 @@ class RuntimeHttp(unittest.TestCase):
         self.assertEqual(result['status'],'stopping',result)
         self.child.wait(timeout=5)
         self.assertEqual(self.child.returncode,0)
+
+    def test_cli_stop_waits_for_bounded_v1_sse_transport_drain(self):
+        def v1(path,body,token=None):
+            headers={'Content-Type':'application/json'}
+            if token:headers['Authorization']='Bearer '+token
+            req=urllib.request.Request(self.base+path,data=json.dumps(body).encode(),headers=headers)
+            with urllib.request.urlopen(req,timeout=5) as response:return json.load(response)
+        connection=v1('/v1/connections',{'protocolMajor':'v1','callsign':'cli-drain'})
+        app=v1('/v1/apps',{'protocolMajor':'v1','connectionId':connection['connectionId'],'manifest':{'appId':'cli-drain','displayName':'cli-drain','originPolicy':{'exactOrigin':self.base}}},connection['capability'])
+        req=urllib.request.Request(self.base+'/v1/apps/'+app['instanceId']+'/stream',headers={'Authorization':'Bearer '+app['capability'],'Origin':self.base})
+        stream=urllib.request.urlopen(req,timeout=5)
+        self.addCleanup(stream.close)
+        started=time.time_ns()
+        result=self.cli_control('stop')
+        state_file=pathlib.Path('/proc')/str(self.child.pid)/'status'
+        state=next((line for line in state_file.read_text().splitlines() if line.startswith('State:')),'UNKNOWN') if sys.platform=='linux' and state_file.exists() else 'not Linux /proc'
+        print(json.dumps({'evidence':'cli-sse-drain','binary_sha256':hashlib.sha256(BIN.read_bytes()).hexdigest(),'started_ns':started,'returned_ns':time.time_ns(),'exit_code':result.returncode,'daemon_native_state_before_parent_wait':state,'result':json.loads(result.stdout)}),flush=True)
+        self.assertEqual(result.returncode,0,result.stderr+' '+result.stdout)
+        self.assertEqual(json.loads(result.stdout),{'stopped':True})
+        if sys.platform=='linux':
+            self.assertIn('Z (zombie)',state,'fixture parent must not reap before the CLI exit witness')
+        self.child.wait(timeout=5)
+        self.assertEqual(self.child.returncode,0)
+        self.assertFalse((pathlib.Path(self.state_dir)/'daemon.json').exists())
 
     def test_restart_refuses_live_stale_session_and_old_lease(self):
         token=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()

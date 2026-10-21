@@ -105,7 +105,6 @@ mod win_process {
     extern "system" {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
         fn GetExitCodeProcess(handle: isize, code: *mut u32) -> i32;
-        fn TerminateProcess(handle: isize, code: u32) -> i32;
         fn CloseHandle(handle: isize) -> i32;
     }
     use std::os::windows::{
@@ -241,7 +240,6 @@ mod win_process {
         }
     }
     const QUERY: u32 = 0x1000;
-    const TERMINATE: u32 = 0x0001;
     const STILL_ACTIVE: u32 = 259;
     pub fn alive(pid: u32) -> bool {
         unsafe {
@@ -255,22 +253,29 @@ mod win_process {
             ok && code == STILL_ACTIVE
         }
     }
-    pub fn terminate(pid: u32) -> bool {
-        unsafe {
-            let handle = OpenProcess(TERMINATE, 0, pid);
-            if handle == 0 {
-                return false;
-            }
-            let ok = TerminateProcess(handle, 0) != 0;
-            CloseHandle(handle);
-            ok
-        }
-    }
 }
 pub(crate) fn process_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // kill -0 also succeeds for a zombie awaiting its parent's wait(). Its
+        // process has exited and cannot own a listener or perform more cleanup.
+        if fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix("State:")
+                        .and_then(|state| state.split_whitespace().next())
+                        .map(str::to_owned)
+                })
+            })
+            .is_some_and(|state| state == "Z" || state == "X")
+        {
+            return false;
+        }
+    }
     #[cfg(unix)]
     {
-        // kill -0 在 Linux 和 macOS 都正確；/proc 只有 Linux 有。
+        // /proc is Linux-only; other Unix platforms retain their native query.
         std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
             .status()
@@ -296,30 +301,50 @@ pub(crate) fn stop_daemon(state_dir: &FsPath) -> Result<bool> {
     if record.protocol_major != PROTOCOL {
         bail!("protocol_mismatch: explicit compatible runtime required")
     }
+    let address: std::net::SocketAddr = record
+        .address
+        .parse()
+        .context("invalid daemon discovery address")?;
+    if !address.ip().is_loopback() {
+        bail!("discovery does not name a live loopback daemon")
+    }
     if process_alive(record.pid) {
-        #[cfg(unix)]
-        {
-            let status = std::process::Command::new("kill")
-                .args(["-TERM", &record.pid.to_string()])
-                .status()?;
-            if !status.success() {
-                bail!("failed to stop recorded daemon")
+        // Read the existing owner token only. Initializing Engine here could
+        // rotate authority while trying to stop a different live instance.
+        let credential = fs::read_to_string(linkstart::runtime_core::owner_token_path(state_dir))
+            .context("cannot read existing runtime owner credential")?;
+        let call = |tool: &str, args: Value| -> Result<Value> {
+            let body = serde_json::to_vec(
+                &json!({"request_id":uuid::Uuid::new_v4().to_string(),"tool":tool,"args":args}),
+            )?;
+            let (status, value) = crate::tool_client::post(address, credential.trim(), &body)
+                .context("runtime shutdown transport failed; effects may already exist; inspect before retry")?;
+            if !(200..300).contains(&status) {
+                bail!("runtime shutdown returned HTTP {status}; daemon was not replaced; inspect before retry")
             }
-        }
-        #[cfg(windows)]
-        {
-            if !win_process::terminate(record.pid) && process_alive(record.pid) {
-                bail!("failed to stop recorded daemon")
-            }
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            bail!("daemon stop requires the platform current-user process adapter")
+            Ok(value)
+        };
+        let prepared = call("runtime.prepare_shutdown", json!({}))?;
+        let ticket = prepared["ticket"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .context("runtime shutdown returned no ticket; inspect before retry")?;
+        let confirmed = call("runtime.confirm_shutdown", json!({"ticket":ticket}))?;
+        if confirmed["status"] != "stopping" || confirmed["history"] != "durable" {
+            bail!("runtime shutdown pending or unconfirmed; effects may already exist; daemon was not replaced; inspect before retry")
         }
     }
-    for _ in 0..100 {
-        if !process_alive(record.pid) && TcpStream::connect(&record.address).is_err() {
-            let _ = fs::remove_file(record_path);
+    // The runtime schedules its stop signal after 150 ms and bounds remaining
+    // SSE transport drain at two seconds. Leave room for both before witnessing
+    // process/listener exit; this does not extend or bypass owned cleanup.
+    for _ in 0..250 {
+        if !process_alive(record.pid)
+            && TcpStream::connect_timeout(&address, std::time::Duration::from_millis(100)).is_err()
+        {
+            // A concurrent start may have published a different discovery record.
+            if fs::read(&record_path).ok().as_deref() == Some(bytes.as_slice()) {
+                let _ = fs::remove_file(&record_path);
+            }
             return Ok(true);
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
