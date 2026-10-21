@@ -124,8 +124,16 @@ pub struct OperationSnapshot {
     pub error: Option<String>,
     pub provider_turn_id: Option<String>,
     pub provider_outcome: Option<ProviderTurnOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+}
+#[derive(PartialEq, Eq)]
+enum OperationKind {
+    Turn,
+    Interrupt,
 }
 struct Operation {
+    kind: OperationKind,
     snapshot: OperationSnapshot,
     fingerprint: String,
 }
@@ -168,7 +176,7 @@ enum Command {
     Read(SyncSender<Result<Value, HostError>>),
     Reconcile(String, SyncSender<Result<ReconciledOperation, HostError>>),
     Interrupt(SyncSender<Result<Value, HostError>>),
-    InterruptExact(String, SyncSender<Result<Value, HostError>>),
+    InterruptExact(String, String, SyncSender<Result<Value, HostError>>),
 }
 // Deliberately no Debug/Serialize: the original caller credential is ephemeral
 // queue authority, never worker identity and never part of a public receipt.
@@ -222,7 +230,20 @@ impl Command {
                         Some("current command authority denied before dispatch".into());
                 }
             }
-            Self::Read(reply) | Self::Interrupt(reply) | Self::InterruptExact(_, reply) => {
+            Self::Read(reply) | Self::Interrupt(reply) => {
+                let _ = reply.send(Err(denied()));
+            }
+            Self::InterruptExact(id, _, reply) => {
+                if let Some(op) = session
+                    .operations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&id)
+                {
+                    op.snapshot.phase = OperationPhase::Rejected;
+                    op.snapshot.error =
+                        Some("current command authority denied before dispatch".into());
+                }
                 let _ = reply.send(Err(denied()));
             }
             Self::Reconcile(_, reply) => {
@@ -279,6 +300,7 @@ pub struct OwnedSessionSupervisor {
     registry: OwnedCodexRegistry,
     options: SupervisorOptions,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    draining: AtomicBool,
 }
 
 fn authorize(
@@ -333,6 +355,23 @@ fn with_authority<T>(
         )
         .map_err(|_| SupervisorError::Denied)
 }
+/// Delivery revocation does not undo an admitted mutation. The existing Unknown
+/// error preserves this distinction without adding a public error-enum variant.
+fn mutation_delivery<T>(
+    result: Result<T, SupervisorError>,
+    delivery: Result<(), SupervisorError>,
+    admitted: bool,
+    operation_id: String,
+) -> Result<T, SupervisorError> {
+    if delivery.is_err() {
+        return Err(if admitted {
+            SupervisorError::Host(HostError::Unknown { operation_id })
+        } else {
+            SupervisorError::Denied
+        });
+    }
+    result
+}
 impl OwnedSessionSupervisor {
     pub fn new(
         engine: Engine,
@@ -353,6 +392,7 @@ impl OwnedSessionSupervisor {
             registry,
             options,
             sessions: Mutex::new(HashMap::new()),
+            draining: AtomicBool::new(false),
         })
     }
     pub fn start(
@@ -361,6 +401,39 @@ impl OwnedSessionSupervisor {
         credential: String,
         facade: Arc<dyn RuntimeToolFacade>,
         admission: ThreadAdmission,
+    ) -> Result<Accepted, SupervisorError> {
+        self.start_internal(config, credential, facade, admission, None)
+    }
+    /// Trusted bridge admission. The sealed plan is resolved again on the worker,
+    /// immediately before spawn, with the original actor and current worker grant.
+    pub fn start_as(
+        &self,
+        actor: &str,
+        launch: crate::runtime_launch_policy::ApprovedLaunch,
+        session_id: String,
+        generation: u64,
+        admission: ThreadAdmission,
+    ) -> Result<Accepted, SupervisorError> {
+        if session_id.trim().is_empty() || generation == 0 {
+            return Err(SupervisorError::Invalid);
+        }
+        let fresh = launch.refresh(actor).map_err(|_| SupervisorError::Denied)?;
+        let (config, credential, facade) = fresh.into_parts(session_id, generation);
+        self.start_internal(
+            config,
+            credential,
+            facade,
+            admission,
+            Some((actor.to_string(), launch)),
+        )
+    }
+    fn start_internal(
+        &self,
+        config: OwnedHostConfig,
+        credential: String,
+        facade: Arc<dyn RuntimeToolFacade>,
+        admission: ThreadAdmission,
+        launch: Option<(String, crate::runtime_launch_policy::ApprovedLaunch)>,
     ) -> Result<Accepted, SupervisorError> {
         let scope = config.scope.clone();
         authorize(&self.engine, &credential, &scope, "send")?;
@@ -389,6 +462,9 @@ impl OwnedSessionSupervisor {
         });
         {
             let mut sessions = self.sessions.lock().map_err(|_| SupervisorError::Closed)?;
+            if self.draining.load(Ordering::Acquire) {
+                return Err(SupervisorError::Closed);
+            }
             if sessions.contains_key(&scope.session_id) {
                 return Err(SupervisorError::Conflict);
             }
@@ -402,6 +478,20 @@ impl OwnedSessionSupervisor {
             .name("runtime-owned-session".into())
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if owned.stop.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let (config, credential, facade) = if let Some((actor, launch)) = launch {
+                        let fresh = launch.refresh(&actor).map_err(|_| {
+                            HostError::Denied("current launch authority denied".into())
+                        })?;
+                        fresh.into_parts(
+                            config.scope.session_id.clone(),
+                            config.scope.binding_generation,
+                        )
+                    } else {
+                        (config, credential, facade)
+                    };
                     run_worker(
                         engine, registry, config, credential, facade, admission, rx, &owned,
                         options,
@@ -488,10 +578,16 @@ impl OwnedSessionSupervisor {
         operation_id: String,
         text: String,
     ) -> Result<Accepted, SupervisorError> {
-        let result = self.start_turn_authorized(actor, scope, operation_id, text, false);
-        with_authority(&self.engine, actor, scope, "send", false, || ())?;
-        result
+        let result = self.start_turn_authorized(actor, scope, operation_id.clone(), text, false);
+        let admitted = result.is_ok();
+        mutation_delivery(
+            result,
+            with_authority(&self.engine, actor, scope, "send", false, || ()),
+            admitted,
+            operation_id,
+        )
     }
+
     pub fn operation(
         &self,
         credential: &str,
@@ -571,9 +667,22 @@ impl OwnedSessionSupervisor {
         wait: Duration,
     ) -> Result<SessionStatus, SupervisorError> {
         let result = self.stop_authorized(actor, scope, wait, false);
-        with_authority(&self.engine, actor, scope, "manage", false, || ())?;
-        result
+        let admitted = !matches!(
+            &result,
+            Err(SupervisorError::Denied
+                | SupervisorError::Invalid
+                | SupervisorError::Closed
+                | SupervisorError::Conflict
+                | SupervisorError::QueueFull)
+        );
+        mutation_delivery(
+            result,
+            with_authority(&self.engine, actor, scope, "manage", false, || ()),
+            admitted,
+            format!("stop:{}", scope.session_id),
+        )
     }
+
     pub fn list_as(
         &self,
         actor: &str,
@@ -602,20 +711,97 @@ impl OwnedSessionSupervisor {
         expected_turn: String,
         wait: Duration,
     ) -> Result<Value, SupervisorError> {
-        if expected_turn.trim().is_empty() {
-            return Err(SupervisorError::Invalid);
-        }
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.enqueue_authorized(
+        self.interrupt_turn_with_operation_as(
             actor,
             scope,
-            Command::InterruptExact(expected_turn, tx),
-            false,
-        )?;
-        let result = bounded(rx, wait);
-        with_authority(&self.engine, actor, scope, "control", false, || ())?;
-        result
+            uuid::Uuid::new_v4().to_string(),
+            expected_turn,
+            wait,
+        )
     }
+    /// Exact interrupt receipt survives the bounded reply receiver. Reusing this
+    /// operation ID observes the original command and never sends it again.
+    pub fn interrupt_turn_with_operation_as(
+        &self,
+        actor: &str,
+        scope: &HostScope,
+        operation_id: String,
+        expected_turn: String,
+        wait: Duration,
+    ) -> Result<Value, SupervisorError> {
+        if operation_id.trim().is_empty() || expected_turn.trim().is_empty() {
+            return Err(SupervisorError::Invalid);
+        }
+        let session = self.session_authorized(actor, scope, "control", false)?;
+        let (tx, rx) = mpsc::sync_channel(1);
+        let fingerprint = format!("interrupt:{expected_turn}");
+        let existing = with_authority(&self.engine, actor, scope, "control", false, || {
+            let mut operations = session
+                .operations
+                .lock()
+                .map_err(|_| SupervisorError::Closed)?;
+            if let Some(op) = operations.get(&operation_id) {
+                if op.kind != OperationKind::Interrupt || op.fingerprint != fingerprint {
+                    return Err(SupervisorError::Conflict);
+                }
+                return Ok(Some(op.snapshot.clone()));
+            }
+            if session.stop.load(Ordering::Acquire) {
+                return Err(SupervisorError::Closed);
+            }
+            if operations.len() >= 1024 {
+                return Err(SupervisorError::QueueFull);
+            }
+            operations.insert(
+                operation_id.clone(),
+                Operation {
+                    kind: OperationKind::Interrupt,
+                    fingerprint,
+                    snapshot: OperationSnapshot {
+                        operation_id: operation_id.clone(),
+                        phase: OperationPhase::Queued,
+                        error: None,
+                        provider_turn_id: None,
+                        provider_outcome: None,
+                        result: None,
+                    },
+                },
+            );
+            if let Err(e) = session.tx.try_send(QueuedCommand {
+                authority: CommandAuthority {
+                    credential: actor.into(),
+                    exact_member: false,
+                },
+                command: Command::InterruptExact(operation_id.clone(), expected_turn, tx),
+            }) {
+                operations.remove(&operation_id);
+                return Err(match e {
+                    TrySendError::Full(_) => SupervisorError::QueueFull,
+                    TrySendError::Disconnected(_) => SupervisorError::Closed,
+                });
+            }
+            Ok(None)
+        })??;
+        let result = if let Some(snapshot) = existing {
+            match snapshot.phase {
+                OperationPhase::Confirmed => snapshot.result.ok_or(SupervisorError::Pending),
+                OperationPhase::Rejected => Err(SupervisorError::Denied),
+                OperationPhase::Unknown => Err(SupervisorError::Host(HostError::Unknown {
+                    operation_id: operation_id.clone(),
+                })),
+                _ => Err(SupervisorError::Pending),
+            }
+        } else {
+            bounded(rx, wait)
+        };
+        mutation_delivery(
+            result,
+            with_authority(&self.engine, actor, scope, "control", false, || ()),
+            true,
+            operation_id,
+        )
+    }
+
     fn session_authorized(
         &self,
         credential: &str,
@@ -742,18 +928,32 @@ impl OwnedSessionSupervisor {
                         return Err(SupervisorError::Conflict);
                     }
                 } else {
+                    if session.stop.load(Ordering::Acquire) {
+                        return Err(SupervisorError::Closed);
+                    }
+                    if session
+                        .status
+                        .lock()
+                        .map_err(|_| SupervisorError::Closed)?
+                        .phase
+                        != SessionPhase::Running
+                    {
+                        return Err(SupervisorError::Conflict);
+                    }
                     if operations.len() >= 1024 {
                         return Err(SupervisorError::QueueFull);
                     }
                     operations.insert(
                         operation_id.clone(),
                         Operation {
+                            kind: OperationKind::Turn,
                             snapshot: OperationSnapshot {
                                 operation_id: operation_id.clone(),
                                 phase: OperationPhase::Queued,
                                 error: None,
                                 provider_turn_id: None,
                                 provider_outcome: None,
+                                result: None,
                             },
                             fingerprint,
                         },
@@ -869,15 +1069,19 @@ impl OwnedSessionSupervisor {
         let (tx, rx) = mpsc::sync_channel(1);
         self.enqueue_authorized(credential, scope, Command::Interrupt(tx), exact_member)?;
         let result = bounded(rx, wait);
-        with_authority(
-            &self.engine,
-            credential,
-            scope,
-            "control",
-            exact_member,
-            || (),
-        )?;
-        result
+        mutation_delivery(
+            result,
+            with_authority(
+                &self.engine,
+                credential,
+                scope,
+                "control",
+                exact_member,
+                || (),
+            ),
+            true,
+            format!("interrupt:{}", scope.session_id),
+        )
     }
     fn stop_authorized(
         &self,
@@ -945,13 +1149,13 @@ impl OwnedSessionSupervisor {
             .count()
     }
     pub fn request_shutdown(&self) {
-        let sessions: Vec<_> = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .cloned()
-            .collect();
+        let sessions: Vec<_> = {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            // The same map lock fences every legacy/actor start registration.
+            // No provider I/O is performed under this admission transaction.
+            self.draining.store(true, Ordering::Release);
+            sessions.values().cloned().collect()
+        };
         for s in sessions {
             s.stop.store(true, Ordering::Release);
             // Immediate local fence; Pending only means an existing callback
@@ -987,6 +1191,9 @@ fn run_worker(
     options: SupervisorOptions,
 ) -> Result<(), HostError> {
     let scope = config.scope.clone();
+    if session.stop.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let mut host = registry.spawn(config, &credential, facade)?;
     session
         .status
@@ -1081,7 +1288,7 @@ fn run_worker(
                     command.required_grant(),
                     authority.exact_member,
                     || {
-                        if let Command::Turn(id, _) = &command {
+                        if let Command::Turn(id, _) | Command::InterruptExact(id, _, _) = &command {
                             if let Some(op) = session
                                 .operations
                                 .lock()
@@ -1146,8 +1353,35 @@ fn run_worker(
                     Command::Interrupt(reply) => {
                         let _ = reply.send(host.interrupt());
                     }
-                    Command::InterruptExact(turn, reply) => {
-                        let _ = reply.send(host.interrupt_exact_turn(&turn));
+                    Command::InterruptExact(id, turn, reply) => {
+                        let result = host.interrupt_exact_turn(&turn);
+                        if let Some(op) = session
+                            .operations
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_mut(&id)
+                        {
+                            match &result {
+                                Ok(value) => {
+                                    op.snapshot.phase = OperationPhase::Confirmed;
+                                    op.snapshot.provider_turn_id = Some(turn);
+                                    op.snapshot.result = Some(value.clone());
+                                }
+                                Err(HostError::Denied(_)) => {
+                                    op.snapshot.phase = OperationPhase::Rejected;
+                                    op.snapshot.error = Some(
+                                        "exact active turn rejected before provider dispatch"
+                                            .into(),
+                                    );
+                                }
+                                Err(_) => {
+                                    op.snapshot.phase = OperationPhase::Unknown;
+                                    op.snapshot.error =
+                                        Some("interrupt outcome unknown; do not resend".into());
+                                }
+                            }
+                        }
+                        let _ = reply.send(result);
                     }
                 }
             }
@@ -1163,7 +1397,10 @@ fn run_worker(
                             .unwrap_or_else(|e| e.into_inner())
                             .values_mut()
                         {
-                            if turn.is_some() && op.snapshot.provider_turn_id.as_deref() == turn {
+                            if op.kind == OperationKind::Turn
+                                && turn.is_some()
+                                && op.snapshot.provider_turn_id.as_deref() == turn
+                            {
                                 if let Some(outcome) = v["params"]["turn"]["status"]
                                     .as_str()
                                     .and_then(ProviderTurnOutcome::from_status)

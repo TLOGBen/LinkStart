@@ -1,8 +1,10 @@
 mod cli;
 mod daemon;
+mod discovery;
 mod help;
 mod server;
 mod store;
+mod tool_client;
 mod util;
 
 use anyhow::{bail, Context, Result};
@@ -34,6 +36,7 @@ async fn main() -> Result<()> {
         command: None,
         json: false,
     })) {
+        Command::Tool(a) => tool_client::run(a)?,
         Command::Help(h) => {
             if h.json {
                 json_line(main_help_json())
