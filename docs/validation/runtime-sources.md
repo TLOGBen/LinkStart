@@ -84,3 +84,31 @@ top-level tests (47 library plus the unchanged 10 baseline integration tests).
 The final status-save error lead was inspected but is not part of these fixes;
 failure injection and its behavior remain unverified. Existing live-write/model/
 platform limits above remain in force. Independent gates must review the new head.
+
+## Follow-up: F3 terminal publication ownership
+
+The previous unverified final-save lead was subsequently reproduced by the independent
+public fault consumer at head 10234bb. New author regressions independently reproduce
+both SourceJobs and Watch: an authorized public factory synchronizes with an actual
+SQLite writer lock, then returns a controlled config error. No external process is
+needed. RED leaves no worker but advertises running/active with no error; both fail
+their public-status assertions. Product busy timeouts remain unchanged.
+
+GREEN retains an unpublished terminal record in each service's shared in-memory
+ownership before releasing accounting, exposing Unknown/PublicationPending and the
+original outcome instead of a fictitious worker. The tests cover lookup and same-ID
+replay while the writer lock remains held, lookup after rollback, current-auth
+rejection, source resume without checkpoint, source reopen/shutdown, and watch
+explicit stop with persisted stopped readback after reopen. Source replay never
+relaunches the controlled operation, and pending watch replay never rearms it.
+The original independent fault driver is rerun against the new frozen head without
+editing its source. Logs/manifests are retained in the implementation checkout under
+`.codex/implementation/source-publication-fix/`.
+
+This adds two regressions: 59 top-level tests (49 library, 10 unchanged baseline
+integration tests). Source writeback's existing Unknown/no-second-POST regression
+remains required; no live remote POST is attempted. In-memory details can be lost at
+process exit; durable recovery remains conservative Unknown, not inferred completion.
+Watch read-only polling may still fail with current permission/storage read errors;
+no autonomous retry broker or multi-daemon publication protocol was added. Fresh
+independent exact-head review/proof remain required.

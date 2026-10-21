@@ -50,6 +50,18 @@ append the same old revision again. Interrupted running/applying jobs reopen as
 `unknown` without relaunch. Resume needs a complete checkpoint; an incomplete fetch
 requires a new explicit read-only sync.
 
+If a terminal ledger write fails, the live service retains the result/checkpoint/
+receipt in a clone-shared in-memory record before releasing its worker count. Public
+status becomes `unknown` with `error` prefixed `PublicationPending`, including the
+unpublished outcome. Current authority and caller identity still apply to get and
+same-ID replay. Read-only lookup/replay does not write the ledger or rerun work.
+Explicit resume still requires a complete same-caller checkpoint; explicit write
+reconciliation remains GET-only. No terminal-publication failure permits another
+POST under the same request ID. There is no background publication retry loop.
+On reopen, the older durable running/applying record becomes Unknown as usual;
+the detailed in-memory result may be lost, so inspect durable checkpoint/receipt
+through explicit recovery rather than assuming success or automatically resending.
+
 Writeback commits an Unknown intent before POST. Keep the same stable request ID:
 confirmed replay returns its receipt, while uncertain outcomes refuse another POST.
 Reconciliation reads for an exact body/marker and validated target URL. Missing or
@@ -92,6 +104,15 @@ multi-daemon fencing and arbitrary subprocess descendant containment are not sup
 SourceJobs admission, cancellation and active-count observation share one fence:
 `cancel_all()` waits for prior admission to commit and count/spawn (or reject) before
 returning. No earlier uncounted admission can appear after shutdown observes drain.
+Worker count zero describes physical drain, including recording publication failure
+in memory; it does not prove terminal durability. Inspect `PublicationPending` before
+shutdown if the detailed outcome must be retained. Watch terminal-publication faults
+use the same Unknown/error contract for get/list/start replay and do not rearm the
+watch. Once storage recovers, explicit stop persists stopped and clears the pending
+view; use a new ID for a fresh watch. Alternatively reopen the controller and
+explicitly reauthenticate/rearm the recovered durable Unknown watch. Old source jobs
+remain Unknown and are never relaunched. These recovery actions require current
+permission, and get/list never perform publication retries.
 
 ## Executable public consumer
 

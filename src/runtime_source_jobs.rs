@@ -38,6 +38,7 @@ pub struct SourceJobs {
     cancel: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
     admission: Arc<Mutex<()>>,
+    unpublished: Arc<Mutex<std::collections::HashMap<String, Record>>>,
     gates: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -123,6 +124,7 @@ impl SourceJobs {
             cancel: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicUsize::new(0)),
             admission: Arc::new(Mutex::new(())),
+            unpublished: Arc::new(Mutex::new(std::collections::HashMap::new())),
             gates: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
@@ -148,6 +150,12 @@ impl SourceJobs {
         Ok(value)
     }
     fn save(&self, record: &Record) -> Result<(), ApiError> {
+        let mut unpublished = self.unpublished.lock().unwrap_or_else(|e| e.into_inner());
+        self.save_durable(record)?;
+        unpublished.remove(&record.snapshot.job_id);
+        Ok(())
+    }
+    fn save_durable(&self, record: &Record) -> Result<(), ApiError> {
         self.db
             .lock()
             .map_err(storage)?
@@ -161,7 +169,56 @@ impl SourceJobs {
             .map_err(storage)?;
         Ok(())
     }
+    fn unpublished(&self, id: &str) -> Option<Record> {
+        self.unpublished
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+    }
+    fn publish_terminal(&self, mut record: Record) {
+        // A later explicit recovery save cannot be overwritten by an older failure view.
+        let mut unpublished = self.unpublished.lock().unwrap_or_else(|e| e.into_inner());
+        if self.save_durable(&record).is_err() {
+            let outcome = format!(
+                "{}: {}",
+                record.snapshot.status,
+                record
+                    .snapshot
+                    .error
+                    .as_deref()
+                    .unwrap_or("operation returned successfully")
+            );
+            record.snapshot.status = "unknown".into();
+            record.snapshot.error = Some(format!("PublicationPending: worker exited but terminal status could not be persisted ({outcome}); durability is uncertain. Status/replay never relaunches work; reopen recovers durable Unknown."));
+            unpublished.insert(record.snapshot.job_id.clone(), record);
+        } else {
+            unpublished.remove(&record.snapshot.job_id);
+        }
+    }
+    fn replay(
+        &self,
+        identity: &str,
+        request: &ToolRequest,
+        previous: Record,
+    ) -> Result<SourceJobSnapshot, ApiError> {
+        if previous.identity_id != identity {
+            return Err(error("Denied", "source job belongs to another identity"));
+        }
+        if serde_json::to_value(&previous.request).map_err(storage)?
+            != serde_json::to_value(request).map_err(storage)?
+        {
+            return Err(error(
+                "RequestConflict",
+                "source job id already names different inputs",
+            ));
+        }
+        Ok(previous.snapshot)
+    }
     fn record(&self, id: &str) -> Result<Record, ApiError> {
+        if let Some(record) = self.unpublished(id) {
+            return Ok(record);
+        }
         let encoded: String = self
             .db
             .lock()
@@ -224,6 +281,9 @@ impl SourceJobs {
         let identity = admission["identity_id"]
             .as_str()
             .ok_or_else(|| error("Denied", "source caller identity required"))?;
+        if let Some(previous) = self.unpublished(&request.request_id) {
+            return self.replay(identity, request, previous);
+        }
         let source_snapshots = if request.tool == "sources.resume" {
             let original = self.record(
                 request.args["sync_job_id"]
@@ -298,19 +358,8 @@ impl SourceJobs {
                 .optional()
                 .map_err(storage)?;
             if let Some(previous) = previous {
-                let previous: Record = serde_json::from_str(&previous).map_err(storage)?;
-                if previous.identity_id != identity {
-                    return Err(error("Denied", "source job belongs to another identity"));
-                }
-                if serde_json::to_value(&previous.request).map_err(storage)?
-                    != serde_json::to_value(request).map_err(storage)?
-                {
-                    return Err(error(
-                        "RequestConflict",
-                        "source job id already names different inputs",
-                    ));
-                }
-                return Ok(previous.snapshot);
+                let previous = serde_json::from_str(&previous).map_err(storage)?;
+                return self.replay(identity, request, previous);
             }
             transaction
                 .execute(
@@ -356,13 +405,13 @@ impl SourceJobs {
                         worker.snapshot.error = Some(e.to_string());
                     }
                 }
-                let _ = jobs.save(&worker);
+                jobs.publish_terminal(worker);
             });
         if let Err(e) = spawned {
             let mut record = record;
             record.snapshot.status = "failed".into();
             record.snapshot.error = Some("source worker could not start".into());
-            self.save(&record)?;
+            self.publish_terminal(record);
             return Err(error("SourceWorker", e.to_string()));
         }
         Ok(record.snapshot)
@@ -839,6 +888,94 @@ mod tests {
     use crate::{runtime_core::owner_token_path, runtime_source::tests::Fixture};
     use serde_json::json;
     use std::time::{Duration, Instant};
+    #[test]
+    fn terminal_publication_failure_is_unknown_on_get_replay_resume_and_reopen() {
+        use std::sync::mpsc;
+        let (dir, engine, admin, sid, eid) = setup();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let path = dir.path().join("jobs");
+        let jobs = SourceJobs::open_with_config_factory(
+            &path,
+            engine.clone(),
+            Arc::new(move |_, _| {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                Err("controlled configuration failure".into())
+            }),
+        )
+        .unwrap();
+        let req = request(
+            "publication-fault",
+            "sources.sync",
+            Some(&sid),
+            json!({"endpoint_id":eid}),
+        );
+        jobs.start(&admin, &req).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let blocker = Connection::open(path.join("source-jobs.sqlite3")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while jobs.active_count() != 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let locked = jobs.get(&admin, &req.request_id).unwrap();
+        let replay_locked = jobs.start(&admin, &req);
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            locked.status, "unknown",
+            "physical worker exit must not leave a fictitious running job"
+        );
+        assert!(locked
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("PublicationPending"));
+        assert_eq!(
+            replay_locked.unwrap().status,
+            "unknown",
+            "pending replay is observable even while storage remains locked"
+        );
+        assert_eq!(jobs.get(&admin, &req.request_id).unwrap().status, "unknown");
+        assert_eq!(
+            jobs.start(&admin, &req).unwrap().status,
+            "unknown",
+            "same ID must never relaunch the operation"
+        );
+        assert!(entered_rx.try_recv().is_err());
+        assert!(jobs.get("invalid", &req.request_id).is_err());
+        assert_eq!(
+            jobs.start(
+                &admin,
+                &request(
+                    "resume-fault",
+                    "sources.resume",
+                    Some(&sid),
+                    json!({"endpoint_id":eid,"sync_job_id":req.request_id})
+                )
+            )
+            .unwrap_err()
+            .code,
+            "NoCheckpoint"
+        );
+        jobs.cancel_all();
+        assert_eq!(jobs.get(&admin, &req.request_id).unwrap().status, "unknown");
+        drop(jobs);
+        let reopened = SourceJobs::open(&path, engine).unwrap();
+        assert_eq!(
+            reopened.get(&admin, &req.request_id).unwrap().status,
+            "unknown"
+        );
+        assert_eq!(reopened.start(&admin, &req).unwrap().status, "unknown");
+        assert_eq!(reopened.active_count(), 0);
+    }
     #[test]
     fn title_only_revision_is_visible_without_replacing_original_or_human_work() {
         let fixture = Fixture::new();

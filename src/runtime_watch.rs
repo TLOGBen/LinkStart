@@ -44,6 +44,7 @@ pub struct WatchManager {
     cancelled: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
     interval_floor: u64,
+    unpublished: Arc<Mutex<HashMap<String, Record>>>,
 }
 impl WatchManager {
     /// Open once at daemon startup. Interrupted watches need explicit reauthentication/rearm.
@@ -84,9 +85,19 @@ impl WatchManager {
             cancelled: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicUsize::new(0)),
             interval_floor,
+            unpublished: Arc::new(Mutex::new(HashMap::new())),
         })
     }
     fn record(&self, id: &str) -> Result<Record, ApiError> {
+        if let Some(record) = self
+            .unpublished
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+        {
+            return Ok(record);
+        }
         let raw = self
             .db
             .lock()
@@ -100,6 +111,12 @@ impl WatchManager {
         serde_json::from_str(&raw).map_err(storage)
     }
     fn save(&self, r: &Record) -> Result<(), ApiError> {
+        let mut unpublished = self.unpublished.lock().unwrap_or_else(|e| e.into_inner());
+        self.save_durable(r)?;
+        unpublished.remove(&r.snapshot.watch_id);
+        Ok(())
+    }
+    fn save_durable(&self, r: &Record) -> Result<(), ApiError> {
         let db = self.db.lock().map_err(storage)?;
         let mut updated = r.clone();
         if updated.snapshot.status == "active" {
@@ -120,6 +137,21 @@ impl WatchManager {
         }
         db.execute("INSERT INTO source_watches(id,record) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET record=excluded.record", params![updated.snapshot.watch_id,serde_json::to_string(&updated).map_err(storage)?]).map_err(storage)?;
         Ok(())
+    }
+    fn publish_terminal(&self, mut record: Record) {
+        let mut unpublished = self.unpublished.lock().unwrap_or_else(|e| e.into_inner());
+        if self.save_durable(&record).is_err() {
+            let outcome = format!(
+                "{}: {}",
+                record.snapshot.status,
+                record.snapshot.error.as_deref().unwrap_or("watch stopped")
+            );
+            record.snapshot.status = "unknown".into();
+            record.snapshot.error = Some(format!("PublicationPending: watch worker exited but terminal status could not be persisted ({outcome}); stop after storage recovery or reopen and explicitly reauthenticate to recover; status/replay never rearms it."));
+            unpublished.insert(record.snapshot.watch_id.clone(), record);
+        } else {
+            unpublished.remove(&record.snapshot.watch_id);
+        }
     }
     fn authorize(
         &self,
@@ -214,7 +246,14 @@ impl WatchManager {
                     "watch id already names different configuration",
                 ));
             }
-            if workers.contains_key(&request.request_id) || r.snapshot.status != "unknown" {
+            if workers.contains_key(&request.request_id)
+                || r.snapshot.status != "unknown"
+                || self
+                    .unpublished
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&request.request_id)
+            {
                 return Ok(r.snapshot);
             }
             if let Some(id) = &r.snapshot.last_job_id {
@@ -290,8 +329,9 @@ impl WatchManager {
                         r.snapshot.error = Some(e.to_string());
                     }
                 }
-                if let Ok(mut workers) = manager.workers.lock() {
-                    let _ = manager.save(&r);
+                {
+                    let mut workers = manager.workers.lock().unwrap_or_else(|e| e.into_inner());
+                    manager.publish_terminal(r.clone());
                     workers.remove(&r.snapshot.watch_id);
                 }
                 manager.active.fetch_sub(1, Ordering::SeqCst);
@@ -301,7 +341,7 @@ impl WatchManager {
             self.active.fetch_sub(1, Ordering::SeqCst);
             record.snapshot.status = "failed".into();
             record.snapshot.error = Some("watch worker could not start".into());
-            self.save(&record)?;
+            self.publish_terminal(record);
             return Err(error("WatchWorker", "watch worker could not start"));
         }
         Ok(record.snapshot)
@@ -466,6 +506,80 @@ mod tests {
     use super::*;
     use crate::{runtime_core::owner_token_path, runtime_source::tests::Fixture};
     use std::time::{Duration, Instant};
+    #[test]
+    fn terminal_watch_publication_failure_is_visible_and_explicit_stop_recovers() {
+        use std::sync::mpsc;
+        let (dir, engine, admin, sid, eid) = setup();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let jobs = SourceJobs::open_with_config_factory(
+            dir.path(),
+            engine.clone(),
+            Arc::new(move |_, _| {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                Err("controlled source configuration failure".into())
+            }),
+        )
+        .unwrap();
+        let manager = WatchManager::open(dir.path(), engine.clone(), jobs.clone()).unwrap();
+        let req = tool(
+            "watch-publication-fault",
+            "sources.watch.start",
+            &sid,
+            json!({"endpoint_id":eid,"interval_seconds":30}),
+        );
+        manager.start(&admin, &req).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let blocker = Connection::open(dir.path().join("source-watches.sqlite3")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        release_tx.send(()).unwrap();
+        until(|| manager.active_count() == 0 && jobs.active_count() == 0);
+        let locked = manager.get(&admin, &req.request_id).unwrap();
+        let replay_locked = manager.start(&admin, &req);
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            locked.status, "unknown",
+            "absent watch worker must not remain active/stopping"
+        );
+        assert!(locked
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("PublicationPending"));
+        assert_eq!(
+            replay_locked.unwrap().status,
+            "unknown",
+            "pending watch replay must not rearm work"
+        );
+        assert_eq!(manager.list(&admin, &sid).unwrap()[0].status, "unknown");
+        assert!(manager.get("invalid", &req.request_id).is_err());
+        assert_eq!(
+            manager.stop(&admin, &req.request_id).unwrap().status,
+            "stopped"
+        );
+        assert_eq!(
+            manager.get(&admin, &req.request_id).unwrap().status,
+            "stopped"
+        );
+        manager.cancel_all();
+        jobs.cancel_all();
+        drop(manager);
+        let reopened = WatchManager::open(dir.path(), engine, jobs).unwrap();
+        assert_eq!(
+            reopened.get(&admin, &req.request_id).unwrap().status,
+            "stopped"
+        );
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "status/stop/reopen never dispatch another source operation"
+        );
+    }
 
     fn setup() -> (tempfile::TempDir, Engine, String, String, String) {
         let dir = tempfile::tempdir().unwrap();
