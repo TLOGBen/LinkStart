@@ -728,6 +728,12 @@ impl Fixture {
         Self::with_clock(None)
     }
     fn with_clock(clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>) -> Self {
+        Self::with_registry_setup(clock, || {})
+    }
+    fn with_registry_setup(
+        clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+        after_registry_open: impl FnOnce(),
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let engine = match clock {
             Some(clock) => Engine::open_with_clock(dir.path(), clock),
@@ -783,6 +789,11 @@ impl Fixture {
             "endpoints.grant",
             json!({"endpoint_id":endpoint["id"],"member_id":member["id"],"operations":["observe","send","control","manage"]}),
         );
+        // Registry storage/ACL initialization can take longer than the real
+        // five-second attachment lease on a busy Windows host. Establish the
+        // initial lease only after setup; leave the actual expiry tests real.
+        let registry = OwnedCodexRegistry::open(dir.path(), engine.clone()).unwrap();
+        after_registry_open();
         let hb = exec(&engine, &token, Some(sid), "members.heartbeat", json!({}));
         let scope = HostScope {
             identity_id: member["id"].as_str().unwrap().into(),
@@ -792,7 +803,6 @@ impl Fixture {
             session_id: "supervisor-owned".into(),
             binding_generation: 1,
         };
-        let registry = OwnedCodexRegistry::open(dir.path(), engine.clone()).unwrap();
         Self {
             dir,
             engine,
@@ -869,6 +879,27 @@ impl Fixture {
             json!({}),
         )
     }
+}
+
+#[test]
+fn fixture_initial_lease_starts_after_registry_setup() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let time = Arc::new(AtomicU64::new(1000));
+    let clock_time = time.clone();
+    let setup_time = time.clone();
+    let f = Fixture::with_registry_setup(
+        Some(Arc::new(move || clock_time.load(Ordering::SeqCst))),
+        move || setup_time.store(6001, Ordering::SeqCst),
+    );
+    let mut host = f
+        .registry
+        .spawn(
+            f.config(false),
+            &f.token,
+            Arc::new(EngineForumFacade::new(f.engine.clone(), f.token.clone())),
+        )
+        .expect("registry setup must not consume the fixture's initial attachment lease");
+    host.close().unwrap();
 }
 
 #[test]
