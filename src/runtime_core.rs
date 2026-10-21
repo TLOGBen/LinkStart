@@ -57,6 +57,8 @@ struct State {
     #[serde(default)]
     events: Vec<Value>,
     #[serde(default)]
+    credential_audit_events: Vec<Value>,
+    #[serde(default)]
     invites: Vec<Value>,
     #[serde(default)]
     endpoints: Vec<Value>,
@@ -152,6 +154,41 @@ fn initialize_owner_token(dir: &Path) -> anyhow::Result<String> {
 fn derive(secret: &str, kind: &str, key: &str) -> String {
     hash(&format!("linkstart-v2\0{secret}\0{kind}\0{key}"))
 }
+fn member_credential(secret: &str, key: &str, epoch: u64) -> String {
+    if epoch == 0 {
+        derive(secret, "member", key)
+    } else {
+        derive(secret, "member-generation", &format!("{key}\0{epoch}"))
+    }
+}
+fn credential_active(member: &Value, time: u64) -> bool {
+    member["credential_revoked"] != true
+        && member["credential_expires_at"]
+            .as_u64()
+            .is_none_or(|expiry| time < expiry)
+}
+// Both role and credential writers must preserve the same usable administrator set.
+fn preserve_active_administrator(
+    s: &State,
+    target: &Value,
+    next_roles: &Value,
+    disables_credential: bool,
+    time: u64,
+) -> Result<(), ApiError> {
+    if admin(&target["roles"])
+        && credential_active(target, time)
+        && (!admin(next_roles) || disables_credential)
+        && !s.members.iter().any(|m| {
+            m["space_id"] == target["space_id"]
+                && m["id"] != target["id"]
+                && admin(&m["roles"])
+                && credential_active(m, time)
+        })
+    {
+        return Err(err("Conflict", "cannot disable the final active human_admin or manager; hand off or use local owner recovery"));
+    }
+    Ok(())
+}
 fn text<'a>(v: &'a Value, k: &str) -> Result<&'a str, ApiError> {
     v.get(k)
         .and_then(Value::as_str)
@@ -184,6 +221,8 @@ fn validate_args(r: &ToolRequest) -> Result<(), ApiError> {
         "members.heartbeat" => &["attachment_id"],
         "members.register" => &["name"],
         "members.set_roles" => &["member_id", "roles"],
+        "members.rotate_credential" => &["member_id", "expected_epoch", "ttl_seconds"],
+        "members.revoke_credential" => &["member_id", "expected_epoch"],
         "topics.create" => &["title", "body", "kind", "parent_topic_id", "dependencies"],
         "topics.read" => &["topic_id", "cursor", "limit"],
         "task.act" => &[
@@ -239,6 +278,14 @@ fn posting(roles: &Value) -> bool {
 fn public_member(m: &Value) -> Value {
     let mut m = m.clone();
     m.as_object_mut().unwrap().remove("credential_hash");
+    // Legacy persisted members predate credential lifecycle metadata.
+    for (key, default) in [
+        ("credential_epoch", json!(0)),
+        ("credential_expires_at", Value::Null),
+        ("credential_revoked", json!(false)),
+    ] {
+        m.as_object_mut().unwrap().entry(key).or_insert(default);
+    }
     m
 }
 fn member_view(s: &State, member: &Value, time: u64) -> Value {
@@ -294,7 +341,12 @@ fn permission(owner: bool, member: Option<&Value>, r: &ToolRequest) -> Result<()
     let manage = admin(roles);
     let allowed = match r.tool.as_str() {
         "spaces.create" => false,
-        "members.invite" | "members.set_roles" | "settings.set" | "endpoints.grant" => manage,
+        "members.invite"
+        | "members.set_roles"
+        | "members.rotate_credential"
+        | "members.revoke_credential"
+        | "settings.set"
+        | "endpoints.grant" => manage,
         "topics.create" => manage || posting(roles),
         "task.act" => match r.args["action"].as_str().unwrap_or("") {
             "comment" => manage || posting(roles),
@@ -313,14 +365,37 @@ fn permission(owner: bool, member: Option<&Value>, r: &ToolRequest) -> Result<()
         Err(err("Denied", "current roles do not permit this operation"))
     }
 }
+fn credential_target<'a>(
+    s: &'a State,
+    owner: bool,
+    caller: Option<&Value>,
+    r: &ToolRequest,
+) -> Result<&'a Value, ApiError> {
+    let mid = text(&r.args, "member_id")?;
+    let target = s
+        .members
+        .iter()
+        .find(|m| m["id"] == mid && m["space_id"].as_str() == r.space_id.as_deref())
+        .ok_or_else(|| err("NotFound", "member not found in requested space"))?;
+    if target["kind"] == "human"
+        && !owner
+        && !caller.is_some_and(|m| m["kind"] == "human" && has(&m["roles"], "human_admin"))
+    {
+        return Err(err(
+            "Denied",
+            "human credentials require a verified human administrator or owner",
+        ));
+    }
+    Ok(target)
+}
 fn make_member(s: &mut State, secret: &str, space: &str, name: &str, roles: Value) -> Value {
     let key = id();
     let token = derive(secret, "member", &key);
-    let m = json!({"id":key,"space_id":space,"name":name,"kind":if has(&roles,"human_admin"){"human"}else{"agent"},"roles":roles,"credential_hash":hash(&token),"created_at":now()});
+    let m = json!({"id":key,"space_id":space,"name":name,"kind":if has(&roles,"human_admin"){"human"}else{"agent"},"roles":roles,"credential_hash":hash(&token),"credential_epoch":0,"credential_expires_at":null,"credential_revoked":false,"created_at":now()});
     s.members.push(m.clone());
     let mut public = m;
     public.as_object_mut().unwrap().remove("credential_hash");
-    public["credential"] = json!({"$credential":key});
+    public["credential"] = json!({"$credential":key,"epoch":0});
     public
 }
 // Only server-owned response slots may materialize secrets. Never traverse caller JSON.
@@ -332,7 +407,9 @@ fn hydrate(v: &mut Value, secret: &str) {
         .map(str::to_owned)
     {
         if v.get("id").and_then(Value::as_str) == Some(&key) && v.get("roles").is_some() {
-            v["credential"] = json!(derive(secret, "member", &key));
+            // Epoch belongs to this issued response, never to the member's latest state.
+            let epoch = v["credential"]["epoch"].as_u64().unwrap_or(0);
+            v["credential"] = json!(member_credential(secret, &key, epoch));
         }
     }
     if let Some(key) = v
@@ -513,7 +590,9 @@ impl Engine {
         let member = s
             .members
             .iter()
-            .find(|m| m["credential_hash"] == hash(credential))
+            .find(|m| {
+                m["credential_hash"] == hash(credential) && credential_active(m, (self.clock)())
+            })
             .cloned();
         let invitation = if request.tool == "members.register" {
             s.invites
@@ -540,6 +619,12 @@ impl Engine {
         }
         if invitation.is_none() {
             permission(owner, member.as_ref(), request)?;
+        }
+        if matches!(
+            request.tool.as_str(),
+            "members.rotate_credential" | "members.revoke_credential"
+        ) {
+            credential_target(&s, owner, member.as_ref(), request)?;
         }
         if let Some(role) = required_role {
             if !ROLES.contains(&role) || !member.as_ref().is_some_and(|m| has(&m["roles"], role)) {
@@ -1022,6 +1107,51 @@ fn dispatch(
             s.invites.push(json!({"id":key,"space_id":sid,"roles":r.args["roles"],"token_hash":hash(&token),"used":false,"created_at":now()}));
             Ok(json!({"invite_token":{"$invite":key},"space_id":sid,"roles":r.args["roles"]}))
         }
+        "members.rotate_credential" | "members.revoke_credential" => {
+            let target = credential_target(s, owner, member, r)?;
+            let epoch = target["credential_epoch"].as_u64().unwrap_or(0);
+            let expected = r.args["expected_epoch"].as_u64()
+                .ok_or_else(|| err("Invalid", "expected_epoch must be a nonnegative integer"))?;
+            if epoch != expected {
+                return Err(err("Conflict", "credential epoch changed"));
+            }
+            let next_epoch = epoch.checked_add(1).ok_or_else(|| err("Conflict", "credential epoch exhausted"))?;
+            let expires_at = match r.args.get("ttl_seconds") {
+                None => None,
+                Some(ttl) => {
+                    let seconds = ttl.as_u64().filter(|n| (1..=2_592_000).contains(n))
+                        .ok_or_else(|| err("Invalid", "ttl_seconds must be an integer in 1..2592000"))?;
+                    Some(runtime_now.checked_add(seconds * 1000)
+                        .ok_or_else(|| err("Invalid", "credential expiry exceeds clock range"))?)
+                }
+            };
+            let revoke = r.tool == "members.revoke_credential";
+            if !owner {
+                preserve_active_administrator(s, target, &target["roles"], revoke || expires_at.is_some(), runtime_now)?;
+            }
+            let mid = target["id"].clone();
+            let target = s.members.iter_mut().find(|m| m["id"] == mid).unwrap();
+            target["credential_epoch"] = json!(next_epoch);
+            target["credential_revoked"] = json!(revoke);
+            target["credential_expires_at"] = json!(expires_at);
+            // Persist only a verifier. Revoked generations never receive a bearer response.
+            target["credential_hash"] = if revoke { Value::Null } else {
+                json!(hash(&member_credential(secret, mid.as_str().unwrap(), next_epoch)))
+            };
+            let mut result = public_member(target);
+            if !revoke {
+                result["credential"] = json!({"$credential":mid,"epoch":next_epoch});
+            }
+            // Keep security administration separate from forum authorship/activity.
+            // The surrounding transaction persists this event and its receipt atomically.
+            let audit = json!({"id":id(),"space_id":sid,"actor":author,
+                "target_member_id":mid,"action":if revoke {"revoke_credential"} else {"rotate_credential"},
+                "epoch_before":epoch,"epoch_after":next_epoch,"request_id":r.request_id,
+                "created_at":runtime_now,"owner_recovery":owner});
+            s.credential_audit_events.push(audit.clone());
+            result["audit_event"] = audit;
+            Ok(result)
+        }
         "members.set_roles" => {
             roles_valid(&r.args["roles"])?;
             let mid = text(&r.args, "member_id")?;
@@ -1036,19 +1166,7 @@ fn dispatch(
                     "agent identity cannot become a human administrator",
                 ));
             }
-            if admin(&existing["roles"])
-                && !admin(&r.args["roles"])
-                && s.members
-                    .iter()
-                    .filter(|m| m["space_id"] == sid && admin(&m["roles"]))
-                    .count()
-                    == 1
-            {
-                return Err(err(
-                    "Conflict",
-                    "cannot remove the final human_admin or manager",
-                ));
-            }
+            preserve_active_administrator(s, existing, &r.args["roles"], false, runtime_now)?;
             let m = s
                 .members
                 .iter_mut()
