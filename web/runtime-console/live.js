@@ -172,13 +172,14 @@ function startConsole() {
   const historyReader=createHistoryReader(args=>scoped('history.read',args));
   const actionCommand = createActionCommand();
   const client = createClient({ credential: () => token });
+  const staleDecompositionResponse = new Error('畫面範圍已變更，忽略先前拆分回覆');
   let spacesRange=createPagedView(args=>client.call('spaces.list',null,args));
   function range(key,read){if(!ranges.has(key)){const owner=space?.id;ranges.set(key,createPagedView(args=>{if(space?.id!==owner)throw new Error('分頁所屬空間已變更');return read(args);}));}return ranges.get(key);}
   const leaseKeeper = createLeaseKeeper(value => scoped('terminal.renew', value));
   function node(tag, text, className) { const n = document.createElement(tag); if (text != null) n.textContent = text; if (className) n.className = className; return n; }
   function notice(message, error = false) { $('notice').textContent = message; $('notice').classList.toggle('error', error); }
   function clearDecomposition(){decompositionEpoch++;jobs.clear();$('decompositionJobId').value='';$('decompositionState').textContent='';$('recoveryPurpose').textContent='';$('decompositionChildren').replaceChildren();$('recoverDecomposition').hidden=true;}
-  function failure(error) { if(['Denied','Unauthenticated'].includes(error.code)){clearDecomposition();$('decompositionState').textContent='目前未獲授權，已清除先前拆分結果。';}notice(`${error.code || 'Error'}：${error.message}`, true); }
+  function failure(error) { if(error===staleDecompositionResponse)return;if(['Denied','Unauthenticated'].includes(error.code)){clearDecomposition();$('decompositionState').textContent='目前未獲授權，已清除先前拆分結果。';}notice(`${error.code || 'Error'}：${error.message}`, true); }
   async function run(action, button) {
     if (button) button.disabled = true;
     try { await action(); } catch (error) { failure(error); } finally { if (button) button.disabled = false; renderDecomposition(); renderSourceActions(); }
@@ -354,7 +355,12 @@ function startConsole() {
     renderDecomposition();
   }
   function jobKey(){return space&&topic?`${space.id}/${topic.id}`:null;}
-  function decompositionCall(name,args,id){const key=jobKey(),epoch=decompositionEpoch;return scoped(name,args,id).then(value=>{if(jobKey()!==key||decompositionEpoch!==epoch)throw new Error('母任務已變更，忽略先前拆分回覆');return value;});}
+  function decompositionCall(name,args,id){
+    const key=jobKey(),epoch=decompositionEpoch,credential=token;
+    const current=()=>jobKey()===key&&decompositionEpoch===epoch&&token===credential;
+    return scoped(name,args,id).then(value=>{if(!current())throw staleDecompositionResponse;return value;},
+      error=>{if(!current())throw staleDecompositionResponse;throw error;});
+  }
   function makeJob(){return createDecompositionJob(args=>decompositionCall('agent.run',args));}
   function renderDecomposition(){
     const allowed=canDecompose(identity)&&['plan','task'].includes(topic?.kind);
