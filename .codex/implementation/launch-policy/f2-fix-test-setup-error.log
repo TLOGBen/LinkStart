@@ -1,0 +1,182 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling windows-link v0.2.1
+   Compiling cfg-if v1.0.4
+   Compiling version_check v0.9.5
+   Compiling pin-project-lite v0.2.17
+   Compiling itoa v1.0.18
+   Compiling futures-core v0.3.34
+   Compiling bytes v1.12.1
+   Compiling once_cell v1.21.4
+   Compiling zerocopy v0.8.56
+   Compiling serde_core v1.0.229
+   Compiling libc v0.2.189
+   Compiling httparse v1.10.1
+   Compiling log v0.4.34
+   Compiling tower-service v0.3.3
+   Compiling find-msvc-tools v0.1.11
+   Compiling shlex v2.0.1
+   Compiling winapi v0.3.9
+   Compiling typenum v1.20.1
+   Compiling bitflags v2.13.1
+   Compiling smallvec v1.15.2
+   Compiling utf8parse v0.2.2
+   Compiling pkg-config v0.3.34
+   Compiling vcpkg v0.2.15
+   Compiling cfg_aliases v0.1.1
+   Compiling anstyle v1.0.14
+   Compiling zmij v1.0.23
+   Compiling rustversion v1.0.23
+   Compiling slab v0.4.12
+   Compiling once_cell_polyfill v1.70.2
+   Compiling windows-sys v0.61.2
+   Compiling thiserror v1.0.69
+   Compiling tower-layer v0.3.3
+   Compiling serde v1.0.229
+   Compiling futures-task v0.3.34
+   Compiling tracing-core v0.1.36
+   Compiling getrandom v0.4.3
+   Compiling nix v0.28.0
+   Compiling anstyle-parse v1.0.0
+   Compiling futures-channel v0.3.34
+   Compiling getrandom v0.2.17
+   Compiling serde_json v1.0.151
+   Compiling colorchoice v1.0.5
+   Compiling percent-encoding v2.3.2
+   Compiling atomic-waker v1.1.2
+   Compiling anyhow v1.0.104
+   Compiling generic-array v0.14.7
+   Compiling ahash v0.8.12
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling cc v1.4.4
+   Compiling httpdate v1.0.3
+   Compiling winreg v0.10.1
+   Compiling http v1.5.0
+   Compiling tracing v0.1.44
+   Compiling sync_wrapper v1.0.2
+   Compiling form_urlencoded v1.2.2
+   Compiling rand_core v0.6.4
+   Compiling futures-sink v0.3.34
+   Compiling heck v0.5.0
+   Compiling mime v0.3.17
+   Compiling lazy_static v1.5.1
+   Compiling strsim v0.11.1
+   Compiling clap_lex v1.1.0
+   Compiling ryu v1.0.23
+   Compiling memchr v2.8.3
+   Compiling fallible-iterator v0.3.0
+   Compiling matchit v0.7.3
+   Compiling bitflags v1.3.2
+   Compiling shell-words v1.1.1
+   Compiling http-body v1.1.0
+   Compiling cpufeatures v0.2.17
+   Compiling downcast-rs v1.2.1
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling fastrand v2.5.0
+   Compiling http-body-util v0.1.5
+   Compiling libsqlite3-sys v0.30.1
+   Compiling shared_library v0.1.9
+   Compiling syn v3.0.4
+   Compiling syn v2.0.119
+   Compiling tower-http v0.6.11
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling serde_path_to_error v0.1.20
+   Compiling uuid v1.26.0
+   Compiling thiserror-impl v1.0.69
+   Compiling socket2 v0.6.5
+   Compiling mio v1.2.2
+   Compiling anstyle-query v1.1.5
+   Compiling anstyle-wincon v3.0.11
+   Compiling serial2 v0.2.38
+   Compiling tempfile v3.27.0
+   Compiling anstream v1.0.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling hashbrown v0.14.5
+   Compiling tokio-macros v2.7.2
+   Compiling futures-macro v0.3.34
+   Compiling serde_derive v1.0.229
+   Compiling async-trait v0.1.92
+   Compiling clap_derive v4.6.4
+   Compiling filedescriptor v0.8.3
+   Compiling clap_builder v4.6.6
+   Compiling rand_chacha v0.3.1
+   Compiling portable-pty v0.9.0
+   Compiling rand v0.8.8
+   Compiling hashlink v0.9.1
+   Compiling tokio v1.53.1
+   Compiling futures-util v0.3.34
+   Compiling rusqlite v0.32.1
+   Compiling clap v4.6.6
+   Compiling axum-core v0.4.5
+   Compiling serde_urlencoded v0.7.1
+   Compiling hyper v1.11.0
+   Compiling tokio-util v0.7.19
+   Compiling tower v0.5.3
+   Compiling tokio-stream v0.1.19
+   Compiling hyper-util v0.1.20
+   Compiling axum v0.7.9
+   Compiling linkstart v0.1.6 (C:\Users\jimts\workspace\Gits\Vakarve\LinkStart-launch-policy)
+warning: fields `credential` and `facade` are never read
+   --> src\runtime_launch_policy.rs:171:5
+    |
+169 | pub struct ApprovedLaunch {
+    |            -------------- fields in this struct
+170 |     config: OwnedHostConfig,
+171 |     credential: String,
+    |     ^^^^^^^^^^
+172 |     facade: Arc<dyn RuntimeToolFacade>,
+    |     ^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: method `into_parts` is never used
+   --> src\runtime_launch_policy.rs:186:19
+    |
+176 | impl ApprovedLaunch {
+    | ------------------- method in this implementation
+...
+186 |     pub(crate) fn into_parts(
+    |                   ^^^^^^^^^^
+
+warning: field `stderr` is never read
+   --> src\runtime_source.rs:421:9
+    |
+418 | pub(crate) struct BoundedProcessOutput {
+    |                   -------------------- field in this struct
+...
+421 |     pub stderr: Vec<u8>,
+    |         ^^^^^^
+
+warning: `linkstart` (lib) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.91s
+     Running tests\runtime_launch_policy.rs (target\debug\deps\runtime_launch_policy-79ac62624f677211.exe)
+
+running 2 tests
+test provisioning_admission_precedes_worker_validation ... FAILED
+test installer_admission_precedes_private_slot_and_preflight_observation ... FAILED
+
+failures:
+
+---- provisioning_admission_precedes_worker_validation stdout ----
+
+thread 'provisioning_admission_precedes_worker_validation' panicked at tests\runtime_launch_policy.rs:380:10:
+called `Result::unwrap()` on an `Err` value: SqliteFailure(Error { code: Unknown, extended_code: 1 }, Some("no such table: unrelated_state"))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- installer_admission_precedes_private_slot_and_preflight_observation stdout ----
+
+thread 'installer_admission_precedes_private_slot_and_preflight_observation' panicked at tests\runtime_launch_policy.rs:380:10:
+called `Result::unwrap()` on an `Err` value: SqliteFailure(Error { code: Unknown, extended_code: 1 }, Some("no such table: unrelated_state"))
+
+
+failures:
+    installer_admission_precedes_private_slot_and_preflight_observation
+    provisioning_admission_precedes_worker_validation
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 19 filtered out; finished in 2.37s
+
+error: test failed, to rerun pass `--test runtime_launch_policy`
