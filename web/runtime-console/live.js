@@ -54,16 +54,27 @@ export function shutdownView(result) {
 
 export function createDecompositionJob(run, jobId = () => crypto.randomUUID()) {
   let state = null;
+  let attempt = null;
   return {
     current() { return state ? {...state} : null; },
     async inspect(get, knownId, expectedMission) {
       const previous=state || (knownId?{job_id:knownId,status:'unknown',topic_ids:[]}:null);
       if(!previous)throw new Error('尚無拆分 job');
-      const result=await get({job_id:previous.job_id});
       const mission=expectedMission||previous.mission_topic_id;
+      const result=await get({job_id:previous.job_id,mission_topic_id:mission});
       if(mission&&result.mission_topic_id!==mission)throw new Error('job 回覆屬於其他母任務');
       if(result.job_id!==previous.job_id)throw new Error('job 回覆 ID 不符');
-      state={...previous,...result};return {...state};
+      state={...previous,...result};if(attempt)attempt.inspected=true;return {...state};
+    },
+    async recover(recover) {
+      if(!state||state.recovery?.eligibility!=='eligible')throw new Error('此 job 目前不可恢復，請先查詢既有結果');
+      if(attempt?.unknown&&!attempt.inspected)throw new Error('恢復結果尚未確認，請先查詢既有 job');
+      const id=attempt?.unknown?attempt.id:jobId();
+      attempt={id,unknown:true,inspected:false};
+      try{const result=await recover({job_id:state.job_id,mission_topic_id:state.mission_topic_id},id);
+        if(result.job_id!==state.job_id||result.mission_topic_id!==state.mission_topic_id)throw new Error('恢復回覆範圍不符');
+        state={...state,...result};attempt.unknown=false;return {...state};
+      }catch(error){state={...state,status:'unknown',error:error.message};throw error;}
     },
     async start(missionId) {
       if (state) throw new Error('此母任務已有單次拆分 job，請查詢既有結果；不自動重跑');
@@ -153,7 +164,7 @@ function startConsole() {
   const $ = id => document.getElementById(id);
   const roles = ['human_admin','session_maintainer','manager','task_decomposer','implementer','reviewer','consultant','tester','observer'];
   const labels = {human_admin:'人類管理員',session_maintainer:'Session 維護者',manager:'主控',task_decomposer:'任務拆分者',implementer:'實作',reviewer:'Reviewer',consultant:'顧問',tester:'測試',observer:'Observer'};
-  let token = '', space = null, topic = null, basis = null, identity = null, view = 'forum', endpoint = null, outputCursor = 0, shutdownTicket = null, pollBusy = false, observeBusy = false, decompositionBusy = false, leaseExpires = 0;
+  let token = '', space = null, topic = null, basis = null, identity = null, view = 'forum', endpoint = null, outputCursor = 0, shutdownTicket = null, pollBusy = false, observeBusy = false, decompositionBusy = false, decompositionEpoch = 0, leaseExpires = 0;
   const pages = {}, drafts = new Map(), roleDrafts = new Map(), jobs = new Map(), completedJobs = new Set(),ranges=new Map(),heartbeats=new Map();
   let spaces = [], topics = [], comments = [];
   let historyOwner=null,historySessions=[],sourceOperation=null,sourceSnapshot=null,watchSnapshot=null,sourcePollBusy=false;
@@ -166,7 +177,8 @@ function startConsole() {
   const leaseKeeper = createLeaseKeeper(value => scoped('terminal.renew', value));
   function node(tag, text, className) { const n = document.createElement(tag); if (text != null) n.textContent = text; if (className) n.className = className; return n; }
   function notice(message, error = false) { $('notice').textContent = message; $('notice').classList.toggle('error', error); }
-  function failure(error) { notice(`${error.code || 'Error'}：${error.message}`, true); }
+  function clearDecomposition(){decompositionEpoch++;jobs.clear();$('decompositionJobId').value='';$('decompositionState').textContent='';$('recoveryPurpose').textContent='';$('decompositionChildren').replaceChildren();$('recoverDecomposition').hidden=true;}
+  function failure(error) { if(['Denied','Unauthenticated'].includes(error.code)){clearDecomposition();$('decompositionState').textContent='目前未獲授權，已清除先前拆分結果。';}notice(`${error.code || 'Error'}：${error.message}`, true); }
   async function run(action, button) {
     if (button) button.disabled = true;
     try { await action(); } catch (error) { failure(error); } finally { if (button) button.disabled = false; renderDecomposition(); renderSourceActions(); }
@@ -245,7 +257,7 @@ function startConsole() {
   $('spaceSelect').addEventListener('change', event => run(() => selectSpace(event.target.value)));
   async function selectSpace(id) {
     await releaseControl();
-    saveDraft(); space = spaces.find(item => item.id === id) || null; topic = null; basis = null; identity=null; endpoint = null; topics = []; comments = [];
+    clearDecomposition();saveDraft(); space = spaces.find(item => item.id === id) || null; topic = null; basis = null; identity=null; endpoint = null; topics = []; comments = [];
     ranges.clear();
     clearEndpointExtras();
     $('spaceSelect').value = space?.id || '';
@@ -304,6 +316,7 @@ function startConsole() {
   bindButton('moreTopics', () => loadTopics(true));
   async function readTopic(id, append = false, polling = false) {
     const oldId = topic?.id;
+    if(!polling&&!append&&oldId!==id)clearDecomposition();
     if (!polling && !append) saveDraft();
     const result = await range(`comments:${id}`,async args=>{const value=await scoped('topics.read',{topic_id:id,...args});return {...value,items:value.comments};}).read(append);
     if (polling && topic?.id !== id) return;
@@ -341,13 +354,17 @@ function startConsole() {
     renderDecomposition();
   }
   function jobKey(){return space&&topic?`${space.id}/${topic.id}`:null;}
-  function makeJob(){return createDecompositionJob(args=>scoped('agent.run',args));}
+  function decompositionCall(name,args,id){const key=jobKey(),epoch=decompositionEpoch;return scoped(name,args,id).then(value=>{if(jobKey()!==key||decompositionEpoch!==epoch)throw new Error('母任務已變更，忽略先前拆分回覆');return value;});}
+  function makeJob(){return createDecompositionJob(args=>decompositionCall('agent.run',args));}
   function renderDecomposition(){
     const allowed=canDecompose(identity)&&['plan','task'].includes(topic?.kind);
-    $('decompositionPanel').hidden=!allowed;if(!allowed)return;
+    $('decompositionPanel').hidden=!allowed;if(!allowed){clearDecomposition();return;}
     const state=jobs.get(jobKey())?.current();$('runDecomposition').disabled=Boolean(state)||decompositionBusy;
     $('decompositionJobId').readOnly=Boolean(state);if(state)$('decompositionJobId').value=state.job_id;
     $('decompositionState').textContent=state?JSON.stringify(state,null,2):'尚未開始。執行一次會啟動真實 Luna low 工作；請保存 job ID。';
+    $('recoverDecomposition').hidden=state?.recovery?.eligibility!=='eligible';$('recoverDecomposition').disabled=decompositionBusy;
+    const reasons={missing_durable_plan:'缺少已保存計畫，無法恢復剩餘任務',invalid_saved_plan:'已保存計畫未通過驗證',incompatible_saved_plan:'已保存計畫版本或內容不相容',receipt_plan_conflict:'已建立子任務與保存計畫不一致',unresolved_receipt_evidence:'部分建立結果無法核對',unresolved_child_evidence:'部分已知子任務無法核對'};
+    $('recoveryPurpose').textContent=state?`既有 job ${state.job_id}；已知子任務 ${state.topic_ids?.length||0} 筆。${state.recovery?.publication==='pending'?'結果尚未成功保存，請先查詢；不能視為完成。':state.recovery?.eligibility==='completed'?'已完成已保存計畫，所有子任務建立結果均已確認。':state.recovery?.eligibility==='needs_attention'?`需要處理：${reasons[state.recovery.reason]||state.recovery.reason}。保留已知子任務。`:'恢復會沿用已保存計畫，繼續建立剩餘子任務。'}`:'';
     $('decompositionChildren').replaceChildren();
     for(const childId of state?.topic_ids||[]){const button=node('button',`子任務 ${childId}`);button.addEventListener('click',()=>run(()=>readTopic(childId)));$('decompositionChildren').append(button);}
   }
@@ -363,12 +380,19 @@ function startConsole() {
     const key=jobKey(),mission=topic.id;let job=jobs.get(key);const knownId=$('decompositionJobId').value.trim();
     if(!job){if(!knownId)throw new Error('請先執行一次，或輸入既有 job ID 補讀');job=makeJob();jobs.set(key,job);}
     decompositionBusy=true;
-    try{const result=await job.inspect(args=>scoped('agent.get',args),knownId,mission);
+    try{const result=await job.inspect(args=>decompositionCall('agent.get',args),knownId,mission);
       if(result.status==='completed'&&!completedJobs.has(result.job_id)){completedJobs.add(result.job_id);await loadTopics();notice('單次拆分已完成，Runtime 已回傳子任務；尚未執行實作、審查或測試。');}
       if(result.status==='failed')notice(`單次拆分失敗：${typeof result.error==='string'?result.error:JSON.stringify(result.error)}；不自動重跑。`,true);
     }finally{decompositionBusy=false;if(jobKey()===key)renderDecomposition();}
   }
   bindButton('inspectDecomposition',inspectDecomposition);
+  bindButton('recoverDecomposition',async()=>{
+    if(!canDecompose(identity)||!topic)throw new Error('目前未具 task_decomposer 權限');
+    const key=jobKey(),job=jobs.get(key);if(!job)throw new Error('請先查詢既有 job');
+    decompositionBusy=true;
+    try{await job.recover((args,id)=>decompositionCall('agent.recover',args,id));notice('已提交明確恢復；沿用已保存計畫，請查詢確認結果。');}
+    finally{decompositionBusy=false;if(jobKey()===key)renderDecomposition();}
+  });
   setInterval(()=>{const state=jobs.get(jobKey())?.current();if(token&&view==='forum'&&!document.hidden&&canDecompose(identity)&&state&&['queued','accepted','running','applying','unknown'].includes(state.status)&&!decompositionBusy)inspectDecomposition().catch(failure);},2000);
   bindButton('moreComments', () => readTopic(topic.id,true));
   bindButton('rebase', async () => { if (!topic) return; await readTopic(topic.id,false,true); basis = structuredClone(topic); saveDraft(); renderTopic(); notice('已更新操作基準；草稿保持原樣，請確認成果與內容後送出。'); });

@@ -748,6 +748,104 @@ impl Engine {
             json!({"tool":tool,"topic_id":topic_id,"receipt":receipt["result"]}),
         ))
     }
+    /// Internal, bounded saved-plan evidence read. Never dispatches or repairs metadata.
+    pub(crate) fn agent_child_receipts(
+        &self,
+        credential: &str,
+        identity: &str,
+        space: &str,
+        mission: &str,
+        prefix: &str,
+    ) -> Result<(Vec<(ToolRequest, String)>, bool), ApiError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| err("Internal", "runtime lock poisoned"))?;
+        let tx = inner
+            .db
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(internal)?;
+        let encoded: String = tx
+            .query_row("SELECT json FROM core_state WHERE id=1", [], |r| r.get(0))
+            .map_err(internal)?;
+        let state: State = serde_json::from_str(&encoded).map_err(internal)?;
+        let member = state
+            .members
+            .iter()
+            .find(|m| {
+                m["credential_hash"] == hash(credential) && credential_active(m, (self.clock)())
+            })
+            .ok_or_else(|| err("Unauthenticated", "invalid credential"))?;
+        if member["id"] != identity
+            || member["space_id"] != space
+            || !has(&member["roles"], "task_decomposer")
+        {
+            return Err(err(
+                "Denied",
+                "current original task_decomposer identity and scope required",
+            ));
+        }
+        let mut children = Vec::new();
+        let mut unresolved = false;
+        for (index, receipt) in state
+            .receipts
+            .iter()
+            .filter(|r| {
+                r["identity"] == identity
+                    && r["request_id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with(prefix))
+            })
+            .take(13)
+            .enumerate()
+        {
+            if index >= 12 {
+                unresolved = true;
+                break;
+            }
+            let parsed = receipt["fingerprint"]
+                .as_str()
+                .and_then(|s| serde_json::from_str::<ToolRequest>(s).ok());
+            let Some(request) = parsed else {
+                unresolved = true;
+                continue;
+            };
+            let key = request.request_id.strip_prefix(prefix).unwrap_or("");
+            let scope = &receipt["operation_scope"];
+            let topic_id = receipt["result"]["id"].as_str();
+            let topic = topic_id.and_then(|id| state.topics.iter().find(|t| t["id"] == id));
+            if key.is_empty()
+                || key.len() > 64
+                || !key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                || receipt["request_id"] != request.request_id
+                || request.tool != "topics.create"
+                || request.space_id.as_deref() != Some(space)
+                || request.args["parent_topic_id"] != mission
+                || request.args["kind"] != "task"
+                || scope["tool"] != "topics.create"
+                || scope["space_id"] != space
+                || scope["required_role"] != "task_decomposer"
+                || !scope["endpoint_id"].is_null()
+                || topic_id.is_none()
+                || scope["topic_id"].as_str() != topic_id
+                || receipt["result"]["space_id"] != space
+                || receipt["result"]["parent_topic_id"] != mission
+                || receipt["result"]["dependencies"] != request.args["dependencies"]
+                || topic.is_none_or(|t| {
+                    t["space_id"] != space
+                        || t["parent_topic_id"] != mission
+                        || t["dependencies"] != request.args["dependencies"]
+                })
+            {
+                unresolved = true;
+                continue;
+            }
+            children.push((request, topic_id.unwrap().to_string()));
+        }
+        Ok((children, unresolved))
+    }
     pub fn execute_requiring_role(
         &self,
         credential: &str,

@@ -347,7 +347,17 @@ fn dispatch(
     if r.tool.starts_with("sources.") {
         return Ok(json!(s.sources.start(token, r)?));
     }
-    if r.tool == "agent.run" {
+    if matches!(r.tool.as_str(), "agent.run" | "agent.recover" | "agent.get") {
+        let args = r
+            .args
+            .as_object()
+            .ok_or_else(|| error("Invalid", "agent args must be an object"))?;
+        if args
+            .keys()
+            .any(|key| !matches!(key.as_str(), "job_id" | "mission_topic_id"))
+        {
+            return Err(error("Invalid", "unsupported agent argument"));
+        }
         let request = JobRequest {
             job_id: field(&r.args, "job_id")?.into(),
             space_id: r
@@ -356,10 +366,11 @@ fn dispatch(
                 .ok_or_else(|| error("Invalid", "space_id required"))?,
             mission_topic_id: field(&r.args, "mission_topic_id")?.into(),
         };
-        return Ok(json!(s.agents.start(token, &request)?));
-    }
-    if r.tool == "agent.get" {
-        return Ok(json!(s.agents.get(token, field(&r.args, "job_id")?)?));
+        return Ok(json!(match r.tool.as_str() {
+            "agent.recover" => s.agents.recover(token, &request, &r.request_id)?,
+            "agent.get" => s.agents.get_scoped(token, &request)?,
+            _ => s.agents.start(token, &request)?,
+        }));
     }
     if r.tool.starts_with("runtime.") {
         if !s.engine.is_owner(token) {
