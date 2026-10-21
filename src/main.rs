@@ -1,5 +1,6 @@
 mod cli;
 mod daemon;
+mod discovery;
 mod help;
 mod server;
 mod store;

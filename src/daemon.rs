@@ -28,8 +28,7 @@ pub(crate) fn start_daemon(a: &StartArgs) -> Result<Value> {
     if a.host != "127.0.0.1" {
         bail!("loopback_only: host must be 127.0.0.1")
     }
-    let record_path = a.state.state_dir.join("daemon.json");
-    if let Ok(bytes) = fs::read(&record_path) {
+    if let Some(bytes) = crate::discovery::read(&a.state.state_dir)? {
         let record: DaemonRecord =
             serde_json::from_slice(&bytes).context("invalid daemon discovery record")?;
         if process_alive(record.pid) {
@@ -62,28 +61,40 @@ pub(crate) fn start_daemon(a: &StartArgs) -> Result<Value> {
     #[cfg(not(windows))]
     let mut child = command.spawn()?;
     let address = format!("{}:{}", a.host, a.port);
-    for _ in 0..100 {
-        if child.try_wait()?.is_some() {
-            bail!("daemon_replacement_exited")
-        }
-        let record = fs::read(&record_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<DaemonRecord>(&bytes).ok());
-        if let Some(record) = record.filter(|record| {
-            record.pid == child.id()
-                && record.address == address
-                && record.version == VERSION
-                && record.protocol_major == PROTOCOL
-        }) {
-            if process_alive(record.pid) && health_ready(&address) {
-                return Ok(
-                    json!({"state":"started","pid":child.id(),"address":address,"version":VERSION,"protocolMajor":PROTOCOL}),
-                );
+    // Discovery is published only after Runtime initialization and listener
+    // binding succeed. Use an elapsed bound instead of poll count: the previous
+    // loop also spent up to 100ms per health probe (about 12s in total).
+    let result = (|| -> Result<Value> {
+        let startup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < startup_deadline {
+            if child.try_wait()?.is_some() {
+                bail!("daemon_replacement_exited")
             }
+            let record = crate::discovery::read(&a.state.state_dir)?
+                .and_then(|bytes| serde_json::from_slice::<DaemonRecord>(&bytes).ok());
+            if let Some(record) = record.filter(|record| {
+                record.pid == child.id()
+                    && record.address == address
+                    && record.version == VERSION
+                    && record.protocol_major == PROTOCOL
+            }) {
+                if process_alive(record.pid) && health_ready(&address) {
+                    return Ok(
+                        json!({"state":"started","pid":child.id(),"address":address,"version":VERSION,"protocolMajor":PROTOCOL}),
+                    );
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    bail!("daemon_start_timeout")
+        bail!("daemon_start_timeout")
+    })();
+    // Initialization may already own work before discovery is published. A
+    // failed acknowledgement cannot authorize killing that process. Preserve
+    // its exact identity and recovery locator instead of claiming it stopped.
+    result.map_err(|error| anyhow::anyhow!(
+        "startup_outcome_unknown: pid={} address={} state_dir={} detail={error}; inspect before retry",
+        child.id(), address, a.state.state_dir.display()
+    ))
 }
 pub(crate) fn health_ready(address: &str) -> bool {
     let Ok(mut stream) = TcpStream::connect(address) else {
@@ -292,8 +303,7 @@ pub(crate) fn process_alive(pid: u32) -> bool {
     }
 }
 pub(crate) fn stop_daemon(state_dir: &FsPath) -> Result<bool> {
-    let record_path = state_dir.join("daemon.json");
-    let Ok(bytes) = fs::read(&record_path) else {
+    let Some(bytes) = crate::discovery::read(state_dir)? else {
         return Ok(false);
     };
     let record: DaemonRecord =
@@ -342,9 +352,7 @@ pub(crate) fn stop_daemon(state_dir: &FsPath) -> Result<bool> {
             && TcpStream::connect_timeout(&address, std::time::Duration::from_millis(100)).is_err()
         {
             // A concurrent start may have published a different discovery record.
-            if fs::read(&record_path).ok().as_deref() == Some(bytes.as_slice()) {
-                let _ = fs::remove_file(&record_path);
-            }
+            crate::discovery::remove_if_matches(state_dir, &bytes)?;
             return Ok(true);
         }
         std::thread::sleep(std::time::Duration::from_millis(20));

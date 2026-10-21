@@ -6,8 +6,8 @@ use std::{
     time::Duration,
 };
 pub(crate) fn run(a: crate::cli::ToolArgs) -> Result<()> {
-    let record: crate::cli::DaemonRecord =
-        serde_json::from_slice(&std::fs::read(a.state_dir.join("daemon.json"))?)?;
+    let bytes = crate::discovery::read(&a.state_dir)?.context("daemon discovery record missing")?;
+    let record: crate::cli::DaemonRecord = serde_json::from_slice(&bytes)?;
     let address: SocketAddr = record.address.parse()?;
     if !address.ip().is_loopback() || !crate::daemon::process_alive(record.pid) {
         bail!("discovery does not name a live loopback daemon")

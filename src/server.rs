@@ -155,33 +155,46 @@ pub(crate) async fn serve(a: StartArgs) -> Result<()> {
     if a.host != "127.0.0.1" {
         bail!("loopback_only: host must be 127.0.0.1")
     }
-    let record_path = a.state.state_dir.join("daemon.json");
-    if let Ok(bytes) = fs::read(&record_path) {
-        let record: DaemonRecord =
-            serde_json::from_slice(&bytes).context("invalid daemon discovery record")?;
-        if process_alive(record.pid) {
-            if record.version != VERSION || record.protocol_major != PROTOCOL {
-                bail!("daemon_version_or_protocol_conflict: explicit drain/restart required")
+    // Every direct `daemon run` participates, including different requested
+    // ports for one state directory. Bounded lock waits and synchronous startup
+    // work run off the async worker; no owner is held during HTTP or shutdown.
+    let prepared = tokio::task::spawn_blocking(move || -> Result<_> {
+        let owner = crate::discovery::Owner::acquire(&a.state.state_dir)?;
+        if let Some(bytes) = owner.read()? {
+            let record: DaemonRecord =
+                serde_json::from_slice(&bytes).context("invalid daemon discovery record")?;
+            if process_alive(record.pid) {
+                if record.version != VERSION || record.protocol_major != PROTOCOL {
+                    bail!("daemon_version_or_protocol_conflict: explicit drain/restart required")
+                }
+                output(
+                    a.state.json,
+                    json!({"reused":true,"version":VERSION,"protocolMajor":PROTOCOL}),
+                    "相容 daemon 已在執行，安全重用",
+                );
+                return Ok(None);
             }
-            output(
-                a.state.json,
-                json!({"reused":true,"version":VERSION,"protocolMajor":PROTOCOL}),
-                "相容 daemon 已在執行，安全重用",
-            );
-            return Ok(());
         }
-    }
-    let store = Store::open(&a.state.state_dir)?;
-    let addr: SocketAddr = format!("{}:{}", a.host, a.port).parse()?;
-    let host = addr.to_string();
-    fs::write(
-        &record_path,
-        serde_json::to_vec(
-            &json!({"address":host,"pid":std::process::id(),"version":VERSION,"protocolMajor":PROTOCOL}),
-        )?,
-    )?;
-    let state = AppState { store, host };
-    let (v2, mut shutdown) = linkstart::runtime_http::router(&a.state.state_dir, &state.host)?;
+        let addr: SocketAddr = format!("{}:{}", a.host, a.port).parse()?;
+        // A bind failure must not initialize/rotate credentials or replace the
+        // previous locator. The listener exists before publication succeeds.
+        let listener = std::net::TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        let host = addr.to_string();
+        let store = Store::open(&a.state.state_dir)?;
+        let state = AppState { store, host };
+        let (v2, shutdown) = linkstart::runtime_http::router(&a.state.state_dir, &state.host)?;
+        owner.publish(&serde_json::to_vec(
+            &json!({"address":state.host,"pid":std::process::id(),"version":VERSION,"protocolMajor":PROTOCOL}),
+        )?)?;
+        Ok(Some((state, v2, shutdown, listener)))
+    })
+    .await??;
+    let Some((state, v2, mut shutdown, listener)) = prepared else {
+        return Ok(());
+    };
+    let listener = tokio::net::TcpListener::from_std(listener)?;
+    let addr = listener.local_addr()?;
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/connections", post(register_connection))
@@ -214,15 +227,13 @@ pub(crate) async fn serve(a: StartArgs) -> Result<()> {
     println!("LinkStart daemon listening on http://{addr}");
     let mut transport_drain = shutdown.clone();
     let serving = std::future::IntoFuture::into_future(
-        axum::serve(tokio::net::TcpListener::bind(addr).await?, app).with_graceful_shutdown(
-            async move {
-                while !*shutdown.borrow() {
-                    if shutdown.changed().await.is_err() {
-                        break;
-                    }
+        axum::serve(listener, app).with_graceful_shutdown(async move {
+            while !*shutdown.borrow() {
+                if shutdown.changed().await.is_err() {
+                    break;
                 }
-            },
-        ),
+            }
+        }),
     );
     tokio::pin!(serving);
     // Runtime signals only after owned children, workers and durable history are safe.
