@@ -2,6 +2,7 @@
 name = "linkstart"
 version = "0.1.6"
 edition = "2021"
+rust-version = "1.89"
 description = "LinkStart v1 Preview stable core"
 license = "MIT"
 repository = "https://github.com/TLOGBen/LinkStart"

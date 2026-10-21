@@ -90,23 +90,64 @@ fn protect(path: &Path) -> anyhow::Result<()> {
     }
     #[cfg(windows)]
     {
-        let output = std::process::Command::new("whoami").output()?;
-        anyhow::ensure!(output.status.success(), "cannot determine local owner");
-        let user = String::from_utf8(output.stdout)?.trim().to_string();
-        let status = std::process::Command::new("icacls")
-            .arg(path)
+        let output = std::process::Command::new("powershell.exe")
             .args([
-                "/inheritance:r",
-                "/grant:r",
-                &format!("{}:{}", user, if path.is_dir() { "(OI)(CI)F" } else { "F" }),
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                include_str!("storage_acl.ps1"),
             ])
+            .env_remove("PSModulePath")
+            .env("LINKSTART_STORAGE_PATH", path)
             .output()?;
         anyhow::ensure!(
-            status.status.success(),
-            "cannot protect runtime storage ACL"
+            output.status.success(),
+            "cannot protect runtime storage ACL: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
     Ok(())
+}
+// Only an absent DB permits recovery of an interrupted first initialization.
+// A missing/corrupt token beside any existing DB must never rotate its credentials.
+fn initialize_owner_token(dir: &Path) -> anyhow::Result<String> {
+    let canonical = owner_token_path(dir);
+    let previous = if canonical.exists() {
+        protect(&canonical)?;
+        Some(std::fs::read_to_string(&canonical)?)
+    } else {
+        None
+    };
+    if let Some(secret) = &previous {
+        if secret.len() >= 32 {
+            return Ok(secret.clone());
+        }
+    }
+    anyhow::ensure!(
+        !dir.join("v2.sqlite3").exists(),
+        "owner token missing or invalid for existing database; restore original token"
+    );
+    let secret = format!("{}{}", id(), id());
+    let staged = dir.join(format!("v2-owner.token.pending-{}", id()));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&staged)?;
+    protect(&staged)?;
+    file.write_all(secret.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    if previous.is_some() {
+        // Atomic replacement of a legacy incomplete canonical token, under the lock.
+        std::fs::rename(&staged, &canonical)?;
+    } else {
+        // Atomic no-replace publication: canonical never exposes incomplete bytes.
+        std::fs::hard_link(&staged, &canonical)?;
+        std::fs::remove_file(&staged)?;
+    }
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(secret)
 }
 fn derive(secret: &str, kind: &str, key: &str) -> String {
     hash(&format!("linkstart-v2\0{secret}\0{kind}\0{key}"))
@@ -335,25 +376,26 @@ impl Engine {
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
         protect(dir)?;
-        let token_path = owner_token_path(dir);
-        let secret = match std::fs::OpenOptions::new()
-            .create_new(true)
+        // An OS lock releases on process death; keep it through token AND DB initialization.
+        let lock_path = dir.join("v2-initialize.lock");
+        if lock_path.exists() {
+            protect(&lock_path)?;
+        }
+        let initialize_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
             .write(true)
-            .open(&token_path)
-        {
-            Ok(mut f) => {
-                let secret = format!("{}{}", id(), id());
-                f.write_all(secret.as_bytes())?;
-                f.sync_all()?;
-                secret
+            .open(&lock_path)?;
+        initialize_lock.lock()?;
+        protect(&lock_path)?;
+        for name in ["v2.sqlite3", "v2.sqlite3-wal", "v2.sqlite3-shm"] {
+            let path = dir.join(name);
+            if path.exists() {
+                protect(&path)?;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                std::fs::read_to_string(&token_path)?
-            }
-            Err(e) => return Err(e.into()),
-        };
-        protect(&token_path)?;
-        anyhow::ensure!(secret.len() >= 32, "owner token invalid");
+        }
+        let secret = initialize_owner_token(dir)?;
         let mut db = Connection::open(dir.join("v2.sqlite3"))?;
         db.busy_timeout(std::time::Duration::from_secs(10))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS core_state (id INTEGER PRIMARY KEY CHECK(id=1), json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS core_attachments(id TEXT PRIMARY KEY,space_id TEXT NOT NULL,identity_id TEXT NOT NULL,last_seen INTEGER NOT NULL);")?;
