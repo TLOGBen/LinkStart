@@ -1,0 +1,254 @@
+warning: fields `credential` and `facade` are never read
+   --> src/runtime_launch_policy.rs:171:5
+    |
+169 | pub struct ApprovedLaunch {
+    |            -------------- fields in this struct
+170 |     config: OwnedHostConfig,
+171 |     credential: String,
+    |     ^^^^^^^^^^
+172 |     facade: Arc<dyn RuntimeToolFacade>,
+    |     ^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `into_parts` is never used
+   --> src/runtime_launch_policy.rs:186:19
+    |
+176 | impl ApprovedLaunch {
+    | ------------------- method in this implementation
+...
+186 |     pub(crate) fn into_parts(
+    |                   ^^^^^^^^^^
+
+warning: field `stderr` is never read
+   --> src/runtime_source.rs:421:9
+    |
+418 | pub(crate) struct BoundedProcessOutput {
+    |                   -------------------- field in this struct
+...
+421 |     pub stderr: Vec<u8>,
+    |         ^^^^^^
+
+   Compiling linkstart v0.1.6 (/mnt/c/Users/jimts/workspace/Gits/Vakarve/LinkStart-launch-policy)
+warning: `linkstart` (lib) generated 3 warnings
+warning: `linkstart` (lib test) generated 3 warnings (3 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.50s
+     Running unittests src/lib.rs (/tmp/linkstart-launch-policy-target/debug/deps/linkstart-d5e233486431cd60)
+
+running 29 tests
+test runtime_terminal::tests::input_overload_is_rejected_without_preventing_bounded_cleanup ... ok
+test runtime_core::tests::current_identity_comes_from_credential_and_tracks_revoked_roles ... ok
+test runtime_core::tests::caller_configuration_cannot_expand_private_credential_receipt_markers ... ok
+test runtime_core::tests::heartbeat_renewal_refreshes_latest_attachment_even_when_pulse_id_is_reused ... ok
+test runtime_core::tests::durable_space_and_topic_survive_reopen ... ok
+test runtime_core::tests::session_maintainer_cannot_mint_github_authority ... ok
+test runtime_core::tests::human_administrator_cannot_be_forged_by_agent_invitation_or_role_change ... ok
+test runtime_core::tests::invitation_cannot_self_elevate_and_last_administrator_requires_handoff ... ok
+test runtime_core::tests::restrictive_role_gate_rechecks_current_role_even_when_general_posting_and_receipt_exist ... ok
+test runtime_core::tests::rejected_server_fields_leave_no_partial_comment_or_revision ... ok
+test runtime_core::tests::member_projection_preserves_role_and_explicit_grant_sources ... ok
+test runtime_core::tests::legacy_github_without_server_approval_cannot_dispatch_even_as_manager ... ok
+test runtime_core::tests::runtime_settings_require_owner_validate_and_survive_restart ... ok
+test runtime_core::tests::endpoint_grants_are_scoped_and_rechecked_after_revoke ... ok
+test runtime_core::tests::endpoint_dispatch_gate_rechecks_revoked_grant_before_replaying_forum_receipt ... ok
+test runtime_core::tests::read_tools_do_not_request_sqlite_writer_lock ... ok
+test runtime_core::tests::comment_reply_keeps_same_topic_target_and_artifact_references ... ok
+test runtime_core::tests::revoked_implementer_cannot_update_owned_task_or_replay_mutation ... ok
+test runtime_core::tests::member_projection_hides_endpoints_the_reader_cannot_discover ... ok
+test runtime_core::tests::decomposer_builds_scoped_child_tasks_and_offline_activity_paginates ... ok
+test runtime_core::tests::claim_is_atomic_and_receipt_survives_restart ... ok
+test runtime_core::tests::member_grant_view_tracks_authoritative_endpoint_changes ... ok
+test runtime_core::tests::independent_attachment_heartbeats_aggregate_connection_liveness_without_releasing_claim ... ok
+test runtime_core::tests::review_and_test_bind_immutable_submission_and_reject_old_evidence ... ok
+test runtime_core::tests::heartbeat_renewal_does_not_rewrite_the_forum_snapshot ... ok
+test runtime_terminal::tests::heartbeat_renews_only_current_terminal_controller ... ok
+test runtime_terminal::tests::owned_terminal_starts_a_real_child ... ok
+test runtime_terminal::tests::slow_observer_gets_gap_while_other_terminal_stays_responsive ... ok
+test runtime_terminal::tests::release_rejoin_keeps_child_and_fences_old_writer ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running unittests src/main.rs (/tmp/linkstart-launch-policy-target/debug/deps/linkstart-fe522fb7624d6619)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/history_authority.rs (/tmp/linkstart-launch-policy-target/debug/deps/history_authority-95d9ff42859254f4)
+
+running 7 tests
+test process_new_writer ... ignored, subprocess helper invoked only by cross-process authority test
+test fenced_store_cannot_register_or_retire_newer_durable_history ... ok
+
+running 1 test
+test exited_status_cannot_retire_a_reader_before_its_tail_and_eof ... ok
+test canonical_root_alias_still_waits_for_same_lock_and_fences_old_store ... ok
+test unrelated_root_lock_wait_does_not_block_healthy_history ... ok
+test process_new_writer ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.16s
+
+test root_os_lock_serializes_cross_process_open_and_fences_old_registration ... ok
+test admission_queued_before_eof_cannot_overtake_later_tail_chunks ... ok
+
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/http_roundtrip.rs (/tmp/linkstart-launch-policy-target/debug/deps/http_roundtrip-d85fb710f8f468cf)
+
+running 1 test
+LinkStart daemon listening on http://127.0.0.1:34203
+kill: (61352): No such process
+LinkStart daemon listening on http://127.0.0.1:34203
+test durable_http_round_trip_and_restart ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.29s
+
+     Running tests/lifecycle_cli.rs (/tmp/linkstart-launch-policy-target/debug/deps/lifecycle_cli-6ef6070360244c07)
+
+running 2 tests
+test start_reports_json_failure_when_port_is_occupied ... ok
+test lifecycle_json_is_one_truthful_control_result ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+     Running tests/member_credentials.rs (/tmp/linkstart-launch-policy-target/debug/deps/member_credentials-5389f23c48ce80cd)
+
+running 7 tests
+test legacy_members_and_receipt_markers_default_to_epoch_zero_without_expiry ... ok
+test rotation_fences_successful_replay_and_preserves_identity_and_topic ... ok
+test credential_audit_is_durable_secret_free_atomic_and_idempotent ... ok
+test management_respects_human_identity_space_and_final_active_admin ... ok
+test bounded_expiry_uses_engine_clock_and_heartbeat_cannot_extend_it ... ok
+test revoked_or_expired_administrator_cannot_enable_final_active_admin_demotion ... ok
+test receipts_keep_original_generation_across_rotation_revoke_and_reopen ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/operation_receipts.rs (/tmp/linkstart-launch-policy-target/debug/deps/operation_receipts-4d93e18365d25d9e)
+
+running 4 tests
+test legacy_and_sensitive_receipts_do_not_hydrate_and_unknown_is_bounded ... ok
+test forum_lookup_is_identity_scoped_durable_and_does_not_write ... ok
+test current_grant_role_and_credential_fence_existing_receipts ... ok
+test real_source_job_unknown_survives_reopen_without_remote_reads_or_resend ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/owned_codex_host.rs (/tmp/linkstart-launch-policy-target/debug/deps/owned_codex_host-7500da4f5e29006d)
+
+running 12 tests
+test actual_forum_facade_rechecks_credentials_and_rejects_admin_tools ... ok
+test owned_eof_preserves_unknown_and_close_observes_exit ... ok
+test binding_fence_rejects_all_late_publication_and_admission ... ok
+test reconciling_completed_a_preserves_active_b_and_its_durable_state ... ok
+test fake_provider_callbacks_execute_real_claim_comment_submission_and_independent_review ... ok
+test request_id_collision_and_notifications_are_routed_before_response ... ok
+test fence_timeout_stays_fenced_and_same_original_generation_can_drain_on_retry ... ok
+test unverified_provider_version_and_effective_sandbox_are_unsupported ... ok
+test exact_owned_thread_recovers_in_new_process_but_external_thread_is_rejected ... ok
+test binding_fence_does_not_return_while_admitted_real_mutation_is_blocked ... ok
+test actual_participant_resume_admits_prospective_host_generation_then_receipt ... ok
+test lost_response_keeps_operation_unknown_and_never_repeats_turn ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+
+     Running tests/participant_authorization.rs (/tmp/linkstart-launch-policy-target/debug/deps/participant_authorization-30849b67a00ddff6)
+
+running 1 test
+test admission_fences_other_engine_revocation_and_rechecks_afterwards ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/participant_ledger.rs (/tmp/linkstart-launch-policy-target/debug/deps/participant_ledger-8c54c2caa2851eb5)
+
+running 14 tests
+test ledger_rejects_an_unrelated_storage_directory ... ok
+test binding_generation_exhaustion_rejects_each_transition_without_changing_ledger ... ok
+test checkpoint_requires_live_owned_host_and_pause_fences_old_generation ... ok
+test operation_lookup_never_changes_durable_intents_and_credentials_are_not_saved ... ok
+test endpoint_and_credential_revocation_reject_replay_and_self_binding_is_enforced ... ok
+test pause_and_resume_replay_are_idempotent_but_old_receipt_is_fenced ... ok
+test explicit_rebind_preserves_participant_history_and_fences_the_previous_session ... ok
+test explicit_initial_boundary_cursor_scope_and_gap_are_preserved ... ok
+test checkpoint_references_only_known_durable_intents_and_lookup_is_read_only ... ok
+test offline_activity_survives_reopen_and_checkpoint_cas_has_one_winner ... ok
+test resume_admits_prospective_generation_and_rolls_back_failed_admission ... ok
+test restart_without_owned_host_remains_readable_but_cannot_resume_or_mutate ... ok
+test receipt_is_durable_contiguous_and_never_completes_forum_work ... ok
+test source_projection_envelopes_preserve_each_version_and_do_not_relabel_human_comments ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+
+     Running tests/runtime_launch_policy.rs (/tmp/linkstart-launch-policy-target/debug/deps/runtime_launch_policy-c2276037566d3974)
+
+running 19 tests
+test credential_cannot_leak_through_public_plan_or_fake_argv ... ok
+test workspace_write_keeps_approved_profile_across_reopen ... ok
+test missing_slot_nonadmin_and_borrowed_manager_are_rejected ... ok
+test identifier_and_persisted_timeout_boundaries ... ok
+test exact_space_is_required_even_for_owner ... ok
+test malformed_plan_and_unknown_target_fail_closed ... ok
+test rotation_never_recreates_or_replaces_private_slot ... ok
+test expired_worker_remains_expired_after_reopen ... ok
+test actor_may_use_explicit_manage_without_becoming_installer ... ok
+test extreme_timeout_obeys_platform_deadline_without_panic ... ok
+test revocation_advances_revision_and_replay_does_not_restore_it ... ok
+test worker_slots_cross_endpoint ... ok
+test durable_exact_plan_and_private_slot ... ok
+test scope_namespaces_cross_endpoint ... ok
+test unknown_future_schema_is_rejected_without_mutation ... ok
+test worker_slots_cross_space ... ok
+test malformed_legacy_document_rolls_back_both_tables_and_unrelated_state ... ok
+test scope_namespaces_cross_space ... ok
+test legacy_migration_preserves_rows_secrets_revisions_and_reopen_is_idempotent ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/storage_initialization.rs (/tmp/linkstart-launch-policy-target/debug/deps/storage_initialization-18a99993b35b64cf)
+
+running 4 tests
+test initializer_process ... ok
+
+running 1 test
+test interrupted_first_token_write_without_database_recovers ... ok
+test existing_database_never_rotates_missing_or_corrupt_token ... ok
+
+running 1 test
+
+running 1 test
+
+running 1 test
+test initializer_process ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 1.50s
+
+test initializer_process ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 1.50s
+
+test initializer_process ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 1.51s
+
+test killed_initializer_and_concurrent_processes_recover_one_owner ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.54s
+
+     Running unittests examples/native_history.rs (/tmp/linkstart-launch-policy-target/debug/examples/native_history-8a3f61dc06fed2af)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/runtime_core.rs (/tmp/linkstart-launch-policy-target/debug/examples/runtime_core-559dc1f1cd3bd963)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/runtime_sources.rs (/tmp/linkstart-launch-policy-target/debug/examples/runtime_sources-a41529ad3018f6fc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
