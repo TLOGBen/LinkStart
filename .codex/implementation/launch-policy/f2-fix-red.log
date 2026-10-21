@@ -1,0 +1,65 @@
+warning: fields `credential` and `facade` are never read
+   --> src\runtime_launch_policy.rs:171:5
+    |
+169 | pub struct ApprovedLaunch {
+    |            -------------- fields in this struct
+170 |     config: OwnedHostConfig,
+171 |     credential: String,
+    |     ^^^^^^^^^^
+172 |     facade: Arc<dyn RuntimeToolFacade>,
+    |     ^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: method `into_parts` is never used
+   --> src\runtime_launch_policy.rs:186:19
+    |
+176 | impl ApprovedLaunch {
+    | ------------------- method in this implementation
+...
+186 |     pub(crate) fn into_parts(
+    |                   ^^^^^^^^^^
+
+warning: field `stderr` is never read
+   --> src\runtime_source.rs:421:9
+    |
+418 | pub(crate) struct BoundedProcessOutput {
+    |                   -------------------- field in this struct
+...
+421 |     pub stderr: Vec<u8>,
+    |         ^^^^^^
+
+warning: `linkstart` (lib) generated 3 warnings
+   Compiling linkstart v0.1.6 (C:\Users\jimts\workspace\Gits\Vakarve\LinkStart-launch-policy)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.99s
+     Running tests\runtime_launch_policy.rs (target\debug\deps\runtime_launch_policy-79ac62624f677211.exe)
+
+running 2 tests
+test installer_admission_precedes_private_slot_and_preflight_observation ... FAILED
+test provisioning_admission_precedes_worker_validation ... FAILED
+
+failures:
+
+---- installer_admission_precedes_private_slot_and_preflight_observation stdout ----
+
+thread 'installer_admission_precedes_private_slot_and_preflight_observation' panicked at tests\runtime_launch_policy.rs:90:13:
+assertion `left == right` failed: invalid/absent
+  left: ("WorkerCredentialRequired", "provision independent worker credential first")
+ right: ("Unauthenticated", "invalid credential")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- provisioning_admission_precedes_worker_validation stdout ----
+
+thread 'provisioning_admission_precedes_worker_validation' panicked at tests\runtime_launch_policy.rs:127:17:
+assertion `left == right` failed: cross-space/absent-slot
+  left: ("Unauthenticated", "invalid credential")
+ right: ("Denied", "space membership required")
+
+
+failures:
+    installer_admission_precedes_private_slot_and_preflight_observation
+    provisioning_admission_precedes_worker_validation
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 19 filtered out; finished in 4.35s
+
+error: test failed, to rerun pass `--test runtime_launch_policy`

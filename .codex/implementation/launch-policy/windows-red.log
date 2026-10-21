@@ -1,0 +1,172 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling windows-link v0.2.1
+   Compiling cfg-if v1.0.4
+   Compiling version_check v0.9.5
+   Compiling pin-project-lite v0.2.17
+   Compiling futures-core v0.3.34
+   Compiling itoa v1.0.18
+   Compiling once_cell v1.21.4
+   Compiling bytes v1.12.1
+   Compiling zerocopy v0.8.56
+   Compiling serde_core v1.0.229
+   Compiling libc v0.2.189
+   Compiling shlex v2.0.1
+   Compiling winapi v0.3.9
+   Compiling find-msvc-tools v0.1.11
+   Compiling httparse v1.10.1
+   Compiling log v0.4.34
+   Compiling tower-service v0.3.3
+   Compiling typenum v1.20.1
+   Compiling futures-task v0.3.34
+   Compiling zmij v1.0.23
+   Compiling once_cell_polyfill v1.70.2
+   Compiling anstyle v1.0.14
+   Compiling vcpkg v0.2.15
+   Compiling smallvec v1.15.2
+   Compiling serde v1.0.229
+   Compiling bitflags v2.13.1
+   Compiling thiserror v1.0.69
+   Compiling cfg_aliases v0.1.1
+   Compiling tower-layer v0.3.3
+   Compiling windows-sys v0.61.2
+   Compiling getrandom v0.4.3
+   Compiling slab v0.4.12
+   Compiling utf8parse v0.2.2
+   Compiling tracing-core v0.1.36
+   Compiling rustversion v1.0.23
+   Compiling pkg-config v0.3.34
+   Compiling generic-array v0.14.7
+   Compiling ahash v0.8.12
+   Compiling nix v0.28.0
+   Compiling anstyle-parse v1.0.0
+   Compiling futures-channel v0.3.34
+   Compiling getrandom v0.2.17
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling atomic-waker v1.1.2
+   Compiling anyhow v1.0.104
+   Compiling sync_wrapper v1.0.2
+   Compiling http v1.5.0
+   Compiling winreg v0.10.1
+   Compiling colorchoice v1.0.5
+   Compiling serde_json v1.0.151
+   Compiling percent-encoding v2.3.2
+   Compiling httpdate v1.0.3
+   Compiling cc v1.4.4
+   Compiling rand_core v0.6.4
+   Compiling ryu v1.0.23
+   Compiling tracing v0.1.44
+   Compiling mime v0.3.17
+   Compiling clap_lex v1.1.0
+   Compiling memchr v2.8.3
+   Compiling form_urlencoded v1.2.2
+   Compiling heck v0.5.0
+   Compiling strsim v0.11.1
+   Compiling futures-sink v0.3.34
+   Compiling lazy_static v1.5.1
+   Compiling cpufeatures v0.2.17
+   Compiling downcast-rs v1.2.1
+   Compiling matchit v0.7.3
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling shell-words v1.1.1
+   Compiling http-body v1.1.0
+   Compiling fallible-iterator v0.3.0
+   Compiling bitflags v1.3.2
+   Compiling fastrand v2.5.0
+   Compiling http-body-util v0.1.5
+   Compiling shared_library v0.1.9
+   Compiling libsqlite3-sys v0.30.1
+   Compiling syn v3.0.4
+   Compiling syn v2.0.119
+   Compiling tower-http v0.6.11
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling serde_path_to_error v0.1.20
+   Compiling uuid v1.26.0
+   Compiling thiserror-impl v1.0.69
+   Compiling socket2 v0.6.5
+   Compiling mio v1.2.2
+   Compiling anstyle-wincon v3.0.11
+   Compiling anstyle-query v1.1.5
+   Compiling serial2 v0.2.38
+   Compiling tempfile v3.27.0
+   Compiling anstream v1.0.0
+   Compiling clap_builder v4.6.6
+   Compiling tokio-macros v2.7.2
+   Compiling futures-macro v0.3.34
+   Compiling serde_derive v1.0.229
+   Compiling async-trait v0.1.92
+   Compiling clap_derive v4.6.4
+   Compiling filedescriptor v0.8.3
+   Compiling portable-pty v0.9.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling hashbrown v0.14.5
+   Compiling rand_chacha v0.3.1
+   Compiling tokio v1.53.1
+   Compiling futures-util v0.3.34
+   Compiling rand v0.8.8
+   Compiling hashlink v0.9.1
+   Compiling rusqlite v0.32.1
+   Compiling clap v4.6.6
+   Compiling axum-core v0.4.5
+   Compiling serde_urlencoded v0.7.1
+   Compiling hyper v1.11.0
+   Compiling tower v0.5.3
+   Compiling tokio-util v0.7.19
+   Compiling tokio-stream v0.1.19
+   Compiling hyper-util v0.1.20
+   Compiling axum v0.7.9
+   Compiling linkstart v0.1.6 (C:\Users\jimts\workspace\Gits\Vakarve\LinkStart-launch-policy)
+warning: field `stderr` is never read
+   --> src\runtime_source.rs:421:9
+    |
+418 | pub(crate) struct BoundedProcessOutput {
+    |                   -------------------- field in this struct
+...
+421 |     pub stderr: Vec<u8>,
+    |         ^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `credential` and `facade` are never read
+  --> src\runtime_launch_policy.rs:63:5
+   |
+61 | pub struct ApprovedLaunch {
+   |            -------------- fields in this struct
+62 |     config: OwnedHostConfig,
+63 |     credential: String,
+   |     ^^^^^^^^^^
+64 |     facade: Arc<dyn RuntimeToolFacade>,
+   |     ^^^^^^
+
+warning: method `into_parts` is never used
+  --> src\runtime_launch_policy.rs:78:19
+   |
+68 | impl ApprovedLaunch {
+   | ------------------- method in this implementation
+...
+78 |     pub(crate) fn into_parts(
+   |                   ^^^^^^^^^^
+
+warning: `linkstart` (lib) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.84s
+     Running tests\runtime_launch_policy.rs (target\debug\deps\runtime_launch_policy-4dba0c98c9c0fcf9.exe)
+
+running 1 test
+
+thread 'identifier_and_persisted_timeout_boundaries' (55192) panicked at tests\runtime_launch_policy.rs:20:56:
+called `Result::unwrap_err()` on an `Ok` value: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test identifier_and_persisted_timeout_boundaries ... FAILED
+
+failures:
+
+failures:
+    identifier_and_persisted_timeout_boundaries
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 10 filtered out; finished in 2.04s
+
+error: test failed, to rerun pass `--test runtime_launch_policy`
