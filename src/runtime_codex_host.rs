@@ -226,22 +226,69 @@ impl OwnedCodexRegistry {
     ) -> Result<(), HostError> {
         let _lease = {
             let mut facts = self.facts.lock().map_err(io)?;
-            let f = facts.get_mut(&scope.session_id).ok_or_else(|| denied("unknown owned session"))?;
-            if f.scope != *scope || f.fenced_from.is_some() || !f.alive.load(Ordering::Acquire)
-                || f.child.try_lock().map_err(|_| HostError::Idle)?.try_wait().map_err(io)?.is_some()
-            { return Err(denied("current exact live owned host required")); }
-            f.active_callbacks = f.active_callbacks.checked_add(1).ok_or_else(|| denied("lease limit"))?;
-            CallbackLease { facts:self.facts.clone(), drained:self.drained.clone(), session:scope.session_id.clone(), instance:f.instance.clone() }
+            let f = facts
+                .get_mut(&scope.session_id)
+                .ok_or_else(|| denied("unknown owned session"))?;
+            if f.scope != *scope
+                || f.fenced_from.is_some()
+                || !f.alive.load(Ordering::Acquire)
+                || f.child
+                    .try_lock()
+                    .map_err(|_| HostError::Idle)?
+                    .try_wait()
+                    .map_err(io)?
+                    .is_some()
+            {
+                return Err(denied("current exact live owned host required"));
+            }
+            f.active_callbacks = f
+                .active_callbacks
+                .checked_add(1)
+                .ok_or_else(|| denied("lease limit"))?;
+            CallbackLease {
+                facts: self.facts.clone(),
+                drained: self.drained.clone(),
+                session: scope.session_id.clone(),
+                instance: f.instance.clone(),
+            }
         };
-        self.engine.with_endpoint_authorization(credential,&scope.space_id,&scope.endpoint_id,"send",|auth| {
-            if scope.identity_id == "owner" || auth["identity_id"] != scope.identity_id
-                || !auth["identity"]["attachments"].as_array().is_some_and(|aa|aa.iter().any(|a|a["attachment_id"]==scope.attachment_id))
-            { return Err(ApiError {code:"Denied".into(),message:"exact member attachment required".into()}); }
-            Ok(())
-        }).map_err(|_|denied("current renewal authorization denied"))?;
-        self.engine.execute_requiring_endpoint(credential,&crate::runtime_core::ToolRequest {
-            request_id:uuid::Uuid::new_v4().to_string(),tool:"members.heartbeat".into(),space_id:Some(scope.space_id.clone()),args:json!({"attachment_id":scope.attachment_id})
-        },&scope.endpoint_id,"send").map_err(|_|denied("attachment renewal denied"))?;
+        self.engine
+            .with_endpoint_authorization(
+                credential,
+                &scope.space_id,
+                &scope.endpoint_id,
+                "send",
+                |auth| {
+                    if scope.identity_id == "owner"
+                        || auth["identity_id"] != scope.identity_id
+                        || !auth["identity"]["attachments"]
+                            .as_array()
+                            .is_some_and(|aa| {
+                                aa.iter().any(|a| a["attachment_id"] == scope.attachment_id)
+                            })
+                    {
+                        return Err(ApiError {
+                            code: "Denied".into(),
+                            message: "exact member attachment required".into(),
+                        });
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|_| denied("current renewal authorization denied"))?;
+        self.engine
+            .execute_requiring_endpoint(
+                credential,
+                &crate::runtime_core::ToolRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    tool: "members.heartbeat".into(),
+                    space_id: Some(scope.space_id.clone()),
+                    args: json!({"attachment_id":scope.attachment_id}),
+                },
+                &scope.endpoint_id,
+                "send",
+            )
+            .map_err(|_| denied("attachment renewal denied"))?;
         Ok(())
     }
     /// Trusted management entry point; never deserialize an approval from HTTP.

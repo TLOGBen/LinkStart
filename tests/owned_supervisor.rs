@@ -401,8 +401,15 @@ impl Fixture {
         }
     }
     fn new() -> Self {
+        Self::with_clock(None)
+    }
+    fn with_clock(clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let engine = Engine::open(dir.path()).unwrap();
+        let engine = match clock {
+            Some(clock) => Engine::open_with_clock(dir.path(), clock),
+            None => Engine::open(dir.path()),
+        }
+        .unwrap();
         let owner = std::fs::read_to_string(owner_token_path(dir.path())).unwrap();
         let space = exec(
             &engine,
@@ -812,7 +819,10 @@ fn queue_is_bounded_and_queued_work_has_inspectable_status() {
 
 #[test]
 fn heartbeat_never_extends_root_credential_expiry() {
-    let mut f = Fixture::new();
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let time = Arc::new(AtomicU64::new(1000));
+    let clock_time = time.clone();
+    let mut f = Fixture::with_clock(Some(Arc::new(move || clock_time.load(Ordering::SeqCst))));
     let rotated = exec(
         &f.engine,
         &f.admin,
@@ -822,6 +832,7 @@ fn heartbeat_never_extends_root_credential_expiry() {
     );
     f.token = rotated["credential"].as_str().unwrap().into();
     let original_expiry = rotated["credential_expires_at"].clone();
+    assert_eq!(original_expiry, json!(3000));
     let s = f.supervisor();
     s.start(
         f.config(false),
@@ -831,6 +842,62 @@ fn heartbeat_never_extends_root_credential_expiry() {
     )
     .unwrap();
     f.running(&s);
+    // Start-up uses a fixed Engine clock; real worker scheduling cannot expire it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if s.get(&f.token, &f.scope)
+            .unwrap()
+            .heartbeat_last_success_ms
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "initial heartbeat did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // A renewal immediately before expiry must not move the credential deadline.
+    time.store(2999, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let members = exec(
+            &f.engine,
+            &f.admin,
+            Some(&f.scope.space_id),
+            "members.list",
+            json!({}),
+        );
+        let member = members["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["id"] == f.scope.identity_id)
+            .unwrap();
+        assert_eq!(member["credential_expires_at"], original_expiry);
+        if member["attachments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attachment| {
+                attachment["attachment_id"] == f.scope.attachment_id
+                    && attachment["last_seen"] == 2999
+            })
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pre-expiry heartbeat did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    time.store(3000, Ordering::SeqCst);
+    assert!(matches!(
+        s.get(&f.token, &f.scope),
+        Err(SupervisorError::Denied)
+    ));
     let deadline = Instant::now() + Duration::from_secs(7);
     while s.active_count() > 0 {
         assert!(Instant::now() < deadline);
