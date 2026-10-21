@@ -81,7 +81,7 @@ pub struct Engine {
 pub fn owner_token_path(dir: &Path) -> PathBuf {
     dir.join("v2-owner.token")
 }
-fn protect(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn protect(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -502,6 +502,20 @@ impl Engine {
             .map(|i| hash(credential) == hash(&i.secret))
             .unwrap_or(false)
     }
+    pub(crate) fn private_storage_directory(&self) -> anyhow::Result<PathBuf> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?;
+        let path = inner
+            .db
+            .path()
+            .ok_or_else(|| anyhow::anyhow!("runtime database has no file path"))?;
+        let parent = Path::new(path)
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("runtime database has no parent directory"))?;
+        Ok(parent.canonicalize()?)
+    }
     pub fn execute_requiring_endpoint(
         &self,
         credential: &str,
@@ -516,6 +530,97 @@ impl Engine {
             Some((endpoint_id, operation)),
             None,
         )
+    }
+    /// Admit a bounded local operation while fencing credential/grant writers across Engines.
+    /// Lock order is core mutex + SQLite IMMEDIATE, then the caller's ledger transaction.
+    /// The callback must not reenter Engine, wait for events, or invoke external providers.
+    /// The callback's durable transaction is its own commit; this is not distributed atomicity.
+    pub fn with_endpoint_authorization<T>(
+        &self,
+        credential: &str,
+        space_id: &str,
+        endpoint_id: &str,
+        operation: &str,
+        action: impl FnOnce(&Value) -> Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        if !["observe", "send", "control", "manage"].contains(&operation) {
+            return Err(err("Invalid", "invalid endpoint dispatch operation"));
+        }
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| err("Internal", "runtime lock poisoned"))?;
+        let owner = hash(credential) == hash(&inner.secret);
+        // Deferred WAL readers do not fence another connection's revocation commit.
+        let tx = inner
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let encoded: String = tx
+            .query_row("SELECT json FROM core_state WHERE id=1", [], |r| r.get(0))
+            .map_err(internal)?;
+        let mut state: State = serde_json::from_str(&encoded).map_err(internal)?;
+        let time = (self.clock)();
+        let member = state
+            .members
+            .iter()
+            .find(|m| m["credential_hash"] == hash(credential) && credential_active(m, time))
+            .cloned();
+        if !owner && member.is_none() {
+            return Err(err("Unauthenticated", "invalid credential"));
+        }
+        if !owner && !member.as_ref().is_some_and(|m| m["space_id"] == space_id) {
+            return Err(err("Denied", "space membership required"));
+        }
+        let endpoint = state
+            .endpoints
+            .iter()
+            .find(|e| e["id"] == endpoint_id && e["space_id"] == space_id)
+            .ok_or_else(|| err("NotFound", "dispatch endpoint not found in requested space"))?
+            .clone();
+        if endpoint["kind"] == "github"
+            && (endpoint["source_authority"]["space_id"] != space_id
+                || !endpoint["source_authority"]["approved_by"].is_string())
+        {
+            return Err(err(
+                "Denied",
+                "legacy GitHub endpoint lacks repository approval",
+            ));
+        }
+        let identity_id = if owner {
+            "owner"
+        } else {
+            member
+                .as_ref()
+                .and_then(|m| m["id"].as_str())
+                .ok_or_else(|| err("Internal", "invalid member identity"))?
+        };
+        let manager = owner || member.as_ref().is_some_and(|m| admin(&m["roles"]));
+        if !manager
+            && !endpoint["grants"][identity_id]
+                .as_array()
+                .is_some_and(|ops| ops.iter().any(|op| op == operation))
+        {
+            return Err(err("Denied", "current endpoint dispatch grant required"));
+        }
+        {
+            let mut statement = tx.prepare("SELECT id,space_id,identity_id,last_seen FROM core_attachments WHERE space_id=?1").map_err(internal)?;
+            state.attachments = statement.query_map([space_id], |row| Ok(json!({"id":row.get::<_,String>(0)?,"space_id":row.get::<_,String>(1)?,"identity_id":row.get::<_,String>(2)?,"last_seen":row.get::<_,u64>(3)?})))
+                .map_err(internal)?.collect::<Result<Vec<_>,_>>().map_err(internal)?;
+        }
+        let identity = if owner {
+            json!({"id":"owner","kind":"owner","roles":[],"space_id":null})
+        } else {
+            member_view(&state, member.as_ref().unwrap(), time)
+        };
+        let snapshot = json!({
+            "identity_id":identity_id, "identity":identity, "endpoint":endpoint,
+            "activity":state.events.iter().filter(|e| e["space_id"] == space_id).collect::<Vec<_>>(),
+            "topics":state.topics.iter().filter(|t| t["space_id"] == space_id).collect::<Vec<_>>()
+        });
+        // Read-only core transaction intentionally rolls back on drop after callback.
+        // No post-callback fallible core commit can obscure a committed ledger result.
+        action(&snapshot)
     }
     pub fn execute_requiring_role(
         &self,
