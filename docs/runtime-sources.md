@@ -42,7 +42,8 @@ manage authority. Worker dispatch and projection also recheck current authority.
 
 Source identity uses GitHub global node IDs; PRs are excluded from issue listings
 before separate PR ingestion. Stable topics retain the original body and source
-provenance; changed revisions append comments/events. Structured provenance records
+provenance; changed revisions append comments/events containing the new source title
+and body, including title-only changes. Structured provenance records
 the approved endpoint/repository, source/version, original author and external trust.
 Untrusted source content grants no authority. Acknowledged older checkpoints cannot
 append the same old revision again. Interrupted running/applying jobs reopen as
@@ -88,6 +89,9 @@ For shutdown call `watches.cancel_all()` before `jobs.cancel_all()` and wait unt
 **both** `active_count()` values reach zero. Accepted stop or cancellation is not
 process-exit evidence. One manager/service owner per state directory is required;
 multi-daemon fencing and arbitrary subprocess descendant containment are not supplied.
+SourceJobs admission, cancellation and active-count observation share one fence:
+`cancel_all()` waits for prior admission to commit and count/spawn (or reject) before
+returning. No earlier uncounted admission can appear after shutdown observes drain.
 
 ## Executable public consumer
 

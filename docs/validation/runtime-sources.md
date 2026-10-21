@@ -60,3 +60,27 @@ execution, multi-daemon fencing, arbitrary process-tree containment and power-lo
 recovery are not claimed. Existing v1 HTTP regressions do not establish source HTTP
 integration. Prior dirty implementation binaries/live-chain records are not exact-
 head evidence for this library PR.
+
+## Follow-up: retained F1/F2 from independent review
+
+F1 RED used public SourceJobs sync then Engine topics.read after changing only the
+fake upstream title. The second source comment existed but omitted the new title.
+GREEN adds the title to the immutable revision comment; the regression also checks
+original topic title/body/provenance/workflow and the human comment remain intact.
+
+F2 RED paused real public start admission on a separate SQLite BEGIN IMMEDIATE lock;
+the actual busy handler confirmed admission reached the locked storage boundary.
+Cancellation returned and observed zero before that earlier admission could commit,
+count and spawn. GREEN serializes start through durable commit/accounting/spawn with
+cancel_all and active_count using one admission mutex. RAII worker accounting and
+bounded process cancellation remain unchanged. The test releases the real DB lock,
+joins both callers, drains workers, and checks post-cancel start is rejected; no
+product timeout was increased and no fake SourceJobs/Engine was substituted.
+
+Both targeted REDs failed for the reported behavior and both GREENs pass. Follow-up
+logs and the new exact-head manifest live in the main implementation checkout under
+`.codex/implementation/source-library-fixes/`. The new all-target gate has 57
+top-level tests (47 library plus the unchanged 10 baseline integration tests).
+The final status-save error lead was inspected but is not part of these fixes;
+failure injection and its behavior remain unverified. Existing live-write/model/
+platform limits above remain in force. Independent gates must review the new head.

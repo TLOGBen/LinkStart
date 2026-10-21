@@ -37,6 +37,7 @@ pub struct SourceJobs {
     db: Arc<Mutex<Connection>>,
     cancel: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
+    admission: Arc<Mutex<()>>,
     gates: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -121,6 +122,7 @@ impl SourceJobs {
             db: Arc::new(Mutex::new(db)),
             cancel: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicUsize::new(0)),
+            admission: Arc::new(Mutex::new(())),
             gates: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
@@ -177,6 +179,8 @@ impl SourceJobs {
         credential: &str,
         request: &ToolRequest,
     ) -> Result<SourceJobSnapshot, ApiError> {
+        // Serialize admission through durable commit, accounting and spawn with shutdown.
+        let _admission = self.admission.lock().map_err(storage)?;
         if self.cancel.load(Ordering::SeqCst) {
             return Err(error(
                 "ShuttingDown",
@@ -751,7 +755,7 @@ impl SourceJobs {
                     &format!("source:revision:{key}:{fingerprint}"),
                     "task.act",
                     &record.snapshot.space_id,
-                    json!({"topic_id":topic,"action":"comment","comment":format!("GitHub source revision\n\n{}",source_body(snapshot)),"expected_revision":current["topic"]["revision"]}),
+                    json!({"topic_id":topic,"action":"comment","comment":format!("GitHub source revision\nTitle: {}\n\n{}",snapshot.title,source_body(snapshot)),"expected_revision":current["topic"]["revision"]}),
                 ),
             });
             self.save_projection(&key, &projection)?;
@@ -780,9 +784,11 @@ impl SourceJobs {
         Ok(record.snapshot)
     }
     pub fn cancel_all(&self) {
+        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
         self.cancel.store(true, Ordering::SeqCst);
     }
     pub fn active_count(&self) -> usize {
+        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
         self.active.load(Ordering::SeqCst)
     }
 }
@@ -833,6 +839,157 @@ mod tests {
     use crate::{runtime_core::owner_token_path, runtime_source::tests::Fixture};
     use serde_json::json;
     use std::time::{Duration, Instant};
+    #[test]
+    fn title_only_revision_is_visible_without_replacing_original_or_human_work() {
+        let fixture = Fixture::new();
+        let (dir, engine, admin, sid, eid) = setup();
+        let config = fixture.config.clone();
+        let jobs = SourceJobs::open_with_config_factory(
+            &dir.path().join("jobs"),
+            engine.clone(),
+            Arc::new(move |_, _| Ok(config.clone())),
+        )
+        .unwrap();
+        jobs.start(
+            &admin,
+            &request(
+                "title-first",
+                "sources.sync",
+                Some(&sid),
+                json!({"endpoint_id":eid}),
+            ),
+        )
+        .unwrap();
+        let first = wait(&jobs, &admin, "title-first");
+        assert_eq!(first.status, "completed");
+        let read = |id: &str| {
+            engine
+                .execute(
+                    &admin,
+                    &request(
+                        "title-read",
+                        "topics.read",
+                        Some(&sid),
+                        json!({"topic_id":id}),
+                    ),
+                )
+                .unwrap()
+        };
+        let topic = first
+            .topic_ids
+            .iter()
+            .find(|id| read(id)["topic"]["title"] == "Issue snapshot")
+            .unwrap();
+        let original = read(topic)["topic"].clone();
+        engine.execute(&admin, &request("title-human", "task.act", Some(&sid), json!({"topic_id":topic,"action":"comment","comment":"Human work remains","expected_revision":0}))).unwrap();
+        let issue_path = fixture.dir.path().join("issues.json");
+        let mut issues: Value =
+            serde_json::from_slice(&std::fs::read(&issue_path).unwrap()).unwrap();
+        // Only the title changes: fingerprint/projection must cover the same source facts.
+        issues[0][0]["title"] = json!("New upstream title");
+        std::fs::write(issue_path, serde_json::to_vec(&issues).unwrap()).unwrap();
+        jobs.start(
+            &admin,
+            &request(
+                "title-second",
+                "sources.sync",
+                Some(&sid),
+                json!({"endpoint_id":eid}),
+            ),
+        )
+        .unwrap();
+        let second = wait(&jobs, &admin, "title-second");
+        assert_eq!(second.status, "completed");
+        assert_eq!(second.topic_ids, first.topic_ids);
+        let view = read(topic);
+        for field in [
+            "title",
+            "body",
+            "provenance",
+            "state",
+            "assignee",
+            "current_submission",
+        ] {
+            assert_eq!(
+                view["topic"][field], original[field],
+                "original {field} must remain intact"
+            );
+        }
+        assert_eq!(view["comments"][0]["comment"], "Human work remains");
+        assert_eq!(view["comments"].as_array().unwrap().len(), 2);
+        assert!(
+            view["comments"][1]["comment"]
+                .as_str()
+                .unwrap()
+                .contains("New upstream title"),
+            "title-only source revision must expose its new title to the Engine consumer: {view}"
+        );
+    }
+
+    #[test]
+    fn cancellation_fences_sql_blocked_admission_before_reporting_drain() {
+        use std::sync::mpsc;
+        static ADMISSION_BLOCKED: AtomicBool = AtomicBool::new(false);
+        fn busy(_: i32) -> bool {
+            ADMISSION_BLOCKED.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1));
+            true
+        }
+        let fixture = Fixture::new();
+        let (dir, engine, admin, sid, eid) = setup();
+        let config = fixture.config.clone();
+        let path = dir.path().join("jobs");
+        let jobs = SourceJobs::open_with_config_factory(
+            &path,
+            engine,
+            Arc::new(move |_, _| Ok(config.clone())),
+        )
+        .unwrap();
+        jobs.db.lock().unwrap().busy_handler(Some(busy)).unwrap();
+        let blocker = Connection::open(path.join("source-jobs.sqlite3")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let starter = jobs.clone();
+        let actor = admin.clone();
+        let req = request(
+            "queued-admission",
+            "sources.sync",
+            Some(&sid),
+            json!({"endpoint_id":eid}),
+        );
+        let start_request = req.clone();
+        let start = std::thread::spawn(move || starter.start(&actor, &start_request));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ADMISSION_BLOCKED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "real SQLite admission must reach the held write lock"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let canceller = jobs.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let cancel = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            canceller.cancel_all();
+            done_tx.send(canceller.active_count()).unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let premature_drain = done_rx.recv_timeout(Duration::from_millis(150)).ok();
+        // Release actual storage before asserting, so RED also joins/drains its workers.
+        blocker.execute_batch("COMMIT").unwrap();
+        let accepted = start.join().unwrap().unwrap();
+        cancel.join().unwrap();
+        while jobs.active_count() != 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(jobs.start(&admin, &req).unwrap_err().code, "ShuttingDown");
+        assert_eq!(accepted.job_id, "queued-admission");
+        assert!(!["running", "applying"]
+            .contains(&jobs.get(&admin, &accepted.job_id).unwrap().status.as_str()));
+        assert_eq!(premature_drain, None, "cancel returned and observed zero while a prior admission could still commit/count/spawn");
+    }
     fn request(id: &str, name: &str, space: Option<&str>, args: Value) -> ToolRequest {
         ToolRequest {
             request_id: id.into(),
