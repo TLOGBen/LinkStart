@@ -195,11 +195,15 @@ fn fixture_child() -> FixtureChild {
     FixtureChild(child)
 }
 
-fn scripted_shutdown(reply: &str) -> (TcpListener, std::sync::mpsc::Receiver<Vec<Value>>) {
+fn scripted_shutdown(
+    reply: &str,
+    pid: u32,
+) -> (TcpListener, std::sync::mpsc::Receiver<Vec<Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let serving = listener.try_clone().unwrap();
     serving.set_nonblocking(true).unwrap();
     let reply = reply.to_string();
+    let address = listener.local_addr().unwrap().to_string();
     let (send, receive) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -224,6 +228,17 @@ fn scripted_shutdown(reply: &str) -> (TcpListener, std::sync::mpsc::Receiver<Vec
             if headers.is_empty() {
                 continue;
             } // listener-exit probes carry no request
+            if headers.starts_with("GET /v1/health HTTP/1.1\r\n") {
+                assert!(!headers.contains("Authorization:"));
+                let body = serde_json::json!({"status":"ready","pid":pid,"address":address,"instanceId":"fixture-instance","version":env!("CARGO_PKG_VERSION"),"protocolMajor":"v1"}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                continue;
+            }
             assert!(headers.starts_with("POST /v2/tools HTTP/1.1\r\n"));
             assert!(headers.contains("Authorization: Bearer fixture-owner\r\n"));
             let length: usize = headers
@@ -262,9 +277,9 @@ fn pending_or_uncertain_shutdown_never_kills_recorded_process_or_restarts() {
         for action in ["stop", "restart"] {
             let dir = TempDir::new().unwrap();
             let child = fixture_child();
-            let (listener, requests) = scripted_shutdown(response);
+            let (listener, requests) = scripted_shutdown(response, child.0.id());
             let address = listener.local_addr().unwrap();
-            let record = serde_json::json!({"pid":child.0.id(),"address":address.to_string(),"version":env!("CARGO_PKG_VERSION"),"protocolMajor":"v1"});
+            let record = serde_json::json!({"pid":child.0.id(),"address":address.to_string(),"version":env!("CARGO_PKG_VERSION"),"protocolMajor":"v1","instanceId":"fixture-instance"});
             let bytes = serde_json::to_vec(&record).unwrap();
             std::fs::write(dir.path().join("daemon.json"), &bytes).unwrap();
             std::fs::write(dir.path().join("v2-owner.token"), "fixture-owner\n").unwrap();

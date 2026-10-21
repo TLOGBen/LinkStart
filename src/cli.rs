@@ -84,6 +84,8 @@ pub(crate) struct StartArgs {
 }
 #[derive(Deserialize)]
 pub(crate) struct DaemonRecord {
+    #[serde(default, rename = "instanceId")]
+    pub(crate) instance_id: Option<String>,
     pub(crate) pid: u32,
     pub(crate) address: String,
     pub(crate) version: String,
