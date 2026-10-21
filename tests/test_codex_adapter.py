@@ -850,6 +850,29 @@ class CodexOriginAdapterTest(unittest.TestCase):
         )
         self.assertTrue(context_deleted)
 
+    @unittest.skipUnless(os.name == "nt", "Windows process handle semantics")
+    def test_process_alive_preserves_child_and_detects_exit(self) -> None:
+        child = subprocess.Popen(
+            [sys.executable, "-u", "-c",
+             "print('ready', flush=True); input(); print('still-alive', flush=True)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8",
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
+        )
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            self.assertTrue(adapter.process_alive(child.pid))
+            output, error = child.communicate("continue\n", timeout=5)
+            self.assertEqual(output.strip(), "still-alive", error)
+            self.assertEqual(child.returncode, 0)
+            self.assertFalse(adapter.process_alive(child.pid))
+            self.assertFalse(adapter.process_alive(0))
+            self.assertFalse(adapter.process_alive(0x100000000))
+        finally:
+            if child.poll() is None:
+                child.terminate()
+            child.communicate(timeout=5)
+
     def test_adapter_cli_parent_exit_keeps_lease_armed_until_explicit_close(self) -> None:
         capability = "a" * 64
         with tempfile.TemporaryDirectory() as directory:
@@ -935,6 +958,14 @@ class CodexOriginAdapterTest(unittest.TestCase):
                 encoding="utf-8",
                 timeout=10,
             )
+            lease = sqlite3.connect(adapter.default_lease_path(context_path))
+            try:
+                lease_diagnostics = dict(lease.execute(
+                    "SELECT key,value FROM lease_meta "
+                    "WHERE key IN ('leaseStatus', 'error', 'desiredState')"
+                ))
+            finally:
+                lease.close()
             closed = subprocess.run(
                 [
                     sys.executable,
@@ -952,7 +983,9 @@ class CodexOriginAdapterTest(unittest.TestCase):
             )
 
         self.assertEqual(json.loads(start.stdout)["leaseStatus"], "armed")
-        self.assertEqual(json.loads(status.stdout)["leaseStatus"], "armed")
+        self.assertEqual(
+            json.loads(status.stdout)["leaseStatus"], "armed", lease_diagnostics
+        )
         self.assertEqual(json.loads(closed.stdout)["leaseStatus"], "closed")
 
     def test_runtime_helper_exposes_adapter_without_removing_foreground_commands(self) -> None:

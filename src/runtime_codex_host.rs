@@ -49,6 +49,32 @@ pub struct HostScope {
     pub session_id: String,
     pub binding_generation: u64,
 }
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTurnOutcome {
+    InProgress,
+    Completed,
+    Interrupted,
+    Failed,
+}
+impl ProviderTurnOutcome {
+    pub fn from_status(status: &str) -> Option<Self> {
+        match status {
+            "inProgress" => Some(Self::InProgress),
+            "completed" => Some(Self::Completed),
+            "interrupted" => Some(Self::Interrupted),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct ReconciledOperation {
+    pub operation_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub outcome: ProviderTurnOutcome,
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct ApprovedWorkspace {
     root: PathBuf,
@@ -190,6 +216,81 @@ impl Drop for CallbackLease {
     }
 }
 impl OwnedCodexRegistry {
+    /// Refresh only an actual held, unfenced host's existing attachment. The
+    /// liveness lease participates in lifecycle drain but never holds facts
+    /// across Engine I/O. Initialization need not have created a thread yet.
+    pub fn renew_owned_attachment(
+        &self,
+        scope: &HostScope,
+        credential: &str,
+    ) -> Result<(), HostError> {
+        let _lease = {
+            let mut facts = self.facts.lock().map_err(io)?;
+            let f = facts
+                .get_mut(&scope.session_id)
+                .ok_or_else(|| denied("unknown owned session"))?;
+            if f.scope != *scope
+                || f.fenced_from.is_some()
+                || !f.alive.load(Ordering::Acquire)
+                || f.child
+                    .try_lock()
+                    .map_err(|_| HostError::Idle)?
+                    .try_wait()
+                    .map_err(io)?
+                    .is_some()
+            {
+                return Err(denied("current exact live owned host required"));
+            }
+            f.active_callbacks = f
+                .active_callbacks
+                .checked_add(1)
+                .ok_or_else(|| denied("lease limit"))?;
+            CallbackLease {
+                facts: self.facts.clone(),
+                drained: self.drained.clone(),
+                session: scope.session_id.clone(),
+                instance: f.instance.clone(),
+            }
+        };
+        self.engine
+            .with_endpoint_authorization(
+                credential,
+                &scope.space_id,
+                &scope.endpoint_id,
+                "send",
+                |auth| {
+                    if scope.identity_id == "owner"
+                        || auth["identity_id"] != scope.identity_id
+                        || !auth["identity"]["attachments"]
+                            .as_array()
+                            .is_some_and(|aa| {
+                                aa.iter().any(|a| a["attachment_id"] == scope.attachment_id)
+                            })
+                    {
+                        return Err(ApiError {
+                            code: "Denied".into(),
+                            message: "exact member attachment required".into(),
+                        });
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|_| denied("current renewal authorization denied"))?;
+        self.engine
+            .execute_requiring_endpoint(
+                credential,
+                &crate::runtime_core::ToolRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    tool: "members.heartbeat".into(),
+                    space_id: Some(scope.space_id.clone()),
+                    args: json!({"attachment_id":scope.attachment_id}),
+                },
+                &scope.endpoint_id,
+                "send",
+            )
+            .map_err(|_| denied("attachment renewal denied"))?;
+        Ok(())
+    }
     /// Trusted protected-plan recovery only. Never expose persisted to HTTP.
     pub(crate) fn restore_workspace_approval(
         &self,
@@ -1109,6 +1210,14 @@ impl OwnedCodexHost {
     /// Positive exact user-message evidence only. Missing/truncated history stays
     /// unknown. This method never starts a replacement turn or a new thread.
     pub fn reconcile_operation(&mut self, operation_id: &str) -> Result<String, HostError> {
+        self.reconcile_operation_observation(operation_id)
+            .map(|observed| observed.turn_id)
+    }
+    /// Exact provider evidence; terminal outcome is distinct from forum/task success.
+    pub fn reconcile_operation_observation(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<ReconciledOperation, HostError> {
         let thread = self
             .thread
             .clone()
@@ -1161,17 +1270,16 @@ impl OwnedCodexHost {
                 operation_id: operation_id.into(),
             })?
             .to_string();
-        let state = if matched[0]["status"] == "inProgress" {
-            "accepted"
-        } else if ["completed", "interrupted", "failed"]
-            .iter()
-            .any(|s| matched[0]["status"] == *s)
-        {
-            "completed"
-        } else {
-            return Err(HostError::Unknown {
+        let outcome = matched[0]["status"]
+            .as_str()
+            .and_then(ProviderTurnOutcome::from_status)
+            .ok_or_else(|| HostError::Unknown {
                 operation_id: operation_id.into(),
-            });
+            })?;
+        let state = if outcome == ProviderTurnOutcome::InProgress {
+            "accepted"
+        } else {
+            "completed"
         };
         if state == "accepted" {
             if self
@@ -1202,7 +1310,12 @@ impl OwnedCodexHost {
             )
             .map_err(io)?;
         self.publish(unknown == 0)?;
-        Ok(turn)
+        Ok(ReconciledOperation {
+            operation_id: operation_id.into(),
+            thread_id: thread,
+            turn_id: turn,
+            outcome,
+        })
     }
     pub fn interrupt(&mut self) -> Result<Value, HostError> {
         let t = self
