@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
+import shutil
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -21,6 +25,74 @@ SPEC.loader.exec_module(release)
 
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 WORKFLOW_RUN = "https://github.com/TLOGBen/LinkStart/actions/runs/123/attempts/1"
+
+
+@unittest.skipUnless(os.name == "nt", "Windows pwsh native exit semantics")
+class WindowsWorkflowExitTest(unittest.TestCase):
+    def test_every_native_failure_stops_the_actual_workflow_block(self) -> None:
+        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+        windows = workflow.split("  windows-x64:\n", 1)[1].split("  macos-universal:\n", 1)[0]
+        blocks = re.findall(r"        run: \|\n((?:          .*\n|\n)+)", windows)
+        self.assertEqual(len(blocks), 3)
+        pwsh = shutil.which("pwsh")
+        self.assertIsNotNone(pwsh, "Windows release validation requires pwsh")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stub = root / "native.py"
+            stub.write_text(
+                "import os, pathlib, sys\n"
+                "with pathlib.Path(os.environ['NATIVE_TRACE']).open('a') as trace:\n"
+                "    trace.write(sys.argv[1] + '\\n')\n"
+                "print('stub-native-output')\n"
+                "sys.exit(23 if sys.argv[1] == os.environ.get('NATIVE_FAIL') else 0)\n",
+                encoding="utf-8",
+            )
+            quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+            for block_index, block in enumerate(blocks):
+                body = "\n".join(line[10:] for line in block.splitlines()) + "\n"
+                calls: list[str] = []
+
+                def replace_native(match: re.Match) -> str:
+                    call = str(len(calls))
+                    calls.append(call)
+                    return (match[1] + (match[2] or "") + "& " + quote(sys.executable)
+                            + " " + quote(stub) + " " + call)
+
+                # Substitute only the executable, retaining assignments, arguments,
+                # multiline continuations, pipelines, guards and runner epilogue.
+                body = re.sub(
+                    r"(?m)^( *)(\$rustcVersion = )?"
+                    r"(?:rustup|cargo|python|rustc|& target\\[^\s]+\.exe)(?= )",
+                    replace_native,
+                    body,
+                )
+                self.assertGreater(len(calls), 0)
+                script = root / "step.ps1"
+                script.write_text(
+                    "$ErrorActionPreference = 'stop'\n" + body
+                    + "& " + quote(sys.executable) + " " + quote(stub) + " sentinel\n"
+                    + "if ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) { exit $LASTEXITCODE }\n",
+                    encoding="utf-8",
+                )
+                for failing in [None, *calls]:
+                    with self.subTest(block=block_index, native=failing):
+                        trace = root / "trace.txt"
+                        if trace.exists():
+                            trace.unlink()
+                        environment = os.environ.copy()
+                        environment.update(NATIVE_TRACE=str(trace), NATIVE_FAIL=failing or "")
+                        result = subprocess.run(
+                            [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)],
+                            cwd=root, env=environment, capture_output=True, text=True,
+                            encoding="utf-8", timeout=30,
+                        )
+                        actual = trace.read_text(encoding="utf-8").splitlines()
+                        if failing is None:
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(actual, [*calls, "sentinel"])
+                        else:
+                            self.assertEqual(result.returncode, 23, (actual, result.stderr))
+                            self.assertEqual(actual, calls[: int(failing) + 1])
 
 
 def assert_plugin_consumer_contract(manifest: dict) -> None:

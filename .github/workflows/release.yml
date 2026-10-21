@@ -79,22 +79,33 @@ jobs:
         shell: pwsh
         run: |
           rustup toolchain install $env:RUST_VERSION --profile minimal --component rustfmt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default $env:RUST_VERSION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup target add x86_64-pc-windows-msvc --toolchain $env:RUST_VERSION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Compile tests and build native runtime
         shell: pwsh
         run: |
           cargo fmt --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest -v scripts/release/test_release.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m unittest -v tests/test_codex_adapter.py tests/test_claude_adapter.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --all-targets --no-run
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked --release --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           & target\x86_64-pc-windows-msvc\release\linkstart.exe version --json | Out-File -Encoding utf8 version.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Validate native output and record provenance
         shell: pwsh
         run: |
           $sourceTag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { '' }
           $rustcVersion = rustc --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/release/release.py bundle `
             --binary target\x86_64-pc-windows-msvc\release\linkstart.exe `
             --target windows-x64 `
@@ -110,6 +121,7 @@ jobs:
             --runner-arch $env:RUNNER_ARCH `
             --rustc-version $rustcVersion `
             --rust-target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload Windows bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
