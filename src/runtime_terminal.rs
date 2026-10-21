@@ -514,7 +514,7 @@ impl TerminalManager {
 }
 
 #[cfg(windows)]
-mod owned_job {
+pub(crate) mod owned_job {
     use std::{ffi::c_void, io, mem, ptr};
     type Handle = *mut c_void;
     #[repr(C)]
