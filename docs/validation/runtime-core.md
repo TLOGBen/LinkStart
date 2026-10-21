@@ -42,3 +42,11 @@ This is author implementation evidence; independent prove-it/review against the 
 - Public `runtime_core` example passed twice against the same disposable state directory; owner credentials were not printed.
 - Build output uses a dedicated external `CARGO_TARGET_DIR`. Moving an already-built target directory exposed stale compiled `CARGO_BIN_EXE` paths in HTTP tests; rebuilding this package restored the all-target gate. The failed run remains in the evidence bundle.
 - Raw RED/GREEN/final logs and version manifest: main checkout `.codex/implementation/pr2-storage-fix/`; no token, DB or build output is committed. Windows tested; Unix execution, second-account login, unsupported/network filesystem semantics and power loss remain unverified.
+
+## Minimum compiler follow-up after independent F3 (2026-10-21)
+
+The storage OS lock uses `std::fs::File::lock` (stable since Rust 1.89). The package now declares `rust-version = "1.89"`, and the release workflow's shared `RUST_VERSION` is `1.89.0` for its Linux, Windows and macOS compiler consumers. The historical `rustc 1.88.0 (fixture)` provenance test value is unchanged because it is test data, not a compiler selection.
+
+Author verification uses explicit `cargo +1.89.0` with a separate external target directory; no global toolchain default changes. Windows `test --all-targets --locked` passes all 34 top-level tests, and the public example passes twice against the same disposable directory. Exact-head logs and manifest are retained in the main checkout `.codex/implementation/pr2-toolchain-fix/`.
+
+This validates the configured minimum on Windows only. It does not claim that the complete three-platform release workflow is green. Linux/macOS jobs and Python workflow steps are not rerun here; the separate known Windows Python v1 process-liveness issue is outside this toolchain-only patch. Independent exact-head proof/review remain required.
