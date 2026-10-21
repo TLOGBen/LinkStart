@@ -61,6 +61,10 @@ Every root handoff/recovery, session registration/retirement, journal append,
 rotation and checkpoint replacement uses the same OS file lock while checking
 current writer authority. This also serializes cooperating processes sharing the
 root; it assumes all writers use this library and the filesystem honors OS locks.
+The lock is scoped to the canonical connection root, including in-process reads
+and writes. Waiting for an unrelated root's OS lock does not hold a shared
+process-wide gate. There is no static registry of roots to retain abandoned
+entries; canonical path aliases still reach the same underlying OS lock file.
 Registration and retention run on the history writer thread and synchronously
 return their result; no queue reply is awaited while holding mutation authority.
 The lock file is persistent and must not be removed/replaced while stores exist.

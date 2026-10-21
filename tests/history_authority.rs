@@ -267,3 +267,102 @@ fn admission_queued_before_eof_cannot_overtake_later_tail_chunks() {
     next.close_output();
     history.shutdown_flush(Duration::from_secs(3)).unwrap();
 }
+
+#[test]
+fn unrelated_root_lock_wait_does_not_block_healthy_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = HistoryStore::open(&dir.path().join("a"), retention()).unwrap();
+    let a_sink = a.record_session("endpoint", &view("healthy-a")).unwrap();
+    assert!(a_sink.output(b"healthy root A baseline"));
+    a.flush(Duration::from_secs(1)).unwrap();
+    let b_path = dir.path().join("b");
+    let b = HistoryStore::open(&b_path, retention()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(b_path.join("connections/.writer-lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let (started, ready) = std::sync::mpsc::channel();
+    let blocked = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        let sink = b.record_session("endpoint", &view("blocked-b"))?;
+        sink.close_output();
+        b.shutdown_flush(Duration::from_secs(3))
+    });
+    ready.recv_timeout(Duration::from_secs(3)).unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(a_sink.output(b"healthy root A while B waits"));
+    let start = std::time::Instant::now();
+    let flushed = a.flush(Duration::from_secs(1));
+    println!(
+        "unrelated-root A flush elapsed={:?}, result={flushed:?}",
+        start.elapsed()
+    );
+    let reader = a.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reading = std::thread::spawn(move || {
+        let _ = tx.send(reader.read("endpoint", "healthy-a", 0, 1000));
+    });
+    let independent_read = rx.recv_timeout(Duration::from_secs(1));
+    // Always release this run's lock/join its workers before asserting, including RED.
+    drop(lock);
+    blocked.join().unwrap().unwrap();
+    reading.join().unwrap();
+    assert!(
+        flushed.is_ok(),
+        "unrelated root B must not consume A's flush budget: {flushed:?}"
+    );
+    let page = independent_read
+        .expect("unrelated root B must not block A's read")
+        .unwrap();
+    let bytes: Vec<_> = page.events.iter().flat_map(|e| e.bytes.clone()).collect();
+    assert_eq!(
+        bytes,
+        b"healthy root A baselinehealthy root A while B waits"
+    );
+    a_sink.close_output();
+    a.shutdown_flush(Duration::from_secs(3)).unwrap();
+}
+
+#[test]
+fn canonical_root_alias_still_waits_for_same_lock_and_fences_old_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("state");
+    let old = HistoryStore::open(&root, retention()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join("connections/.writer-lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let alias = root.join(".");
+    assert_eq!(
+        std::fs::canonicalize(&root).unwrap(),
+        std::fs::canonicalize(&alias).unwrap()
+    );
+    let (ready, started) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let opener = std::thread::spawn(move || {
+        ready.send(()).unwrap();
+        let _ = tx.send(HistoryStore::open(&alias, retention()));
+    });
+    started.recv_timeout(Duration::from_secs(3)).unwrap();
+    let early = rx.recv_timeout(Duration::from_millis(150));
+    drop(lock);
+    let bypassed = early.is_ok();
+    let new = match early {
+        Ok(result) => result,
+        Err(_) => rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+    }
+    .unwrap();
+    opener.join().unwrap();
+    assert!(
+        !bypassed,
+        "canonical alias must not bypass same-root OS authority"
+    );
+    let sink = new.record_session("endpoint", &view("alias-new")).unwrap();
+    sink.close_output();
+    new.shutdown_flush(Duration::from_secs(3)).unwrap();
+    assert!(old.record_session("endpoint", &view("alias-old")).is_err());
+}

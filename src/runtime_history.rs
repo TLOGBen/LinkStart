@@ -188,17 +188,16 @@ fn protect(path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-static FILE_LOCK: Mutex<()> = Mutex::new(());
-// Lock order is process mutex -> root OS lock. No queue reply is awaited while
-// holding either. The OS lock covers writer authority checks AND mutations,
-// including handoff/recovery, registration, retirement and journal/checkpoints.
+// Independently opened handles lock this canonical root's persistent lock file
+// in both the current process and other processes. No process-global gate or
+// per-root registry couples unrelated roots or retains abandoned root entries.
+// No queue reply is awaited while locked. The OS lock covers authority checks
+// AND mutations: handoff/recovery, registration, retirement, journal/checkpoints.
 struct RootMutation {
-    _process: std::sync::MutexGuard<'static, ()>,
     _file: File,
 }
 impl RootMutation {
     fn lock(root: &Path) -> Result<Self, String> {
-        let process = FILE_LOCK.lock().map_err(error)?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -207,10 +206,7 @@ impl RootMutation {
             .open(root.join(".writer-lock"))
             .map_err(error)?;
         file.lock().map_err(error)?;
-        Ok(Self {
-            _process: process,
-            _file: file,
-        })
+        Ok(Self { _file: file })
     }
 }
 fn ensure_root_current(root: &Path, writer: &str) -> Result<(), String> {
@@ -531,7 +527,7 @@ impl HistoryStore {
             return Err("history page limit must be 1..1000".into());
         }
         let mut checkpoint = self.checkpoint(eid, sid)?;
-        let _guard = FILE_LOCK.lock().map_err(error)?;
+        let _guard = RootMutation::lock(&self.inner.root)?;
         if cursor > checkpoint.durable_cursor {
             return Err("history cursor is ahead of durable checkpoint".into());
         }
