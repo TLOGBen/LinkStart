@@ -227,6 +227,12 @@ async fn tools(
             ),
         };
     }
+    if matches!(
+        request.tool.as_str(),
+        "runtime.confirm_shutdown" | "runtime.force_shutdown"
+    ) {
+        return shutdown_tools(state.clone(), token.to_string(), request).await;
+    }
     let Ok(mut guard) = state.gate.lock() else {
         return failure(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -280,6 +286,102 @@ fn reply(result: Result<Value, crate::runtime_core::ApiError>) -> Reply {
     }
 }
 
+async fn shutdown_tools(state: HttpState, actor: String, request: ToolRequest) -> Reply {
+    if !state.engine.is_owner(&actor) {
+        return failure(
+            StatusCode::FORBIDDEN,
+            "Denied",
+            "runtime owner credential required",
+        );
+    }
+    let admission = (|| {
+        let ticket = field(&request.args, "ticket")?;
+        let mut guard = state
+            .gate
+            .lock()
+            .map_err(|_| error("Internal", "dispatch lock poisoned"))?;
+        if guard.ticket.as_ref().is_none_or(|(t, epoch, _, issued)| {
+            t != ticket || *epoch != guard.epoch || issued.elapsed() > Duration::from_secs(60)
+        }) {
+            return Err(error(
+                "StaleImpact",
+                "impact changed or ticket expired; prepare shutdown again",
+            ));
+        }
+        state
+            .owned
+            .begin_shutdown(guard.ticket.as_ref().unwrap().2)?;
+        guard.draining = true;
+        Ok(())
+    })();
+    if let Err(e) = admission {
+        return reply(Err(e));
+    }
+    // Neither terminal cleanup nor history EOF/flush may hold the global gate.
+    let cleanup_state = state.clone();
+    let force = request.tool == "runtime.force_shutdown";
+    let result = tokio::task::spawn_blocking(move || shutdown_cleanup(&cleanup_state, force)).await;
+    match result {
+        Ok(Ok(value)) => {
+            if value["status"] == "stopping" {
+                let stop = state.stop.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let _ = stop.send(true);
+                });
+            }
+            reply(Ok(value))
+        }
+        Ok(Err(e)) => reply(Err(e)),
+        Err(_) => failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal",
+            "shutdown cleanup failed",
+        ),
+    }
+}
+fn shutdown_cleanup(s: &HttpState, force: bool) -> Result<Value, crate::runtime_core::ApiError> {
+    s.agents.cancel_all();
+    s.watches.cancel_all();
+    s.sources.cancel_all();
+    let remaining = if force {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        for session in s.terminals.list() {
+            s.terminals
+                .force_owned(
+                    &session.id,
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                )
+                .map_err(|e| error("NativeError", e))?;
+        }
+        s.terminals
+            .list()
+            .into_iter()
+            .filter(|v| v.status != "exited")
+            .collect::<Vec<_>>()
+    } else {
+        s.terminals.shutdown(Duration::from_millis(500))
+    };
+    let owned = s.owned.inventory();
+    let history_error = if owned.active_workers == 0
+        && owned.launch_reservations == 0
+        && remaining.is_empty()
+        && s.agents.active_count() == 0
+        && s.sources.active_count() == 0
+        && s.watches.active_count() == 0
+    {
+        s.history.shutdown_flush(Duration::from_millis(750)).err()
+    } else {
+        Some("owned processes or workers are still active".into())
+    };
+    if let Some(reason) = history_error {
+        Ok(
+            json!({"status":"pending","owned_sessions":owned,"remaining":remaining,"history_error":reason,"active_agent_jobs":s.agents.active_count(),"active_source_jobs":s.sources.active_count(),"active_source_watches":s.watches.active_count()}),
+        )
+    } else {
+        Ok(json!({"status":"stopping","remaining":remaining,"history":"durable"}))
+    }
+}
 fn error(code: &str, message: impl ToString) -> crate::runtime_core::ApiError {
     crate::runtime_core::ApiError {
         code: code.into(),
@@ -433,69 +535,6 @@ fn dispatch(
                 ));
                 return Ok(
                     json!({"ticket":ticket,"expires_in_seconds":60,"impact":{"spaces":spaces,"endpoints":endpoints,"owned_terminals":s.terminals.list(),"owned_sessions":owned,"active_agent_jobs":s.agents.active_count(),"active_source_jobs":s.sources.active_count(),"active_source_watches":s.watches.active_count(),"scope":"this runtime; other applications excluded","epoch":n.epoch},"status":if n.draining{"pending"}else{"prepared"}}),
-                );
-            }
-            "runtime.confirm_shutdown" | "runtime.force_shutdown" => {
-                let ticket = field(&r.args, "ticket")?;
-                if n.ticket.as_ref().is_none_or(|(t, epoch, _, issued)| {
-                    t != ticket || *epoch != n.epoch || issued.elapsed() > Duration::from_secs(60)
-                }) {
-                    return Err(error(
-                        "StaleImpact",
-                        "impact changed or ticket expired; prepare shutdown again",
-                    ));
-                }
-                s.owned.begin_shutdown(n.ticket.as_ref().unwrap().2)?;
-                n.draining = true;
-                s.agents.cancel_all();
-                s.watches.cancel_all();
-                s.sources.cancel_all();
-                let remaining = if r.tool == "runtime.force_shutdown" {
-                    let deadline = std::time::Instant::now() + Duration::from_secs(1);
-                    for session in s.terminals.list() {
-                        s.terminals
-                            .force_owned(
-                                &session.id,
-                                deadline.saturating_duration_since(std::time::Instant::now()),
-                            )
-                            .map_err(|e| error("NativeError", e))?;
-                    }
-                    s.terminals
-                        .list()
-                        .into_iter()
-                        .filter(|v| v.status != "exited")
-                        .collect::<Vec<_>>()
-                } else {
-                    s.terminals.shutdown(Duration::from_millis(500))
-                };
-                let history_error = if s.owned.inventory().active_workers == 0
-                    && s.owned.inventory().launch_reservations == 0
-                    && remaining.is_empty()
-                    && s.agents.active_count() == 0
-                    && s.sources.active_count() == 0
-                    && s.watches.active_count() == 0
-                {
-                    s.history.shutdown_flush(Duration::from_millis(750)).err()
-                } else {
-                    Some("owned processes or workers are still active".into())
-                };
-                if history_error.is_none() {
-                    let stop = s.stop.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(150)).await;
-                        let _ = stop.send(true);
-                    });
-                    return Ok(
-                        json!({"status":"stopping","remaining":remaining,"history":"durable"}),
-                    );
-                }
-                if let Some(reason) = history_error {
-                    return Ok(
-                        json!({"status":"pending","owned_sessions":s.owned.inventory(),"remaining":remaining,"history_error":reason,"active_agent_jobs":s.agents.active_count(),"active_source_jobs":s.sources.active_count(),"active_source_watches":s.watches.active_count()}),
-                    );
-                }
-                return Ok(
-                    json!({"status":"pending","owned_sessions":s.owned.inventory(),"remaining":remaining,"active_agent_jobs":s.agents.active_count(),"active_source_jobs":s.sources.active_count(),"active_source_watches":s.watches.active_count(),"action":"prepare a fresh impact and explicitly force shutdown, or wait for cancelled jobs to finish"}),
                 );
             }
             _ => return Err(error("Unsupported", "unknown runtime tool")),

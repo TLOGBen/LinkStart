@@ -24,6 +24,7 @@ fn error(code: &str, message: &str) -> ApiError {
         message: message.into(),
     }
 }
+
 fn storage(_: impl std::fmt::Display) -> ApiError {
     error("Internal", "owned control storage unavailable")
 }
@@ -75,6 +76,55 @@ pub struct OwnedInventory {
     pub active_workers: usize,
     pub draining: bool,
 }
+/// Source provenance is internal, not a caller-supplied phase or priority.
+#[derive(Clone, Copy)]
+enum ProjectionSource {
+    Mutation,
+    Observation,
+    NoObservation,
+}
+fn definite_receipt(tool: &str, state: &str) -> bool {
+    state == "rejected"
+        || match tool {
+            "owned.turn" | "owned.interrupt" | "owned.launch" => state == "confirmed",
+            "owned.stop" => state == "exited",
+            _ => false,
+        }
+}
+fn resolves_unknown(source: ProjectionSource, tool: &str, state: &str, body: &Value) -> bool {
+    if !matches!(source, ProjectionSource::Observation) {
+        return false;
+    }
+    // Only a current exact provider ACK/InProgress witness clears uncertainty.
+    // Queued, Dispatching, launch Starting and stop Pending are not completion.
+    tool == "owned.turn"
+        && ((state == "accepted"
+            && body["snapshot"]["phase"] == "Accepted"
+            && body["snapshot"]["provider_turn_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()))
+            || (state == "pending" && body["observation"]["outcome"] == "in_progress"))
+}
+
+fn terminal_outcome(value: &Value) -> bool {
+    matches!(value.as_str(), Some("completed" | "interrupted" | "failed"))
+}
+
+/// Compare verified native facts, never just equal JSON envelope states.
+fn same_turn_fact(retained: &Value, observation: &Value, operation: &str) -> bool {
+    if retained["state"] != "confirmed" || retained["operation_id"] != operation {
+        return false;
+    }
+    if let Some(existing) = retained.get("observation") {
+        return existing == observation;
+    }
+    let snapshot = &retained["snapshot"];
+    snapshot["operation_id"] == operation
+        && snapshot["phase"] == "Confirmed"
+        && terminal_outcome(&snapshot["provider_outcome"])
+        && snapshot["provider_outcome"] == observation["outcome"]
+        && snapshot["provider_turn_id"] == observation["turn_id"]
+}
 pub struct OwnedControlBridge {
     path: PathBuf,
     engine: Engine,
@@ -83,6 +133,8 @@ pub struct OwnedControlBridge {
     participants: Arc<ParticipantService>,
     plans: Arc<LaunchPolicyStore>,
     admission: Mutex<Admission>,
+    #[cfg(test)]
+    projection_test_hook: Mutex<Option<Arc<dyn Fn(&str, &str) + Send + Sync>>>,
 }
 struct Reservation<'a>(&'a OwnedControlBridge);
 impl Drop for Reservation<'_> {
@@ -118,12 +170,25 @@ impl OwnedControlBridge {
         if path.exists() {
             crate::runtime_core::protect(&path)?;
         }
-        let db = Connection::open(&path)?;
+        let mut db = Connection::open(&path)?;
         db.busy_timeout(Duration::from_secs(5))?;
-        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
-          CREATE TABLE IF NOT EXISTS requests(space TEXT NOT NULL,actor TEXT NOT NULL,request TEXT NOT NULL,fingerprint TEXT NOT NULL,operation TEXT UNIQUE NOT NULL,session TEXT NOT NULL,tool TEXT NOT NULL,state TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(space,actor,request));
-          CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,scope TEXT NOT NULL,profile TEXT NOT NULL,status TEXT);
-          UPDATE requests SET state='unknown',body=json_set(body,'$.state','unknown','$.evidence','runtime reopened; original side effect is not retried') WHERE state IN ('intent','accepted','pending');")?;
+        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS requests(space TEXT NOT NULL,actor TEXT NOT NULL,request TEXT NOT NULL,fingerprint TEXT NOT NULL,operation TEXT UNIQUE NOT NULL,session TEXT NOT NULL,tool TEXT NOT NULL,state TEXT NOT NULL,body TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(space,actor,request));
+          CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,scope TEXT NOT NULL,profile TEXT NOT NULL,status TEXT);")?;
+        let columns = tx
+            .prepare("PRAGMA table_info(requests)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|name| name == "revision") {
+            tx.execute_batch(
+                "ALTER TABLE requests ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        // Recovery is part of the same durable owner transaction. Fence every
+        // unresolved pre-open observation, including an already-Unknown row.
+        tx.execute_batch("UPDATE requests SET state='unknown',body=json_set(body,'$.state','unknown','$.evidence','runtime reopened; original side effect is not retried'),revision=revision+1 WHERE state IN ('intent','accepted','pending','unknown');")?;
+        tx.commit()?;
         crate::runtime_core::protect(&path)?;
         Ok(Self {
             path,
@@ -133,6 +198,8 @@ impl OwnedControlBridge {
             participants,
             plans,
             admission: Mutex::new(Admission::default()),
+            #[cfg(test)]
+            projection_test_hook: Mutex::new(None),
         })
     }
     fn db(&self) -> Result<Connection, ApiError> {
@@ -217,14 +284,122 @@ impl OwnedControlBridge {
         }
         Ok(scope)
     }
-    fn save(&self, operation: &str, state: &str, body: &Value) -> Result<(), ApiError> {
-        self.db()?
-            .execute(
-                "UPDATE requests SET state=?1,body=?2 WHERE operation=?3",
-                params![state, body.to_string(), operation],
+    /// The sole projection owner: merge under IMMEDIATE, retain irreversible
+    /// evidence, fence stale non-final snapshots, and return what was committed.
+    fn save(
+        &self,
+        operation: &str,
+        observed_revision: u64,
+        source: ProjectionSource,
+        state: &str,
+        body: &Value,
+    ) -> Result<Value, ApiError> {
+        #[cfg(test)]
+        {
+            let hook = self.projection_test_hook.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook(operation, state);
+            }
+        }
+        if body["operation_id"] != operation || body["state"] != state {
+            return Err(error(
+                "Internal",
+                "receipt projection identity/state mismatch",
+            ));
+        }
+        let mut db = self.db()?;
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let (tool, current_state, encoded, revision, session): (
+            String,
+            String,
+            String,
+            u64,
+            String,
+        ) = tx
+            .query_row(
+                "SELECT tool,state,body,revision,session FROM requests WHERE operation=?1",
+                [operation],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .map_err(storage)?;
-        Ok(())
+        let retained: Value = serde_json::from_str(&encoded).map_err(storage)?;
+        let mut enriched = None;
+        if tool == "owned.turn" && state == "confirmed" && body.get("observation").is_some() {
+            let observation = &body["observation"];
+            let scope: String = tx
+                .query_row("SELECT scope FROM sessions WHERE id=?1", [&session], |r| {
+                    r.get(0)
+                })
+                .map_err(storage)?;
+            let scope: HostScope = serde_json::from_str(&scope).map_err(storage)?;
+            let metadata = self
+                .registry
+                .durable_thread_metadata(&scope)
+                .map_err(|_| error("Conflict", "exact durable thread evidence unavailable"))?
+                .ok_or_else(|| error("Conflict", "exact durable thread evidence unavailable"))?;
+            if observation["operation_id"] != operation
+                || observation["thread_id"] != metadata.provider_thread_id
+                || !observation["turn_id"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+                || !terminal_outcome(&observation["outcome"])
+            {
+                return Err(error(
+                    "Conflict",
+                    "typed observation differs from exact operation binding",
+                ));
+            }
+            if definite_receipt(&tool, &current_state) {
+                if !same_turn_fact(&retained, observation, operation) {
+                    return Err(error(
+                        "Conflict",
+                        "typed observation contradicts retained operation evidence",
+                    ));
+                }
+                let mut merged = retained.clone();
+                // Preserve every original field/result; only add absent evidence.
+                if merged.get("observation").is_none() {
+                    merged["observation"] = observation.clone();
+                }
+                enriched = Some(merged);
+            }
+        }
+        // These are operation-specific historical facts, not a ranking between
+        // Completed/Interrupted/Failed or between rejection and confirmation.
+        // A contradictory definite observation never silently replaces one.
+        let keep = definite_receipt(&tool, &current_state)
+            || matches!(source, ProjectionSource::NoObservation)
+            || (!definite_receipt(&tool, state)
+                && (revision != observed_revision
+                    || (current_state == "unknown"
+                        && state != "unknown"
+                        && !resolves_unknown(source, &tool, state, body))));
+        let proposed = enriched.as_ref().unwrap_or(body);
+        let result = if (keep && enriched.is_none()) || retained == *proposed {
+            retained
+        } else {
+            let next = revision
+                .checked_add(1)
+                .filter(|n| *n <= i64::MAX as u64)
+                .ok_or_else(|| error("Internal", "receipt revision exhausted"))?;
+            let changed=tx.execute("UPDATE requests SET state=?1,body=?2,revision=?3 WHERE operation=?4 AND revision=?5",params![state,proposed.to_string(),next,operation,revision]).map_err(storage)?;
+            if changed != 1 {
+                return Err(error("Internal", "receipt owner revision changed"));
+            }
+            proposed.clone()
+        };
+        tx.commit().map_err(storage)?;
+        Ok(result)
     }
     fn status(&self, actor: &str, scope: &HostScope) -> Result<Value, ApiError> {
         let db = self.db()?;
@@ -437,8 +612,8 @@ impl OwnedControlBridge {
         if r.tool == "owned.operation.get" || r.tool == "owned.operation.reconcile" {
             let scope = scope.as_ref().unwrap();
             let operation = id(&r.args, "operation_id")?;
-            let row:Option<(String,String,String)>=self.db()?.query_row("SELECT state,body,tool FROM requests WHERE operation=?1 AND space=?2 AND session=?3",params![operation,space,scope.session_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(storage)?;
-            let (state, body, tool) =
+            let row:Option<(String,String,u64)>=self.db()?.query_row("SELECT body,tool,revision FROM requests WHERE operation=?1 AND space=?2 AND session=?3",params![operation,space,scope.session_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(storage)?;
+            let (body, tool, revision) =
                 row.ok_or_else(|| error("NotFound", "owned operation not found"))?;
             let mut value: Value = serde_json::from_str(&body).map_err(storage)?;
             if r.tool == "owned.operation.reconcile" {
@@ -454,13 +629,18 @@ impl OwnedControlBridge {
                     .map_err(host_error);
                 value=self.authorized_observation(actor,scope,observation.map(|observed|json!({"state":if observed.outcome==crate::runtime_codex_host::ProviderTurnOutcome::InProgress{"pending"}else{"confirmed"},"operation_id":operation,"observation":observed})))?;
                 value["operation_id"] = json!(operation);
-                if value["state"] != "pending" {
-                    self.save(
-                        &operation,
-                        value["state"].as_str().unwrap_or("unknown"),
-                        &value,
-                    )?;
-                }
+                let source = if value["state"] == "pending" && value.get("observation").is_none() {
+                    ProjectionSource::NoObservation
+                } else {
+                    ProjectionSource::Observation
+                };
+                value = self.save(
+                    &operation,
+                    revision,
+                    source,
+                    value["state"].as_str().unwrap_or("unknown"),
+                    &value,
+                )?;
             } else {
                 if let Ok(snapshot) = self.supervisor.operation_as(actor, scope, &operation) {
                     let state = match snapshot.phase {
@@ -470,8 +650,14 @@ impl OwnedControlBridge {
                         _ => "accepted",
                     };
                     value = json!({"state":state,"operation_id":operation,"snapshot":snapshot});
-                    self.save(&operation, state, &value)?;
-                } else if (tool == "owned.launch" || tool == "owned.stop") && state != "unknown" {
+                    value = self.save(
+                        &operation,
+                        revision,
+                        ProjectionSource::Observation,
+                        state,
+                        &value,
+                    )?;
+                } else if tool == "owned.launch" || tool == "owned.stop" {
                     if let Ok(status) = self.supervisor.get_as(actor, scope) {
                         let state = if tool == "owned.stop" && status.worker_exited {
                             "exited"
@@ -485,7 +671,13 @@ impl OwnedControlBridge {
                             "pending"
                         };
                         value = json!({"state":state,"operation_id":operation,"status":status});
-                        self.save(&operation, state, &value)?;
+                        value = self.save(
+                            &operation,
+                            revision,
+                            ProjectionSource::Observation,
+                            state,
+                            &value,
+                        )?;
                     }
                 }
             }
@@ -525,15 +717,15 @@ impl OwnedControlBridge {
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
-        let old: Option<(String, String)> = tx
+        let old: Option<(String, String, u64)> = tx
             .query_row(
-                "SELECT fingerprint,body FROM requests WHERE space=?1 AND actor=?2 AND request=?3",
+                "SELECT fingerprint,body,revision FROM requests WHERE space=?1 AND actor=?2 AND request=?3",
                 params![space, identity, r.request_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(storage)?;
-        if let Some((prior, body)) = old {
+        if let Some((prior, body, revision)) = old {
             if prior != fingerprint {
                 return Err(error("RequestConflict", "request_id content differs"));
             }
@@ -558,13 +750,16 @@ impl OwnedControlBridge {
                             params![json!(status).to_string(), scope.session_id],
                         )
                         .map_err(storage)?;
-                    self.save(
+                    value = self.save(
                         value["operation_id"].as_str().unwrap(),
+                        revision,
+                        ProjectionSource::Observation,
                         value["state"].as_str().unwrap(),
                         &value,
                     )?;
                 }
             }
+            self.authorize(actor, space, &endpoint, grant)?;
             return Ok(value);
         }
         if r.tool == "owned.turn" {
@@ -585,7 +780,7 @@ impl OwnedControlBridge {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let receipt = json!({"state":"unknown","operation_id":operation,"endpoint_id":endpoint,"session_id":session,"binding_generation":scope.as_ref().map(|s|s.binding_generation).unwrap_or(1),"actor_identity":identity});
         tx.execute(
-            "INSERT INTO requests VALUES(?1,?2,?3,?4,?5,?6,?7,'intent',?8)",
+            "INSERT INTO requests(space,actor,request,fingerprint,operation,session,tool,state,body) VALUES(?1,?2,?3,?4,?5,?6,?7,'intent',?8)",
             params![
                 space,
                 identity,
@@ -604,8 +799,19 @@ impl OwnedControlBridge {
                 Ok(r) => Some(r),
                 Err(e) => {
                     let value = json!({"state":"rejected","operation_id":operation,"error":e});
-                    self.save(&operation, "rejected", &value)?;
-                    return Err(e);
+                    let retained = self.save(
+                        &operation,
+                        0,
+                        ProjectionSource::Mutation,
+                        "rejected",
+                        &value,
+                    )?;
+                    self.authorize(actor, space, &endpoint, grant)?;
+                    return if retained == value {
+                        Err(e)
+                    } else {
+                        Ok(retained)
+                    };
                 }
             }
         } else {
@@ -653,7 +859,13 @@ impl OwnedControlBridge {
             "owned.interrupt" => {
                 let observed = self
                     .supervisor
-                    .interrupt_turn_as(actor, scope.as_ref().unwrap(), turn.unwrap(), wait)
+                    .interrupt_turn_with_operation_as(
+                        actor,
+                        scope.as_ref().unwrap(),
+                        operation.clone(),
+                        turn.unwrap(),
+                        wait,
+                    )
                     .map_err(host_error)?;
                 Ok(json!({"state":"confirmed","operation_id":operation,"observation":observed}))
             }
@@ -675,15 +887,14 @@ impl OwnedControlBridge {
             _ => unreachable!(),
         })();
         drop(reservation);
-        match result {
-            Ok(value) => {
-                self.save(
-                    &operation,
-                    value["state"].as_str().unwrap_or("unknown"),
-                    &value,
-                )?;
-                Ok(value)
-            }
+        let delivered = match result {
+            Ok(value) => self.save(
+                &operation,
+                0,
+                ProjectionSource::Mutation,
+                value["state"].as_str().unwrap_or("unknown"),
+                &value,
+            ),
             Err(e) => {
                 let state = if e.code == "Pending" {
                     "pending"
@@ -703,14 +914,19 @@ impl OwnedControlBridge {
                 };
                 let value =
                     json!({"state":state,"operation_id":operation,"session_id":session,"error":e});
-                self.save(&operation, state, &value)?;
-                if matches!(state, "pending" | "unknown") {
-                    Ok(value)
-                } else {
+                let retained =
+                    self.save(&operation, 0, ProjectionSource::Mutation, state, &value)?;
+                if state == "rejected" && retained == value {
                     Err(e)
+                } else {
+                    Ok(retained)
                 }
             }
-        }
+        };
+        // A concurrent projection may retain a newer result than this command
+        // observed. Recheck delivery authority before exposing that body.
+        self.authorize(actor, space, &endpoint, grant)?;
+        delivered
     }
     fn observation(&self, result: Result<Value, ApiError>) -> Result<Value, ApiError> {
         match result {
@@ -821,5 +1037,618 @@ impl OwnedControlBridge {
             },
         )?;
         Ok(json!({"items":items,"next_cursor":if more{Some(format!("{prefix}:{last}"))}else{None}}))
+    }
+}
+
+#[cfg(test)]
+mod durable_projection_tests {
+    use super::*;
+    use crate::runtime_codex_host::ExecutionProfile;
+    use crate::runtime_launch_policy::{TrustedLaunchPlan, WorkerBinding};
+    use crate::runtime_supervisor::OperationPhase;
+    use std::{sync::Condvar, time::Instant};
+
+    #[test]
+    fn same_fact_comparison_requires_exact_terminal_turn_and_operation() {
+        let original = json!({"state":"confirmed","operation_id":"op","snapshot":{"phase":"Confirmed","operation_id":"op","provider_turn_id":"turn","provider_outcome":"completed","result":{"private":"retained"}}});
+        let observation = json!({"operation_id":"op","thread_id":"trusted-thread","turn_id":"turn","outcome":"completed"});
+        assert!(same_turn_fact(&original, &observation, "op"));
+        for outcome in ["interrupted", "failed", "in_progress"] {
+            let mut other = observation.clone();
+            other["outcome"] = json!(outcome);
+            assert!(!same_turn_fact(&original, &other, "op"));
+        }
+        let mut other = observation.clone();
+        other["turn_id"] = json!("different-turn");
+        assert!(!same_turn_fact(&original, &other, "op"));
+        assert!(!same_turn_fact(
+            &original,
+            &observation,
+            "different-operation"
+        ));
+        let mut insufficient = original.clone();
+        insufficient["snapshot"]["provider_outcome"] = Value::Null;
+        assert!(!same_turn_fact(&insufficient, &observation, "op"));
+        let mut enriched = original.clone();
+        enriched["observation"] = observation.clone();
+        assert!(same_turn_fact(&enriched, &observation, "op"));
+        assert!(!same_turn_fact(&enriched, &other, "op"));
+        assert_eq!(
+            enriched["snapshot"]["result"],
+            original["snapshot"]["result"]
+        );
+    }
+
+    #[test]
+    fn legacy_receipts_migrate_and_recovery_fences_preopen_observations() {
+        let f = Fixture::new();
+        {
+            let db = f.bridge.db().unwrap();
+            db.execute_batch("ALTER TABLE requests DROP COLUMN revision;")
+                .unwrap();
+            for (op, state) in [("settled", "confirmed"), ("unfinished", "accepted")] {
+                db.execute(
+                    "INSERT INTO requests VALUES('s','a',?1,'fp',?1,'session','owned.turn',?2,?3)",
+                    params![
+                        op,
+                        state,
+                        json!({"operation_id":op,"state":state,"result":"retained"}).to_string()
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let reopened = OwnedControlBridge::open(
+            f.dir.path(),
+            f.engine.clone(),
+            f.supervisor.clone(),
+            f.bridge.registry.clone(),
+            f.bridge.participants.clone(),
+            f.plans.clone(),
+        )
+        .unwrap();
+        let read = |op: &str| -> (Value, u64) {
+            let (body, revision): (String, u64) = reopened
+                .db()
+                .unwrap()
+                .query_row(
+                    "SELECT body,revision FROM requests WHERE operation=?1",
+                    [op],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            (serde_json::from_str(&body).unwrap(), revision)
+        };
+        assert_eq!(
+            read("settled"),
+            (
+                json!({"operation_id":"settled","state":"confirmed","result":"retained"}),
+                0
+            )
+        );
+        let (unknown, revision) = read("unfinished");
+        assert_eq!(unknown["state"], "unknown");
+        assert_eq!(revision, 1);
+        let ack = json!({"operation_id":"unfinished","state":"accepted","snapshot":{"phase":"Accepted","provider_turn_id":"turn1"}});
+        // A genuine ACK captured before recovery is still an obsolete projection.
+        assert_eq!(
+            f.bridge
+                .save(
+                    "unfinished",
+                    0,
+                    ProjectionSource::Observation,
+                    "accepted",
+                    &ack
+                )
+                .unwrap(),
+            unknown
+        );
+        assert_eq!(
+            reopened
+                .save(
+                    "unfinished",
+                    revision,
+                    ProjectionSource::Observation,
+                    "accepted",
+                    &ack
+                )
+                .unwrap(),
+            ack
+        );
+    }
+
+    #[test]
+    fn receipt_owner_fences_stale_writers_and_preserves_operation_facts() {
+        let f = Fixture::new();
+        let insert = |operation: &str, tool: &str, state: &str| {
+            let body = json!({"operation_id":operation,"state":state});
+            f.bridge.db().unwrap().execute(
+                "INSERT INTO requests(space,actor,request,fingerprint,operation,session,tool,state,body) VALUES('s','a',?1,'fp',?1,'session',?2,?3,?4)",
+                params![operation,tool,state,body.to_string()],
+            ).unwrap();
+            body
+        };
+        for (op, tool, final_state) in [
+            ("launch", "owned.launch", "confirmed"),
+            ("stop", "owned.stop", "exited"),
+            ("turn", "owned.turn", "confirmed"),
+            ("interrupt", "owned.interrupt", "confirmed"),
+        ] {
+            insert(op, tool, "intent");
+            let fact =
+                json!({"operation_id":op,"state":final_state,"result":{"outcome":"original"}});
+            // Positive exact evidence remains admissible after a weaker writer.
+            let pending = json!({"operation_id":op,"state":"pending"});
+            f.bridge
+                .save(op, 0, ProjectionSource::Mutation, "pending", &pending)
+                .unwrap();
+            assert_eq!(
+                f.bridge
+                    .save(op, 0, ProjectionSource::Observation, final_state, &fact)
+                    .unwrap(),
+                fact
+            );
+            for state in ["pending", "unknown", "rejected", final_state] {
+                let stale =
+                    json!({"operation_id":op,"state":state,"result":{"outcome":"contradiction"}});
+                assert_eq!(
+                    f.bridge
+                        .save(op, 2, ProjectionSource::Observation, state, &stale)
+                        .unwrap(),
+                    fact
+                );
+            }
+        }
+        let unknown = insert("uncertain", "owned.turn", "unknown");
+        for phase in ["Queued", "Dispatching"] {
+            let weaker = json!({"operation_id":"uncertain","state":"accepted","snapshot":{"phase":phase,"provider_turn_id":"turn1"}});
+            assert_eq!(
+                f.bridge
+                    .save(
+                        "uncertain",
+                        0,
+                        ProjectionSource::Observation,
+                        "accepted",
+                        &weaker
+                    )
+                    .unwrap(),
+                unknown
+            );
+        }
+        let ack = json!({"operation_id":"uncertain","state":"accepted","snapshot":{"phase":"Accepted","provider_turn_id":"turn1"}});
+        assert_eq!(
+            f.bridge
+                .save(
+                    "uncertain",
+                    0,
+                    ProjectionSource::Observation,
+                    "accepted",
+                    &ack
+                )
+                .unwrap(),
+            ack
+        );
+        let stale = json!({"operation_id":"uncertain","state":"pending"});
+        assert_eq!(
+            f.bridge
+                .save(
+                    "uncertain",
+                    0,
+                    ProjectionSource::Observation,
+                    "pending",
+                    &stale
+                )
+                .unwrap(),
+            ack
+        );
+        let unknown = insert("in-progress", "owned.turn", "unknown");
+        assert_eq!(
+            f.bridge
+                .save(
+                    "in-progress",
+                    0,
+                    ProjectionSource::NoObservation,
+                    "unknown",
+                    &unknown
+                )
+                .unwrap(),
+            unknown
+        );
+        let progress = json!({"operation_id":"in-progress","state":"pending","observation":{"outcome":"in_progress"}});
+        assert_eq!(
+            f.bridge
+                .save(
+                    "in-progress",
+                    0,
+                    ProjectionSource::Observation,
+                    "pending",
+                    &progress
+                )
+                .unwrap(),
+            progress
+        );
+    }
+
+    fn call(engine: &Engine, actor: &str, space: Option<&str>, tool: &str, args: Value) -> Value {
+        engine
+            .execute(
+                actor,
+                &ToolRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    tool: tool.into(),
+                    space_id: space.map(Into::into),
+                    args,
+                },
+            )
+            .unwrap()
+    }
+    struct Fixture {
+        dir: tempfile::TempDir,
+        engine: Engine,
+        admin: String,
+        observer: String,
+        observer_id: String,
+        binding: WorkerBinding,
+        plans: Arc<LaunchPolicyStore>,
+        supervisor: Arc<OwnedSessionSupervisor>,
+        bridge: Arc<OwnedControlBridge>,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = Engine::open(dir.path()).unwrap();
+            let owner =
+                std::fs::read_to_string(crate::runtime_core::owner_token_path(dir.path())).unwrap();
+            let space = call(
+                &engine,
+                &owner,
+                None,
+                "spaces.create",
+                json!({"name":"projection"}),
+            );
+            let sid = space["space"]["id"].as_str().unwrap();
+            let admin = space["administrator"]["credential"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let endpoint = call(
+                &engine,
+                &admin,
+                Some(sid),
+                "endpoints.register",
+                json!({"name":"owned","kind":"terminal"}),
+            );
+            let invite = call(
+                &engine,
+                &admin,
+                Some(sid),
+                "members.invite",
+                json!({"roles":["implementer"]}),
+            );
+            let worker = call(
+                &engine,
+                invite["invite_token"].as_str().unwrap(),
+                Some(sid),
+                "members.register",
+                json!({"name":"worker"}),
+            );
+            let credential = worker["credential"].as_str().unwrap();
+            call(
+                &engine,
+                &admin,
+                Some(sid),
+                "endpoints.grant",
+                json!({"endpoint_id":endpoint["id"],"member_id":worker["id"],"operations":["send","observe","control"]}),
+            );
+            let invite = call(
+                &engine,
+                &admin,
+                Some(sid),
+                "members.invite",
+                json!({"roles":["observer"]}),
+            );
+            let observer = call(
+                &engine,
+                invite["invite_token"].as_str().unwrap(),
+                Some(sid),
+                "members.register",
+                json!({"name":"G1"}),
+            );
+            call(
+                &engine,
+                &admin,
+                Some(sid),
+                "endpoints.grant",
+                json!({"endpoint_id":endpoint["id"],"member_id":observer["id"],"operations":["observe"]}),
+            );
+            let registry = OwnedCodexRegistry::open(dir.path(), engine.clone()).unwrap();
+            let plans = Arc::new(
+                LaunchPolicyStore::open(dir.path(), engine.clone(), registry.clone()).unwrap(),
+            );
+            let participants = Arc::new(
+                ParticipantService::open(dir.path(), engine.clone(), Arc::new(registry.clone()))
+                    .unwrap(),
+            );
+            let script=include_str!("../tests/fixtures/owned_codex_server.py").replace("elif method=='turn/interrupt':send({'id':rid,'result':{'interruptedTurn':p['turnId']}})","elif method=='turn/interrupt':\n  import pathlib,time\n  open('interrupt-count','a').write('sent\\n')\n  pathlib.Path('interrupt-effect').touch()\n  while not pathlib.Path('interrupt-release').exists():time.sleep(0.005)\n  send({'id':rid,'result':{'interruptedTurn':p['turnId'],'privateReply':'g2-confirmed-sensitive'}})");
+            let path = dir.path().join("provider.py");
+            std::fs::write(&path, script).unwrap();
+            let python =
+                std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
+                    .args(["-c", "import sys;print(sys.executable)"])
+                    .output()
+                    .unwrap();
+            let hb = call(
+                &engine,
+                credential,
+                Some(sid),
+                "members.heartbeat",
+                json!({}),
+            );
+            let binding = WorkerBinding {
+                space_id: sid.into(),
+                endpoint_id: endpoint["id"].as_str().unwrap().into(),
+                identity_id: worker["id"].as_str().unwrap().into(),
+                attachment_id: hb["attachment_id"].as_str().unwrap().into(),
+            };
+            plans
+                .provision_worker_slot(&admin, "worker", binding.clone(), credential)
+                .unwrap();
+            plans
+                .install(
+                    &admin,
+                    "plan",
+                    None,
+                    TrustedLaunchPlan {
+                        binding: binding.clone(),
+                        worker_slot: "worker".into(),
+                        executable: PathBuf::from(String::from_utf8(python.stdout).unwrap().trim()),
+                        args: vec![path.to_str().unwrap().into(), "normal".into()],
+                        workspace: dir.path().into(),
+                        model: "gpt-6-luna".into(),
+                        provider_version: "0.163.0".into(),
+                        capability_evidence: "controlled protocol provider".into(),
+                        timeout: Duration::from_secs(3),
+                        profile: ExecutionProfile::ReadOnlyForum,
+                    },
+                )
+                .unwrap();
+            let supervisor = Arc::new(
+                OwnedSessionSupervisor::new(engine.clone(), registry.clone(), Default::default())
+                    .unwrap(),
+            );
+            let bridge = Arc::new(
+                OwnedControlBridge::open(
+                    dir.path(),
+                    engine.clone(),
+                    supervisor.clone(),
+                    registry,
+                    participants,
+                    plans.clone(),
+                )
+                .unwrap(),
+            );
+            call(
+                &engine,
+                credential,
+                Some(sid),
+                "members.heartbeat",
+                json!({"attachment_id":binding.attachment_id}),
+            );
+            Self {
+                dir,
+                engine,
+                admin,
+                observer: observer["credential"].as_str().unwrap().into(),
+                observer_id: observer["id"].as_str().unwrap().into(),
+                binding,
+                plans,
+                supervisor,
+                bridge,
+            }
+        }
+        fn request(&self, id: &str, tool: &str, args: Value) -> ToolRequest {
+            ToolRequest {
+                request_id: id.into(),
+                tool: tool.into(),
+                space_id: Some(self.binding.space_id.clone()),
+                args,
+            }
+        }
+        fn target(&self, launch: &Value) -> Value {
+            json!({"endpoint_id":self.binding.endpoint_id,"session_id":launch["session_id"],"expected_generation":1})
+        }
+        fn scope(&self, launch: &Value) -> HostScope {
+            HostScope {
+                identity_id: self.binding.identity_id.clone(),
+                space_id: self.binding.space_id.clone(),
+                endpoint_id: self.binding.endpoint_id.clone(),
+                attachment_id: self.binding.attachment_id.clone(),
+                session_id: launch["session_id"].as_str().unwrap().into(),
+                binding_generation: 1,
+            }
+        }
+        fn wait(&self, condition: impl Fn() -> bool) {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !condition() {
+                assert!(Instant::now() < until);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        fn shutdown(&self) {
+            self.supervisor.request_shutdown();
+            self.wait(|| self.supervisor.active_count() == 0);
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.dir.path().join("interrupt-release"), "");
+            self.shutdown();
+        }
+    }
+
+    #[test]
+    fn stale_get_cannot_overwrite_delivered_confirmed_receipt_across_reopen() {
+        for revoke_g1 in [false, true] {
+            let f = Fixture::new();
+            let launch=f.bridge.execute(&f.admin,&f.request("launch","owned.launch",json!({"endpoint_id":f.binding.endpoint_id,"plan_id":"plan","expected_plan_revision":1}))).unwrap();
+            let scope = f.scope(&launch);
+            f.wait(|| {
+                f.supervisor.get_as(&f.admin, &scope).unwrap().phase
+                    == crate::runtime_supervisor::SessionPhase::Running
+            });
+            let mut args = f.target(&launch);
+            args["text"] = json!("active");
+            let turn = f
+                .bridge
+                .execute(&f.admin, &f.request("turn", "owned.turn", args))
+                .unwrap();
+            f.wait(|| {
+                f.supervisor
+                    .operation_as(&f.admin, &scope, turn["operation_id"].as_str().unwrap())
+                    .unwrap()
+                    .phase
+                    == OperationPhase::Accepted
+            });
+            let mut args = f.target(&launch);
+            args["provider_turn_id"] = json!("turn-1");
+            let interrupt_request = f.request("interrupt", "owned.interrupt", args);
+            let interrupt = f.bridge.execute(&f.admin, &interrupt_request).unwrap();
+            let operation = interrupt["operation_id"].as_str().unwrap().to_owned();
+            f.wait(|| f.dir.path().join("interrupt-effect").exists());
+            assert_eq!(
+                f.supervisor
+                    .operation_as(&f.admin, &scope, &operation)
+                    .unwrap()
+                    .phase,
+                OperationPhase::Dispatching
+            );
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let release = Arc::new((Mutex::new(false), Condvar::new()));
+            let control = release.clone();
+            let watched = operation.clone();
+            *f.bridge.projection_test_hook.lock().unwrap() = Some(Arc::new(move |id, state| {
+                if id == watched
+                    && state == "accepted"
+                    && std::thread::current().name() == Some("stale-get")
+                {
+                    entered_tx.send(()).unwrap();
+                    let (lock, ready) = &*control;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                }
+            }));
+            let mut args = f.target(&launch);
+            args["operation_id"] = json!(operation);
+            let request = f.request("get", "owned.operation.get", args);
+            let bridge = f.bridge.clone();
+            let actor = f.observer.clone();
+            let g1request = request.clone();
+            let g1 = std::thread::Builder::new()
+                .name("stale-get".into())
+                .spawn(move || bridge.execute(&actor, &g1request))
+                .unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            std::fs::write(f.dir.path().join("interrupt-release"), "").unwrap();
+            f.wait(|| {
+                f.supervisor
+                    .operation_as(&f.admin, &scope, &operation)
+                    .unwrap()
+                    .phase
+                    == OperationPhase::Confirmed
+            });
+            let g2 = f.bridge.execute(&f.admin, &request).unwrap();
+            eprintln!("G2 durable/delivered: {g2}");
+            assert_eq!(g2["state"], "confirmed");
+            assert_eq!(
+                g2["snapshot"]["result"]["privateReply"],
+                "g2-confirmed-sensitive"
+            );
+            let db = f.bridge.db().unwrap();
+            let saved: String = db
+                .query_row(
+                    "SELECT body FROM requests WHERE operation=?1",
+                    [&operation],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), g2);
+            drop(db);
+            if revoke_g1 {
+                call(
+                    &f.engine,
+                    &f.admin,
+                    Some(&f.binding.space_id),
+                    "endpoints.grant",
+                    json!({"endpoint_id":f.binding.endpoint_id,"member_id":f.observer_id,"operations":[]}),
+                );
+            }
+            {
+                let (lock, ready) = &*release;
+                *lock.lock().unwrap() = true;
+                ready.notify_all();
+            }
+            let g1 = g1.join().unwrap();
+            eprintln!("G1 after stale save: {g1:?}");
+            if revoke_g1 {
+                assert_eq!(g1.as_ref().unwrap_err().code, "Denied");
+                assert!(!format!("{g1:?}").contains("g2-confirmed-sensitive"));
+            }
+            let db = f.bridge.db().unwrap();
+            let after: String = db
+                .query_row(
+                    "SELECT body FROM requests WHERE operation=?1",
+                    [&operation],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            drop(db);
+            eprintln!("SQLite after G1: {after}");
+            f.shutdown();
+            assert!(f.supervisor.get_as(&f.admin, &scope).unwrap().worker_exited);
+            let registry = OwnedCodexRegistry::open(f.dir.path(), f.engine.clone()).unwrap();
+            let supervisor = Arc::new(
+                OwnedSessionSupervisor::new(f.engine.clone(), registry.clone(), Default::default())
+                    .unwrap(),
+            );
+            let participants = Arc::new(
+                ParticipantService::open(
+                    f.dir.path(),
+                    f.engine.clone(),
+                    Arc::new(registry.clone()),
+                )
+                .unwrap(),
+            );
+            let reopened = OwnedControlBridge::open(
+                f.dir.path(),
+                f.engine.clone(),
+                supervisor.clone(),
+                registry,
+                participants,
+                f.plans.clone(),
+            )
+            .unwrap();
+            let recovered = reopened.execute(&f.admin, &request).unwrap();
+            eprintln!("Reopened receipt: {recovered}");
+            assert_eq!(supervisor.active_count(), 0);
+            assert_eq!(
+                serde_json::from_str::<Value>(&after).unwrap(),
+                g2,
+                "G1 stale projection overwrote G2 durable receipt"
+            );
+            assert_eq!(recovered, g2);
+            if !revoke_g1 {
+                assert_eq!(g1.unwrap(), g2);
+            }
+            assert_eq!(
+                std::fs::read_to_string(f.dir.path().join("interrupt-count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            assert_eq!(reopened.execute(&f.admin, &interrupt_request).unwrap(), g2);
+        }
     }
 }

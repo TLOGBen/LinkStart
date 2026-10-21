@@ -233,6 +233,41 @@ impl Fixture {
         let script=std::fs::read_to_string(&path).unwrap().replace("elif method=='thread/read':","elif method=='thread/read':\n  import pathlib,time\n  pathlib.Path('read-entered').touch()\n  while not pathlib.Path('read-release').exists():time.sleep(0.005)").replace("elif method=='turn/start':","elif method=='turn/start':\n  open('turn-count','a').write('sent\\n')");
         std::fs::write(path, script).unwrap();
     }
+    fn gate_interrupt(&self) {
+        let path = self.dir.path().join("fake.py");
+        let script=std::fs::read_to_string(&path).unwrap().replace(
+            "elif method=='turn/interrupt':send({'id':rid,'result':{'interruptedTurn':p['turnId']}})",
+            "elif method=='turn/interrupt':\n  import pathlib,time\n  open('interrupt-count','a').write('sent\\n')\n  pathlib.Path('interrupt-effect').touch()\n  while not pathlib.Path('interrupt-release').exists():time.sleep(0.005)\n  send({'id':rid,'result':{'interruptedTurn':p['turnId'],'privateReply':'controlled-sensitive-reply'}})"
+        );
+        std::fs::write(path, script).unwrap();
+    }
+    fn active_turn(&self, launch: &Value) {
+        for (request_id, state) in [("active-first", "confirmed"), ("active-second", "accepted")] {
+            let mut args = self.target(launch);
+            args["text"] = json!(request_id);
+            let receipt = self
+                .bridge
+                .execute(&self.admin, &self.request(request_id, "owned.turn", args))
+                .unwrap();
+            let until = Instant::now() + Duration::from_secs(4);
+            loop {
+                let mut args = self.target(launch);
+                args["operation_id"] = receipt["operation_id"].clone();
+                let status = self
+                    .bridge
+                    .execute(
+                        &self.admin,
+                        &self.request("wait-active", "owned.operation.get", args),
+                    )
+                    .unwrap();
+                if status["state"] == state {
+                    break;
+                }
+                assert!(Instant::now() < until, "{status}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
     fn await_file(&self, name: &str) {
         let until = Instant::now() + Duration::from_secs(4);
         while !self.dir.path().join(name).exists() {
@@ -519,7 +554,7 @@ fn crash_before_launch_binding_keeps_intent_lookup_without_a_second_admission() 
     let body = json!({"state":"unknown","operation_id":operation,"endpoint_id":f.binding.endpoint_id,"session_id":session,"binding_generation":1,"actor_identity":identity});
     let db = rusqlite::Connection::open(f.dir.path().join("v2-owned-control.sqlite")).unwrap();
     db.execute(
-        "INSERT INTO requests VALUES(?1,?2,?3,?4,?5,?6,'owned.launch','intent',?7)",
+        "INSERT INTO requests(space,actor,request,fingerprint,operation,session,tool,state,body) VALUES(?1,?2,?3,?4,?5,?6,'owned.launch','intent',?7)",
         rusqlite::params![
             f.binding.space_id,
             identity,
@@ -766,6 +801,212 @@ fn shutdown_ticket_detects_reservation_and_preexisting_launch_drains() {
     }
     assert_eq!(f.bridge.inventory().launch_reservations, 0);
     assert!(f.bridge.inventory().draining);
+}
+
+fn f5_durable_body(f: &Fixture, operation: &Value) -> Value {
+    let db = rusqlite::Connection::open(f.dir.path().join("v2-owned-control.sqlite")).unwrap();
+    let body: String = db
+        .query_row(
+            "SELECT body FROM requests WHERE operation=?1",
+            [operation["operation_id"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    serde_json::from_str(&body).unwrap()
+}
+
+fn f5_get_first_terminal(outcome: &str) {
+    let f = Fixture::new();
+    f.gate_reads(); // count actual turn/start invocations; release reads initially.
+    std::fs::write(f.dir.path().join("read-release"), "").unwrap();
+    let path = f.dir.path().join("fake.py");
+    let script = std::fs::read_to_string(&path).unwrap().replace("'status':'completed'", &format!("'status':'{outcome}'"))
+        .replace("elif method=='thread/read':", &format!("elif method=='thread/read':\n  import pathlib\n  if history:history[0]['status']='{}' if pathlib.Path('contradictory-read').exists() else '{outcome}'", if outcome == "failed" { "completed" } else { "failed" }));
+    std::fs::write(path, script).unwrap();
+    let launch = f.launch();
+    f.running(&launch);
+    let mut args = f.target(&launch);
+    args["text"] = json!("F5 exact terminal evidence");
+    let turn_request = f.request("f5-original-turn", "owned.turn", args);
+    let turn = f.bridge.execute(&f.admin, &turn_request).unwrap();
+    let db = rusqlite::Connection::open(f.dir.path().join("v2-owned-control.sqlite")).unwrap();
+    let encoded: String = db
+        .query_row(
+            "SELECT scope FROM sessions WHERE id=?1",
+            [launch["session_id"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let scope: HostScope = serde_json::from_str(&encoded).unwrap();
+    let until = Instant::now() + Duration::from_secs(4);
+    loop {
+        let snapshot = f
+            .supervisor
+            .operation_as(&f.admin, &scope, turn["operation_id"].as_str().unwrap())
+            .unwrap();
+        if matches!(snapshot.phase, OperationPhase::Confirmed) {
+            assert_eq!(
+                serde_json::to_value(snapshot.provider_outcome).unwrap(),
+                outcome
+            );
+            break;
+        }
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut args = f.target(&launch);
+    args["operation_id"] = turn["operation_id"].clone();
+    let get = f.request("f5-get-first", "owned.operation.get", args.clone());
+    let first = f.bridge.execute(&f.admin, &get).unwrap();
+    assert_eq!(first["state"], "confirmed");
+    assert_eq!(first["snapshot"]["provider_outcome"], outcome);
+    assert_eq!(f5_durable_body(&f, &turn), first);
+    args["wait_ms"] = json!(1000);
+    let reconcile = f.request("f5-reconcile", "owned.operation.reconcile", args);
+    let observed = f.bridge.execute(&f.admin, &reconcile).unwrap();
+    eprintln!("F5 {outcome} get-first={first}; reconcile={observed}");
+    assert_eq!(
+        observed["observation"]["outcome"], outcome,
+        "typed observation suppressed by first snapshot envelope"
+    );
+    assert_eq!(observed["snapshot"], first["snapshot"]);
+    assert_eq!(observed["operation_id"], turn["operation_id"]);
+    assert_eq!(
+        observed["observation"]["operation_id"],
+        turn["operation_id"]
+    );
+    assert_eq!(
+        observed["observation"]["turn_id"],
+        first["snapshot"]["provider_turn_id"]
+    );
+    let thread: String = db
+        .query_row(
+            "SELECT json_extract(status,'$.provider_thread_id') FROM sessions WHERE id=?1",
+            [scope.session_id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(observed["observation"]["thread_id"], thread);
+    assert_eq!(f5_durable_body(&f, &turn), observed);
+    assert_eq!(f.bridge.execute(&f.admin, &get).unwrap(), observed);
+    assert_eq!(f.bridge.execute(&f.admin, &reconcile).unwrap(), observed);
+    assert_eq!(f.bridge.execute(&f.admin, &turn_request).unwrap(), observed);
+
+    // A real exact provider read can contradict its prior terminal report. Do
+    // not turn that incoming positive evidence into an admitted typed response.
+    std::fs::write(f.dir.path().join("contradictory-read"), "").unwrap();
+    assert_eq!(
+        f.bridge.execute(&f.admin, &reconcile).unwrap_err().code,
+        "Conflict"
+    );
+    assert_eq!(f5_durable_body(&f, &turn), observed);
+    assert_eq!(f.bridge.execute(&f.admin, &get).unwrap(), observed);
+    std::fs::remove_file(f.dir.path().join("contradictory-read")).unwrap();
+    assert_eq!(f.bridge.execute(&f.admin, &reconcile).unwrap(), observed);
+
+    // A blocked exact read must still recheck the original observer at delivery.
+    std::fs::remove_file(f.dir.path().join("read-entered")).unwrap();
+    std::fs::remove_file(f.dir.path().join("read-release")).unwrap();
+    let (actor, id) = f.actor(&["observe"]);
+    let bridge = f.bridge.clone();
+    let request = reconcile.clone();
+    let credential = actor.clone();
+    let reader = std::thread::spawn(move || bridge.execute(&credential, &request));
+    f.await_file("read-entered");
+    f.grants(&id, &[]);
+    std::fs::write(f.dir.path().join("read-release"), "").unwrap();
+    let denied = reader.join().unwrap();
+    assert_eq!(denied.as_ref().unwrap_err().code, "Denied");
+    assert!(!format!("{denied:?}").contains(&thread));
+    assert_eq!(f5_durable_body(&f, &turn), observed);
+    f.grants(&id, &["observe"]);
+    assert_eq!(f.bridge.execute(&actor, &get).unwrap(), observed);
+
+    f.supervisor.request_shutdown();
+    let until = Instant::now() + Duration::from_secs(5);
+    while f.supervisor.active_count() > 0 {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(f.supervisor.get_as(&f.admin, &scope).unwrap().worker_exited);
+    let registry = OwnedCodexRegistry::open(f.dir.path(), f.engine.clone()).unwrap();
+    let supervisor = Arc::new(
+        OwnedSessionSupervisor::new(f.engine.clone(), registry.clone(), Default::default())
+            .unwrap(),
+    );
+    let participants = Arc::new(
+        linkstart::runtime_participants::ParticipantService::open(
+            f.dir.path(),
+            f.engine.clone(),
+            Arc::new(registry.clone()),
+        )
+        .unwrap(),
+    );
+    let cold = OwnedControlBridge::open(
+        f.dir.path(),
+        f.engine.clone(),
+        supervisor.clone(),
+        registry,
+        participants,
+        f.plans.clone(),
+    )
+    .unwrap();
+    assert_eq!(cold.execute(&f.admin, &get).unwrap(), observed);
+    assert_eq!(cold.execute(&f.admin, &turn_request).unwrap(), observed);
+    // Historical admitted evidence survives; this does not claim a native resume.
+    assert_eq!(cold.execute(&f.admin, &reconcile).unwrap(), observed);
+    assert_eq!(supervisor.active_count(), 0);
+    assert_eq!(f5_durable_body(&f, &turn), observed);
+    assert_eq!(
+        std::fs::read_to_string(f.dir.path().join("turn-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn f5_get_first_completed_preserves_typed_observation() {
+    f5_get_first_terminal("completed");
+}
+#[test]
+fn f5_get_first_interrupted_preserves_typed_observation() {
+    f5_get_first_terminal("interrupted");
+}
+#[test]
+fn f5_get_first_failed_preserves_typed_observation() {
+    f5_get_first_terminal("failed");
+}
+
+#[test]
+fn f5_pending_without_observation_does_not_conflict_or_invent_terminal_evidence() {
+    let f = Fixture::new();
+    f.gate_reads();
+    let launch = f.launch();
+    f.running(&launch);
+    let mut args = f.target(&launch);
+    args["text"] = json!("pending exact read");
+    let turn = f
+        .bridge
+        .execute(&f.admin, &f.request("f5-pending-turn", "owned.turn", args))
+        .unwrap();
+    // Deliberately do not get a completion projection before this zero-wait read.
+    let before = f5_durable_body(&f, &turn);
+    let mut args = f.target(&launch);
+    args["operation_id"] = turn["operation_id"].clone();
+    args["wait_ms"] = json!(0);
+    let pending = f.bridge.execute(
+        &f.admin,
+        &f.request("f5-pending-read", "owned.operation.reconcile", args),
+    );
+    f.await_file("read-entered");
+    std::fs::write(f.dir.path().join("read-release"), "").unwrap();
+    // NoObservation preserves V4's retained admission receipt; no Conflict or
+    // synthetic observation replaces a real timeout with terminal provider proof.
+    assert_eq!(pending.unwrap(), before);
+    assert!(before.get("observation").is_none());
+    assert_eq!(f5_durable_body(&f, &turn), before);
 }
 
 #[test]
@@ -1106,4 +1347,435 @@ fn launch_revocation_and_shutdown_reservation_are_admission_boundaries() {
         ),
         Err(SupervisorError::Closed)
     ));
+}
+
+#[test]
+fn interrupt_default_wait_settles_original_operation_without_a_second_send() {
+    let f = Fixture::new();
+    f.gate_interrupt();
+    let launch = f.launch();
+    f.running(&launch);
+    f.active_turn(&launch);
+    let mut args = f.target(&launch);
+    args["provider_turn_id"] = json!("turn-2");
+    let request = f.request("default-interrupt", "owned.interrupt", args);
+    let receipt = f.bridge.execute(&f.admin, &request).unwrap();
+    assert_eq!(receipt["state"], "pending");
+    f.await_file("interrupt-effect");
+    std::fs::write(f.dir.path().join("interrupt-release"), "").unwrap();
+    let until = Instant::now() + Duration::from_secs(4);
+    loop {
+        let replay = f.bridge.execute(&f.admin, &request).unwrap();
+        assert_eq!(replay["operation_id"], receipt["operation_id"]);
+        let mut args = f.target(&launch);
+        args["operation_id"] = receipt["operation_id"].clone();
+        let observed = f
+            .bridge
+            .execute(
+                &f.admin,
+                &f.request("interrupt-get", "owned.operation.get", args),
+            )
+            .unwrap();
+        if observed["state"] == "confirmed" {
+            assert_eq!(observed["snapshot"]["result"]["interruptedTurn"], "turn-2");
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "original interrupt receipt never settled: {observed}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        std::fs::read_to_string(f.dir.path().join("interrupt-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn revoked_interrupt_delivery_never_claims_the_applied_effect_was_rejected() {
+    let f = Fixture::new();
+    f.gate_interrupt();
+    let launch = f.launch();
+    f.running(&launch);
+    f.active_turn(&launch);
+    let (actor, id) = f.actor(&["control", "observe"]);
+    let mut args = f.target(&launch);
+    args["provider_turn_id"] = json!("turn-2");
+    args["wait_ms"] = json!(1000);
+    let request = f.request("revoked-interrupt", "owned.interrupt", args);
+    let bridge = f.bridge.clone();
+    let credential = actor.clone();
+    let threaded = request.clone();
+    let task = std::thread::spawn(move || bridge.execute(&credential, &threaded));
+    f.await_file("interrupt-effect");
+    f.grants(&id, &[]);
+    std::fs::write(f.dir.path().join("interrupt-release"), "").unwrap();
+    let response = task.join().unwrap();
+    assert!(!format!("{response:?}").contains("controlled-sensitive-reply"));
+    assert_eq!(
+        f.bridge.execute(&actor, &request).unwrap_err().code,
+        "Denied"
+    );
+    f.grants(&id, &["control", "observe"]);
+    let replay = f.bridge.execute(&actor, &request).unwrap();
+    assert_ne!(
+        replay["state"], "rejected",
+        "delivery revocation cannot prove absence of an already applied interrupt"
+    );
+    let mut args = f.target(&launch);
+    args["operation_id"] = replay["operation_id"].clone();
+    let observed = f
+        .bridge
+        .execute(
+            &actor,
+            &f.request("after-restore", "owned.operation.get", args),
+        )
+        .unwrap();
+    assert_eq!(observed["state"], "confirmed");
+    assert_eq!(
+        std::fs::read_to_string(f.dir.path().join("interrupt-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn revoked_stop_delivery_preserves_unknown_until_current_authority_observes_exit() {
+    let f = Fixture::new();
+    f.gate_reads();
+    let launch = f.launch();
+    f.running(&launch);
+    let mut args = f.target(&launch);
+    args["wait_ms"] = json!(1000);
+    let read_request = f.request("blocking-read", "owned.read", args.clone());
+    let bridge = f.bridge.clone();
+    let admin = f.admin.clone();
+    let reader = std::thread::spawn(move || bridge.execute(&admin, &read_request));
+    f.await_file("read-entered");
+    let (actor, id) = f.actor(&["manage", "observe"]);
+    let request = f.request("revoked-stop", "owned.stop", args);
+    let bridge = f.bridge.clone();
+    let credential = actor.clone();
+    let threaded = request.clone();
+    let task = std::thread::spawn(move || bridge.execute(&credential, &threaded));
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        let status = f
+            .bridge
+            .execute(
+                &f.admin,
+                &f.request("stopping-witness", "owned.get", f.target(&launch)),
+            )
+            .unwrap();
+        if status["phase"] == "Stopping" {
+            break;
+        }
+        assert!(Instant::now() < until, "{status}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    f.grants(&id, &[]);
+    std::fs::write(f.dir.path().join("read-release"), "").unwrap();
+    let _ = reader.join().unwrap();
+    let response = task.join().unwrap();
+    assert!(!format!("{response:?}").contains("provider_thread_id"));
+    assert_eq!(
+        f.bridge.execute(&actor, &request).unwrap_err().code,
+        "Denied"
+    );
+    let db = rusqlite::Connection::open(f.dir.path().join("v2-owned-control.sqlite")).unwrap();
+    let body: String = db
+        .query_row(
+            "SELECT body FROM requests WHERE actor=?1 AND request='revoked-stop'",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let receipt: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        receipt["state"], "unknown",
+        "stop was admitted before delivery permission was revoked"
+    );
+    f.grants(&id, &["manage", "observe"]);
+    let replay = f.bridge.execute(&actor, &request).unwrap();
+    assert_eq!(replay["operation_id"], receipt["operation_id"]);
+    let mut args = f.target(&launch);
+    args["operation_id"] = receipt["operation_id"].clone();
+    let observed = f
+        .bridge
+        .execute(
+            &actor,
+            &f.request("exit-after-restore", "owned.operation.get", args),
+        )
+        .unwrap();
+    assert_eq!(observed["state"], "exited");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn posix_shutdown_terminal_wait_releases_global_http_gate() {
+    let f = Fixture::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let host = addr.to_string();
+    let (router, _) =
+        linkstart::runtime_http::router_with_bridge(f.dir.path(), &host, f.bridge.clone()).unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let python = std::process::Command::new("python3")
+        .args(["-c", "import sys;print(sys.executable)"])
+        .output()
+        .unwrap();
+    let script="import signal,time,pathlib\nsignal.signal(signal.SIGINT,lambda *_:pathlib.Path('shutdown-entered').touch())\npathlib.Path('terminal-ready').touch()\nwhile not pathlib.Path('terminal-release').exists():time.sleep(0.01)";
+    let (status,_)=http(addr,host.clone(),f.admin.clone(),Some(f.request("terminal","terminal.create",json!({"command":String::from_utf8(python.stdout).unwrap().trim(),"args":["-u","-c",script],"cwd":f.dir.path()})))).await;
+    assert_eq!(status, 200);
+    f.await_file("terminal-ready");
+    let owner = std::fs::read_to_string(owner_token_path(f.dir.path())).unwrap();
+    let other = exec(
+        &f.engine,
+        &owner,
+        None,
+        "spaces.create",
+        json!({"name":"shutdown-other"}),
+    );
+    let forum_request = ToolRequest {
+        request_id: "shutdown-forum".into(),
+        tool: "topics.list".into(),
+        space_id: Some(other["space"]["id"].as_str().unwrap().into()),
+        args: json!({}),
+    };
+    let (_, prepared) = http(
+        addr,
+        host.clone(),
+        owner.clone(),
+        Some(ToolRequest {
+            request_id: "prepare".into(),
+            tool: "runtime.prepare_shutdown".into(),
+            space_id: None,
+            args: json!({}),
+        }),
+    )
+    .await;
+    let shutdown = tokio::spawn(http(
+        addr,
+        host.clone(),
+        owner,
+        Some(ToolRequest {
+            request_id: "confirm".into(),
+            tool: "runtime.confirm_shutdown".into(),
+            space_id: None,
+            args: json!({"ticket":prepared["ticket"]}),
+        }),
+    ));
+    f.await_file("shutdown-entered");
+    let health = tokio::time::timeout(
+        Duration::from_millis(200),
+        http(addr, host.clone(), f.admin.clone(), None),
+    )
+    .await;
+    let forum = tokio::time::timeout(
+        Duration::from_millis(200),
+        http(
+            addr,
+            host.clone(),
+            other["administrator"]["credential"]
+                .as_str()
+                .unwrap()
+                .into(),
+            Some(forum_request),
+        ),
+    )
+    .await;
+    std::fs::write(f.dir.path().join("terminal-release"), "").unwrap();
+    let _ = shutdown.await.unwrap();
+    server.abort();
+    assert!(
+        health.is_ok(),
+        "health waited for native shutdown cleanup under the global HTTP gate"
+    );
+    assert_eq!(health.unwrap().0, 200);
+    assert!(
+        forum.is_ok(),
+        "another-space forum waited for native cleanup under the global HTTP gate"
+    );
+    assert_eq!(forum.unwrap().0, 200);
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_native_shutdown_terminal_wait_releases_global_http_gate() {
+    let f = Fixture::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let host = addr.to_string();
+    let (router, _) =
+        linkstart::runtime_http::router_with_bridge(f.dir.path(), &host, f.bridge.clone()).unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    struct Cleanup(PathBuf, tokio::task::AbortHandle);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, "");
+            self.1.abort();
+        }
+    }
+    let _cleanup = Cleanup(f.dir.path().join("terminal-release"), server.abort_handle());
+    let python = std::process::Command::new("python")
+        .args(["-c", "import sys;print(sys.executable)"])
+        .output()
+        .unwrap();
+    // This is a Windows console-control handler inside the actual ConPTY child,
+    // not a POSIX SIGINT fixture or a provider-read synchronization hook.
+    let script = r#"import ctypes,pathlib,time,os
+handler_type=ctypes.WINFUNCTYPE(ctypes.c_int,ctypes.c_uint)
+@handler_type
+def handler(event):
+ if event==0:
+  pathlib.Path('shutdown-entered').write_text(str(event))
+  return 1
+ return 0
+kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+kernel.SetConsoleCtrlHandler.argtypes=[handler_type,ctypes.c_int]
+kernel.SetConsoleCtrlHandler.restype=ctypes.c_int
+assert kernel.SetConsoleCtrlHandler(handler,1),ctypes.get_last_error()
+pathlib.Path('terminal-ready').write_text(str(os.getpid()))
+while not pathlib.Path('terminal-release').exists():time.sleep(0.01)
+print('windows-native-final-tail',flush=True)
+"#;
+    let (status, created) = http(addr, host.clone(), f.admin.clone(), Some(f.request("u1-terminal", "terminal.create", json!({"command":String::from_utf8(python.stdout).unwrap().trim(),"args":["-u","-c",script],"cwd":f.dir.path()})))).await;
+    assert_eq!(status, 200, "{created}");
+    f.await_file("terminal-ready");
+    let owner = std::fs::read_to_string(owner_token_path(f.dir.path())).unwrap();
+    let other = exec(
+        &f.engine,
+        &owner,
+        None,
+        "spaces.create",
+        json!({"name":"u1-other-space"}),
+    );
+    let shutdown_request = |tool: &str, args: Value| ToolRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        tool: tool.into(),
+        space_id: None,
+        args,
+    };
+    let (_, prepared) = http(
+        addr,
+        host.clone(),
+        owner.clone(),
+        Some(shutdown_request("runtime.prepare_shutdown", json!({}))),
+    )
+    .await;
+    let shutdown = tokio::spawn(http(
+        addr,
+        host.clone(),
+        owner.clone(),
+        Some(shutdown_request(
+            "runtime.confirm_shutdown",
+            json!({"ticket":prepared["ticket"]}),
+        )),
+    ));
+    f.await_file("shutdown-entered");
+    assert_eq!(
+        std::fs::read_to_string(f.dir.path().join("shutdown-entered")).unwrap(),
+        "0",
+        "actual Windows CTRL_C_EVENT required"
+    );
+    assert!(
+        !shutdown.is_finished(),
+        "native cleanup must still be waiting"
+    );
+    let forum_request = ToolRequest {
+        request_id: "u1-other-forum".into(),
+        tool: "topics.list".into(),
+        space_id: Some(other["space"]["id"].as_str().unwrap().into()),
+        args: json!({}),
+    };
+    let began = Instant::now();
+    let (health, forum) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            http(addr, host.clone(), f.admin.clone(), None)
+        ),
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            http(
+                addr,
+                host.clone(),
+                other["administrator"]["credential"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+                Some(forum_request)
+            )
+        )
+    );
+    let overlapped = !shutdown.is_finished();
+    // Keep the real child alive through the entire native 500ms cleanup budget.
+    let pending = tokio::time::timeout(Duration::from_secs(3), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    std::fs::write(f.dir.path().join("terminal-release"), "").unwrap();
+    assert!(
+        overlapped,
+        "health/forum must complete during native cleanup wait"
+    );
+    assert!(health.is_ok(), "health blocked on Windows native cleanup");
+    assert!(
+        forum.is_ok(),
+        "other-space forum blocked on Windows native cleanup"
+    );
+    let health = health.unwrap();
+    let forum = forum.unwrap();
+    assert_eq!(health.0, 200);
+    assert_eq!(health.1["status"], "draining");
+    assert_eq!(forum.0, 200);
+    assert_eq!(pending.0, 200);
+    assert_eq!(pending.1["status"], "pending");
+    assert_eq!(pending.1["remaining"][0]["status"], "stop_pending");
+    eprintln!("U1 Windows native CTRL_C_EVENT pid={} concurrent_health={} concurrent_forum={} elapsed_ms={} first_shutdown={}", std::fs::read_to_string(f.dir.path().join("terminal-ready")).unwrap(),health.0,forum.0,began.elapsed().as_millis(),pending.1);
+    // Observe the actual owned exit, then retry shutdown until tail/EOF is durable.
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, observed) = http(
+            addr,
+            host.clone(),
+            f.admin.clone(),
+            Some(f.request(
+                "u1-exit",
+                "terminal.observe",
+                json!({"endpoint_id":created["endpoint"]["id"]}),
+            )),
+        )
+        .await;
+        if observed["status"] == "exited" {
+            break;
+        }
+        assert!(Instant::now() < until, "{observed}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (_, prepared) = http(
+        addr,
+        host.clone(),
+        owner.clone(),
+        Some(shutdown_request("runtime.prepare_shutdown", json!({}))),
+    )
+    .await;
+    let (_, final_shutdown) = http(
+        addr,
+        host,
+        owner,
+        Some(shutdown_request(
+            "runtime.confirm_shutdown",
+            json!({"ticket":prepared["ticket"]}),
+        )),
+    )
+    .await;
+    assert_eq!(final_shutdown["status"], "stopping", "{final_shutdown}");
+    assert_eq!(final_shutdown["history"], "durable");
+    eprintln!("U1 Windows actual exit and history EOF/flush: {final_shutdown}");
 }
