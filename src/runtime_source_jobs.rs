@@ -39,6 +39,8 @@ pub struct SourceJobs {
     active: Arc<AtomicUsize>,
     admission: Arc<Mutex<()>>,
     unpublished: Arc<Mutex<std::collections::HashMap<String, Record>>>,
+    #[cfg(all(test, windows))]
+    before_terminal: Arc<Mutex<Option<Arc<dyn Fn(&Record) + Send + Sync>>>>,
     gates: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -125,6 +127,8 @@ impl SourceJobs {
             active: Arc::new(AtomicUsize::new(0)),
             admission: Arc::new(Mutex::new(())),
             unpublished: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            #[cfg(all(test, windows))]
+            before_terminal: Arc::new(Mutex::new(None)),
             gates: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
@@ -381,7 +385,24 @@ impl SourceJobs {
             .name(format!("source-{}", &digest(&request.request_id)[..12]))
             .spawn(move || {
                 let _guard = guard;
-                let result = jobs.run_operation(&credential, &mut worker);
+                // Endpoint ownership extends through terminal publication: a later
+                // reconciliation must not be overwritten by this worker's old result.
+                let endpoint_gate = jobs.endpoint_gate(&worker.snapshot.endpoint_id);
+                let endpoint_guard = endpoint_gate
+                    .as_ref()
+                    .map_err(storage)
+                    .and_then(|gate| gate.lock().map_err(storage));
+                let result = match &endpoint_guard {
+                    Ok(_) => jobs.run_operation(&credential, &mut worker),
+                    Err(_) => Err(error("Internal", "source endpoint lock unavailable")),
+                };
+                #[cfg(all(test, windows))]
+                {
+                    let hook = jobs.before_terminal.lock().unwrap().clone();
+                    if let Some(hook) = hook {
+                        hook(&worker);
+                    }
+                }
                 let result = if jobs.cancel.load(Ordering::SeqCst) {
                     Err(error(
                         "Cancelled",
@@ -406,6 +427,7 @@ impl SourceJobs {
                     }
                 }
                 jobs.publish_terminal(worker);
+                drop(endpoint_guard);
             });
         if let Err(e) = spawned {
             let mut record = record;
@@ -484,16 +506,17 @@ impl SourceJobs {
             repository,
         ))
     }
-    fn run_operation(&self, credential: &str, record: &mut Record) -> Result<(), ApiError> {
-        self.checkpoint()?;
-        let gate = self
+    fn endpoint_gate(&self, endpoint_id: &str) -> Result<Arc<Mutex<()>>, ApiError> {
+        Ok(self
             .gates
             .lock()
             .map_err(storage)?
-            .entry(record.snapshot.endpoint_id.clone())
+            .entry(endpoint_id.into())
             .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let _guard = gate.lock().map_err(storage)?;
+            .clone())
+    }
+    fn run_operation(&self, credential: &str, record: &mut Record) -> Result<(), ApiError> {
+        self.checkpoint()?;
         match record.request.tool.as_str() {
             "sources.sync" => self.run_sync(credential, record),
             "sources.resume" => self.apply_checkpoint(credential, record),
@@ -888,6 +911,201 @@ mod tests {
     use crate::{runtime_core::owner_token_path, runtime_source::tests::Fixture};
     use serde_json::json;
     use std::time::{Duration, Instant};
+    #[test]
+    fn publication_fault_retains_full_write_receipt_and_completed_sync_checkpoint() {
+        use std::sync::mpsc;
+        for write in [false, true] {
+            let fixture = Fixture::new();
+            let (dir, engine, admin, sid, _) = setup();
+            let endpoint = engine.execute(&admin, &request("retention-endpoint", "endpoints.register", Some(&sid), json!({"name":"explicit source","kind":"github","config":{"repository":"acme/project","allow_write_back":true}}))).unwrap();
+            let config = fixture.config.clone();
+            let factory: Arc<SourceConfigFactory> = Arc::new(move |_, _| Ok(config.clone()));
+            let path = dir.path().join("jobs");
+            let jobs = SourceJobs::open_with_config_factory(&path, engine, factory).unwrap();
+            if write {
+                std::fs::write(fixture.dir.path().join("fail-after-write"), b"yes").unwrap();
+            }
+            let (paused_tx, paused_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = Mutex::new(release_rx);
+            *jobs.before_terminal.lock().unwrap() = Some(Arc::new(move |r| {
+                if r.snapshot.job_id == "retained-original" {
+                    paused_tx.send(r.clone()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                }
+            }));
+            let args = if write {
+                json!({"endpoint_id":endpoint["id"],"number":1,"body":"ambiguous receipt survives"})
+            } else {
+                json!({"endpoint_id":endpoint["id"]})
+            };
+            let req = request(
+                "retained-original",
+                if write {
+                    "sources.writeback"
+                } else {
+                    "sources.sync"
+                },
+                Some(&sid),
+                args,
+            );
+            jobs.start(&admin, &req).unwrap();
+            let expected = paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let blocker = Connection::open(path.join("source-jobs.sqlite3")).unwrap();
+            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+            release_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while jobs.active_count() != 0 {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let observed = jobs.get(&admin, "retained-original").unwrap();
+            blocker.execute_batch("ROLLBACK").unwrap();
+            assert_eq!(observed.status, "unknown");
+            assert!(observed
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("PublicationPending"));
+            assert_eq!(observed.topic_ids, expected.snapshot.topic_ids);
+            assert_eq!(
+                observed.write_receipt, expected.snapshot.write_receipt,
+                "all receipt fields survive publication failure"
+            );
+            let retained = jobs.record("retained-original").unwrap();
+            assert_eq!(
+                retained.source_snapshots, expected.source_snapshots,
+                "full checkpoint snapshots survive"
+            );
+            assert_eq!(retained.checkpoint_ready, expected.checkpoint_ready);
+            assert_eq!(jobs.start(&admin, &req).unwrap().status, "unknown");
+            let calls_before_recovery = fixture.calls().len();
+            if write {
+                assert_eq!(observed.write_receipt.unwrap().state, WriteState::Unknown);
+                jobs.start(&admin, &request("retained-reconcile", "sources.reconcile", Some(&sid), json!({"endpoint_id":endpoint["id"],"number":1,"write_request_id":"retained-original"}))).unwrap();
+                assert_eq!(
+                    wait(&jobs, &admin, "retained-reconcile").status,
+                    "completed"
+                );
+                let recovered = jobs.get(&admin, "retained-original").unwrap();
+                assert_eq!(recovered.status, "completed");
+                let receipt = recovered.write_receipt.unwrap();
+                assert_eq!(receipt.state, WriteState::Confirmed);
+                assert_eq!(receipt.comment_id, Some(901));
+                assert!(receipt.url.unwrap().ends_with("#issuecomment-901"));
+                assert_eq!(receipt.author.unwrap().login, "writer");
+                assert_eq!(
+                    fixture
+                        .calls()
+                        .iter()
+                        .filter(|args| args.iter().any(|a| a == "POST"))
+                        .count(),
+                    1
+                );
+            } else {
+                assert!(retained.checkpoint_ready && !retained.source_snapshots.is_empty());
+                jobs.start(
+                    &admin,
+                    &request(
+                        "retained-resume",
+                        "sources.resume",
+                        Some(&sid),
+                        json!({"endpoint_id":endpoint["id"],"sync_job_id":"retained-original"}),
+                    ),
+                )
+                .unwrap();
+                let resumed = wait(&jobs, &admin, "retained-resume");
+                assert_eq!(resumed.status, "completed");
+                assert_eq!(resumed.topic_ids, observed.topic_ids);
+                assert_eq!(
+                    fixture.calls().len(),
+                    calls_before_recovery,
+                    "checkpoint resume performs no extra gh call"
+                );
+            }
+        }
+    }
+    #[test]
+    fn reconciliation_cannot_be_overwritten_by_the_older_write_terminal_publication() {
+        use std::sync::mpsc;
+        let fixture = Fixture::new();
+        let (dir, engine, admin, sid, _) = setup();
+        let endpoint = engine.execute(&admin, &request("race-endpoint", "endpoints.register", Some(&sid), json!({"name":"write","kind":"github","config":{"repository":"acme/project","allow_write_back":true}}))).unwrap();
+        let config = fixture.config.clone();
+        let jobs = SourceJobs::open_with_config_factory(
+            &dir.path().join("jobs"),
+            engine,
+            Arc::new(move |_, _| Ok(config.clone())),
+        )
+        .unwrap();
+        std::fs::write(fixture.dir.path().join("fail-after-write"), b"yes").unwrap();
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let (reconciled_tx, reconciled_rx) = mpsc::channel();
+        *jobs.before_terminal.lock().unwrap() = Some(Arc::new(move |r| {
+            if r.snapshot.job_id == "race-write" {
+                paused_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            } else if r.snapshot.job_id == "race-reconcile" {
+                reconciled_tx.send(()).unwrap();
+            }
+        }));
+        let write = request(
+            "race-write",
+            "sources.writeback",
+            Some(&sid),
+            json!({"endpoint_id":endpoint["id"],"number":1,"body":"ambiguous effect"}),
+        );
+        jobs.start(&admin, &write).unwrap();
+        paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        jobs.start(
+            &admin,
+            &request(
+                "race-reconcile",
+                "sources.reconcile",
+                Some(&sid),
+                json!({"endpoint_id":endpoint["id"],"number":1,"write_request_id":"race-write"}),
+            ),
+        )
+        .unwrap();
+        // Old code can complete reconciliation before the paused publisher. With
+        // one endpoint lifetime fence it waits, so release the original at the bound.
+        let reconciled_before_release = reconciled_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+        if reconciled_before_release {
+            assert_eq!(wait(&jobs, &admin, "race-reconcile").status, "completed");
+        }
+        release_tx.send(()).unwrap();
+        assert_eq!(wait(&jobs, &admin, "race-reconcile").status, "completed");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while jobs.active_count() != 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let confirmed = jobs.get(&admin, "race-write").unwrap();
+        assert_eq!(confirmed.status, "completed", "older terminal publication must not replace confirmed reconciliation; reconciled_before_release={reconciled_before_release}");
+        assert_eq!(
+            confirmed.write_receipt.unwrap().state,
+            WriteState::Confirmed
+        );
+        assert_eq!(jobs.start(&admin, &write).unwrap().status, "completed");
+        assert_eq!(
+            fixture
+                .calls()
+                .iter()
+                .filter(|args| args.iter().any(|a| a == "POST"))
+                .count(),
+            1
+        );
+    }
     #[test]
     fn terminal_publication_failure_is_unknown_on_get_replay_resume_and_reopen() {
         use std::sync::mpsc;

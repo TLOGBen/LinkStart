@@ -58,6 +58,11 @@ same-ID replay. Read-only lookup/replay does not write the ledger or rerun work.
 Explicit resume still requires a complete same-caller checkpoint; explicit write
 reconciliation remains GET-only. No terminal-publication failure permits another
 POST under the same request ID. There is no background publication retry loop.
+Endpoint serialization covers the entire worker through terminal publication,
+including a failed durable save's pending view. Reconciliation therefore cannot
+publish Confirmed and then be overwritten by the earlier write worker's stale
+Unknown outcome. Full receipt fields and completed checkpoints remain available
+for authorized explicit reconciliation/resume after publication failure.
 On reopen, the older durable running/applying record becomes Unknown as usual;
 the detailed in-memory result may be lost, so inspect durable checkpoint/receipt
 through explicit recovery rather than assuming success or automatically resending.

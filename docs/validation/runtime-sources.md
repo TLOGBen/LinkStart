@@ -112,3 +112,25 @@ process exit; durable recovery remains conservative Unknown, not inferred comple
 Watch read-only polling may still fail with current permission/storage read errors;
 no autonomous retry broker or multi-daemon publication protocol was added. Fresh
 independent exact-head review/proof remain required.
+
+## Follow-up: reconciliation versus older terminal publication
+
+At c55d323, a controlled schedule reproduced the independently identified race:
+an ambiguous write persisted its running/Unknown receipt; the worker paused after
+its operation returned, allowing a real GET-only reconciliation to publish
+Completed/Confirmed; releasing the older worker overwrote that result with Unknown
+(RED). The pause is a Windows-test-only scheduler observation at the exact lifecycle
+boundary. It is absent from production builds; Engine/SourceJobs/SQLite execute
+normally and only the gh subprocess is fake. This proves receipt regression, not a
+duplicate POST.
+
+GREEN extends per-endpoint ownership through terminal classification and publication,
+including pending Unknown retention. Lock order is endpoint → publication → DB;
+admission never waits for an endpoint and no reverse edge was added. The same
+scheduled regression preserves Completed/Confirmed and a single POST. A second
+regression injects actual SQLite terminal-save failure after both completed sync and
+ambiguous write, checks full checkpoint/receipt retention, then uses public local
+resume without another gh call or GET-only reconciliation with complete confirmed
+receipt readback. Logs and final-head manifest live in
+`.codex/implementation/source-reconciliation-fix/`. Earlier F3 fault driver and
+current-authority/Unknown/no-second-POST regressions remain required gates.
