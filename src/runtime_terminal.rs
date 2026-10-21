@@ -808,6 +808,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
     #[test]
+    #[cfg(windows)]
     fn owned_tree_stop_reports_truth_and_force_cleans_descendant() {
         let manager = TerminalManager::new();
         // A child with an actual descendant that ignores interactive Ctrl-C.
@@ -915,7 +916,9 @@ mod tests {
                         "Start-Sleep 3".into(),
                     ]
                 } else {
-                    vec!["-c".into(), "sleep 3".into()]
+                    // One owned root, no descendant: Unix tree-force remains
+                    // unsupported. Exercise real PTY Ctrl-C cleanup instead.
+                    vec!["-c".into(), "exec sleep 30".into()]
                 },
                 None,
             )
@@ -928,7 +931,9 @@ mod tests {
             result.is_err(),
             "oversized raw input must be rejected before delivery"
         );
+        assert!(result.unwrap_err().contains("not delivered"));
         assert!(started.elapsed() < Duration::from_secs(1));
+        #[cfg(windows)]
         assert_eq!(
             manager
                 .force_owned(&s.id, Duration::from_secs(3))
@@ -936,5 +941,20 @@ mod tests {
                 .status,
             "exited"
         );
+        #[cfg(not(windows))]
+        {
+            let cleanup_started = Instant::now();
+            let unsupported = manager
+                .force_owned(&s.id, Duration::from_secs(3))
+                .unwrap_err();
+            assert!(unsupported.contains("Unsupported"));
+            let stopped = manager.stop_owned(&s.id, Duration::from_secs(3)).unwrap();
+            assert_eq!(
+                stopped.status, "exited",
+                "real owned root must exit after PTY Ctrl-C"
+            );
+            assert!(cleanup_started.elapsed() < Duration::from_secs(4));
+            assert_eq!(manager.observe(&s.id, 0).unwrap().status, "exited");
+        }
     }
 }

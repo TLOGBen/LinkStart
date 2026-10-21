@@ -40,6 +40,16 @@ means delivery unknown and must not trigger automatic retry. This is not an OS
 sandbox. Unix process-tree force cleanup is unsupported; the public example is
 Windows-only.
 
+Platform test coverage is distinct from release compilation. Windows exercises
+Job Object descendant force cleanup and the native history/large-tail cases.
+On Unix, overload rejection is exercised against a real PTY whose shell execs a
+single sleep root; the test requires explicit force Unsupported, then bounded
+Ctrl-C cleanup with an actual exited root. It does not prove Unix descendant
+cleanup. The descendant-force test and history unit suite are Windows-only;
+the portable history authority integration tests run on Linux too, except the
+explicit cmd.exe large-tail case. macOS/Windows release CI currently compiles
+tests with --no-run; those jobs alone are not execution evidence.
+
 Release and lease expiry reject future input admission. They do not cancel or
 recall an input request already accepted into the bounded native writer queue.
 An accepted request can complete after its caller times out or releases control,
