@@ -509,7 +509,13 @@ impl Engine {
         endpoint_id: &str,
         operation: &str,
     ) -> Result<Value, ApiError> {
-        self.execute_inner(credential, request, None, Some((endpoint_id, operation)))
+        self.execute_inner(
+            credential,
+            request,
+            None,
+            Some((endpoint_id, operation)),
+            None,
+        )
     }
     pub fn execute_requiring_role(
         &self,
@@ -517,10 +523,34 @@ impl Engine {
         request: &ToolRequest,
         required_role: &str,
     ) -> Result<Value, ApiError> {
-        self.execute_inner(credential, request, Some(required_role), None)
+        self.execute_inner(credential, request, Some(required_role), None, None)
     }
     pub fn execute(&self, credential: &str, request: &ToolRequest) -> Result<Value, ApiError> {
-        self.execute_inner(credential, request, None, None)
+        self.execute_inner(credential, request, None, None, None)
+    }
+    /// Adapter-only entry: provenance is never accepted from ordinary tool arguments.
+    pub(crate) fn execute_source_projection(
+        &self,
+        credential: &str,
+        request: &ToolRequest,
+        endpoint_id: &str,
+        origin: &Value,
+    ) -> Result<Value, ApiError> {
+        if request.tool != "topics.create"
+            && !(request.tool == "task.act" && request.args["action"] == "comment")
+        {
+            return Err(err(
+                "Invalid",
+                "source projection must create or append a comment",
+            ));
+        }
+        self.execute_inner(
+            credential,
+            request,
+            None,
+            Some((endpoint_id, "manage")),
+            Some(origin),
+        )
     }
     fn execute_inner(
         &self,
@@ -528,6 +558,7 @@ impl Engine {
         request: &ToolRequest,
         required_role: Option<&str>,
         required_endpoint: Option<(&str, &str)>,
+        source_origin: Option<&Value>,
     ) -> Result<Value, ApiError> {
         let mut inner = self
             .inner
@@ -636,7 +667,60 @@ impl Engine {
                 return Err(err("Denied", "current endpoint dispatch grant required"));
             }
         }
-        let fingerprint = serde_json::to_string(request).map_err(internal)?;
+        if let Some(origin) = source_origin {
+            let endpoint = s
+                .endpoints
+                .iter()
+                .find(|e| Some(e["id"].as_str().unwrap_or("")) == required_endpoint.map(|x| x.0))
+                .unwrap();
+            let approved_repository =
+                endpoint["config"]["repository"]
+                    .as_str()
+                    .and_then(|repository| {
+                        crate::runtime_source::normalize_repository(repository).ok()
+                    });
+            let origin_repository = origin["repository"].as_str().and_then(|repository| {
+                crate::runtime_source::normalize_repository(repository).ok()
+            });
+            if endpoint["kind"] != "github"
+                || origin["kind"] != "github"
+                || origin["trust"] != "external"
+                || origin["endpoint_id"] != endpoint["id"]
+                || approved_repository.is_none()
+                || origin_repository != approved_repository
+                || !origin["source_id"].is_string()
+                || !origin["source_version"].is_string()
+            {
+                return Err(err(
+                    "Denied",
+                    "source origin differs from approved endpoint",
+                ));
+            }
+            if request.tool == "task.act" {
+                let topic = s
+                    .topics
+                    .iter()
+                    .find(|t| {
+                        t["id"] == request.args["topic_id"]
+                            && t["space_id"].as_str() == request.space_id.as_deref()
+                    })
+                    .ok_or_else(|| err("NotFound", "source topic not found"))?;
+                if !topic["provenance"].is_null()
+                    && (topic["provenance"]["kind"] != "github"
+                        || topic["provenance"]["endpoint_id"] != origin["endpoint_id"]
+                        || topic["provenance"]["source_id"] != origin["source_id"])
+                {
+                    return Err(err(
+                        "Denied",
+                        "source origin cannot replace another topic origin",
+                    ));
+                }
+            }
+        }
+        let fingerprint = match source_origin {
+            Some(origin) => serde_json::to_string(&(request, origin)).map_err(internal)?,
+            None => serde_json::to_string(request).map_err(internal)?,
+        };
         let renewal =
             request.tool == "members.heartbeat" && request.args.get("attachment_id").is_some();
         if let Some(receipt) = s.receipts.iter().find(|x| {
@@ -685,6 +769,36 @@ impl Engine {
                 (self.clock)(),
             )?
         };
+        if let Some(origin) = source_origin {
+            let topic_id = if request.tool == "topics.create" {
+                result["id"].clone()
+            } else {
+                request.args["topic_id"].clone()
+            };
+            let mut provenance = origin.clone();
+            provenance["fetched_at"] = json!((self.clock)());
+            let topic = s.topics.iter_mut().find(|t| t["id"] == topic_id).unwrap();
+            // Keep the original source version; later versions belong to their immutable events.
+            if request.tool == "topics.create" || topic["provenance"].is_null() {
+                topic["provenance"] = provenance.clone();
+            }
+            if request.tool == "topics.create" {
+                result = topic.clone();
+            } else {
+                result["topic"] = topic.clone();
+            }
+            if let Some(event) = s
+                .events
+                .iter_mut()
+                .rev()
+                .find(|e| e["topic_id"] == topic_id && e["request_id"] == request.request_id)
+            {
+                event["provenance"] = provenance;
+                if request.tool == "task.act" {
+                    result["event"] = event.clone();
+                }
+            }
+        }
         if request.tool == "members.heartbeat" {
             tx.execute("INSERT INTO core_attachments(id,space_id,identity_id,last_seen) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen",rusqlite::params![result["attachment_id"].as_str().ok_or_else(||err("Internal","heartbeat attachment missing"))?,result["space_id"].as_str().unwrap_or(""),result["identity_id"].as_str().unwrap_or(""),result["last_seen"].as_u64().unwrap_or(0)]).map_err(internal)?;
             if renewal {
@@ -1097,7 +1211,7 @@ fn dispatch(
             }) {
                 return Err(err("NotFound", "dependency not found in space"));
             }
-            let topic = json!({"id":id(),"space_id":sid,"title":title,"body":body,"kind":kind,"author":author,"created_at":now(),"updated_at":now(),"revision":0,"state":if kind=="task"{"unclaimed"}else{"discussion"},"assignee":null,"current_submission":null,"parent_topic_id":parent,"dependencies":dependencies});
+            let topic = json!({"id":id(),"space_id":sid,"title":title,"body":body,"kind":kind,"author":author,"created_at":now(),"updated_at":now(),"revision":0,"state":if kind=="task"{"unclaimed"}else{"discussion"},"assignee":null,"current_submission":null,"parent_topic_id":parent,"dependencies":dependencies,"provenance":{"kind":"forum"}});
             s.topics.push(topic.clone());
             s.events.push(json!({"id":id(),"sequence":s.events.len()+1,"space_id":sid,"topic_id":topic["id"],"author":author,"created_at":topic["created_at"],"request_id":r.request_id,"action":"create_topic","comment":body,"reply_to":null,"artifact_refs":[],"assignee_before":null,"revision_before":0,"revision_after":0,"state_before":null,"state_after":topic["state"],"assignee":null,"submission":null,"self_review":false}));
             Ok(topic)

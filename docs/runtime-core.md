@@ -1,6 +1,6 @@
 # Durable runtime core library
 
-This PR adds `linkstart::runtime_core`, an in-process public Rust library. The existing daemon CLI/HTTP/GUI does **not** route v2 commands to it. No terminal, source adapter, model runner, scheduler, or connection-history integration is included.
+`linkstart::runtime_core` is an in-process public Rust library. The existing daemon CLI/HTTP/GUI does **not** route v2 commands to it. The companion [source library](runtime-sources.md) adds explicit GitHub jobs and read-only watches through this Engine. Terminal, model runner and connection-history integration are not included.
 
 ## Public entry points
 
@@ -44,7 +44,7 @@ Roles: `human_admin`, `session_maintainer`, `manager`, `implementer`, `reviewer`
 
 `task_decomposer` can create child topics, not claim/assign/manage implicitly. Topic kinds: `task`, `plan`, `question`, `review`, `discussion`. Parent and dependencies must already exist in the same space. Creation-only links cannot form cycles. Task actions: `comment`, `claim`, `block`, `resume`, `submit_review`, `approve_review`, `request_changes`, `pass_test`, `fail_test`, `reclaim`. Submission requires `artifact_ref`; reviewing/testing requires `expected_submission` matching immutable `current_submission.id`. `expected_revision` protects concurrent changes. A task mutation, comment, event, and receipt commit atomically.
 
-Restrictive entry points validate the current required role or endpoint authority in the **same transaction before receipt replay**. Use these when an adapter has more restrictive authority than general forum posting. GitHub endpoints require server-created top-level approval from registration by management; caller config cannot establish approval. Legacy unapproved GitHub endpoints are denied by both authorization and restrictive dispatch. A production source adapter must separately validate repository locators and perform bounded external operations; this library does not access GitHub.
+Restrictive entry points validate the current required role or endpoint authority in the **same transaction before receipt replay**. Use these when an adapter has more restrictive authority than general forum posting. GitHub endpoints require server-created top-level approval from registration by management; caller config cannot establish approval. Legacy unapproved GitHub endpoints are denied by both authorization and restrictive dispatch. The companion source modules validate repository locators and bound external operations; Engine itself does not access GitHub. Source projection uses a crate-private entry and origin-aware receipt fingerprint, so ordinary tool requests cannot forge or replay protected external provenance. Ordinary topics have `provenance: {"kind":"forum"}`; imported topics/events retain structured external provenance.
 
 ## Persistence and boundaries
 
