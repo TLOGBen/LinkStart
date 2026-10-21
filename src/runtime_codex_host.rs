@@ -1263,6 +1263,14 @@ impl OwnedCodexHost {
             outcome,
         })
     }
+    /// Interrupt only this exact currently known turn. A queued old control
+    /// request must never acquire authority over a subsequently started turn.
+    pub fn interrupt_exact_turn(&mut self, expected_turn: &str) -> Result<Value, HostError> {
+        if expected_turn.trim().is_empty() || self.turn.as_deref() != Some(expected_turn) {
+            return Err(denied("expected exact active turn required"));
+        }
+        self.interrupt()
+    }
     pub fn interrupt(&mut self) -> Result<Value, HostError> {
         let t = self
             .thread

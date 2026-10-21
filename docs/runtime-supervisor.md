@@ -65,10 +65,43 @@ initialization/resume failure still closes the held host and joins heartbeat.
 startup/run/cleanup boundary failed without exposing provider text or credentials.
 An Unknown terminal status is not evidence that initialization ever succeeded.
 
-This slice requires the exact member's credential for management. Human admin,
-session-maintainer and appointed-controller cross-member management needs a
-separate authorized HTTP management gate; HTTP must never borrow a member bearer
-as proof that the requesting administrator is authorized.
+The original APIs retain their exact-member boundary. Additive `get_as`,
+`list_as(actor, space_id)`, `operation_as`, `read_exact_thread_as`, `reconcile_as`,
+`start_turn_as`, `interrupt_turn_as(expected_turn)` and `stop_as` authorize the
+original actor through the current Engine endpoint grants. The target remains
+the supervisor's exact registered member/space/endpoint/attachment/session and
+binding generation; changing any field is rejected. A manager can control a
+different member's existing worker in the same space. Explicit endpoint grants
+can admit other members, without introducing another role owner. Manage does
+not imply observe, send or control; stop requires only manage even if the worker
+has no manage grant. The worker facade and heartbeat retain the worker's private
+credential and identity. HTTP must never borrow that bearer as actor authority.
+
+Queued commands privately retain the original actor credential and exact-member
+mode, without Debug/Serialize or public receipt fields. Enqueue and dispatch
+recheck current authority in short `Engine::with_endpoint_authorization`
+callbacks. Turn dispatch records Dispatching inside that callback: this is the
+admission linearization point relative to grant revocation. Revocation committed
+before admission prevents provider dispatch; an already admitted dispatch can
+have provider effects that cannot be recalled. Provider I/O follows outside the
+Engine callback and all supervisor locks. Read/reconcile/interrupt delivery and
+every actor API's final receipt delivery revalidate the actor again, so revocation
+while a provider read is blocked prevents returning its snapshot. This is current
+authorization, not a grant snapshot or authority borrowed from the worker.
+
+`interrupt_turn_as` carries an expected provider turn ID through the queue.
+`OwnedCodexHost::interrupt_exact_turn` checks it against the currently known
+active turn before constructing the provider request. An old queued interrupt
+cannot cancel a newer turn. The original `interrupt` API remains compatible.
+`start_as`, trusted launch policy, HTTP routing, durable upstream receipt storage,
+pause/resume and generation rebind remain separate slices. These APIs do not
+claim that an in-memory Accepted receipt is durable or automatically resend Unknown.
+The exact scope comparison is against this supervisor's server-held session
+binding. A registry fence independently blocks the host's provider send gate;
+it does not erase the original-generation status/operation locator. A currently
+authorized observer can still inspect Exited/Unknown after fencing or stop.
+Mapping a replacement/rebound generation to a new current locator is deferred
+to the lifecycle slice; this version does not implement generation rebind.
 
 Each worker exclusively owns its host and continuously pumps provider messages
 even when no caller makes requests. Its separate heartbeat thread uses a bounded

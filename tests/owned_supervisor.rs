@@ -14,6 +14,302 @@ use std::{
 };
 
 #[test]
+fn actor_commands_cross_member_grants_and_exact_legacy_boundary() {
+    for grant in ["observe", "send", "control", "manage"] {
+        let f = Fixture::new();
+        let (actor, _) = f.actor(&[grant]);
+        let s = f.supervisor();
+        let mut config = f.config(false);
+        config.args[1] = "normal".into();
+        s.start(
+            config,
+            f.token.clone(),
+            Arc::new(EngineForumFacade::new(f.engine.clone(), f.token.clone())),
+            ThreadAdmission::New,
+        )
+        .unwrap();
+        f.running(&s);
+        s.start_turn(&f.token, &f.scope, "active".into(), "work".into())
+            .unwrap();
+        f.wait_operation(&s, "active", OperationPhase::Accepted);
+        assert!(matches!(
+            s.get(&actor, &f.scope),
+            Err(SupervisorError::Denied)
+        ));
+        assert!(matches!(
+            s.start_turn(&actor, &f.scope, "legacy-cross".into(), "no".into()),
+            Err(SupervisorError::Denied)
+        ));
+        assert!(matches!(
+            s.operation(&actor, &f.scope, "active"),
+            Err(SupervisorError::Denied)
+        ));
+        assert!(matches!(
+            s.read_exact_thread(&actor, &f.scope, Duration::ZERO),
+            Err(SupervisorError::Denied)
+        ));
+        assert!(matches!(
+            s.interrupt(&actor, &f.scope, Duration::ZERO),
+            Err(SupervisorError::Denied)
+        ));
+        assert!(matches!(
+            s.stop(&actor, &f.scope, Duration::ZERO),
+            Err(SupervisorError::Denied)
+        ));
+        assert_eq!(s.get_as(&actor, &f.scope).is_ok(), grant == "observe");
+        assert_eq!(
+            s.operation_as(&actor, &f.scope, "active").is_ok(),
+            grant == "observe"
+        );
+        assert_eq!(
+            !s.list_as(&actor, &f.scope.space_id).unwrap().is_empty(),
+            grant == "observe"
+        );
+        assert_eq!(
+            s.read_exact_thread_as(&actor, &f.scope, Duration::from_secs(1))
+                .is_ok(),
+            grant == "observe"
+        );
+        assert_eq!(
+            !matches!(
+                s.reconcile_as(&actor, &f.scope, "active".into(), Duration::from_secs(1)),
+                Err(SupervisorError::Denied)
+            ),
+            grant == "observe"
+        );
+        assert_eq!(
+            s.interrupt_turn_as(&actor, &f.scope, "turn-1".into(), Duration::from_secs(1))
+                .is_ok(),
+            grant == "control"
+        );
+        assert_eq!(
+            s.start_turn_as(&actor, &f.scope, "actor-turn".into(), "work".into())
+                .is_ok(),
+            grant == "send"
+        );
+        if grant == "manage" {
+            f.grants(&["send", "observe", "control"]);
+            assert!(matches!(
+                s.stop(&f.token, &f.scope, Duration::ZERO),
+                Err(SupervisorError::Denied)
+            ));
+        }
+        assert_eq!(
+            s.stop_as(&actor, &f.scope, Duration::from_secs(3)).is_ok(),
+            grant == "manage"
+        );
+        s.request_shutdown();
+    }
+}
+
+#[test]
+fn actor_read_delivery_and_queued_turn_revalidate_original_actor() {
+    let f = Fixture::new();
+    let (actor, id) = f.actor(&["observe", "send"]);
+    let s = Arc::new(f.supervisor());
+    let mut config = f.config(false);
+    config.args[1] = "normal".into();
+    let script = std::fs::read_to_string(&config.args[0]).unwrap().replace(
+        "elif method=='thread/read':",
+        "elif method=='thread/read':\n  import pathlib,time\n  pathlib.Path('read-entered').touch()\n  while not pathlib.Path('read-release').exists(): time.sleep(0.01)",
+    ).replace("elif method=='turn/start':", "elif method=='turn/start':\n  open('actor-turn-count','a').write('sent\\n')");
+    std::fs::write(&config.args[0], script).unwrap();
+    s.start(
+        config,
+        f.token.clone(),
+        Arc::new(EngineForumFacade::new(f.engine.clone(), f.token.clone())),
+        ThreadAdmission::New,
+    )
+    .unwrap();
+    f.running(&s);
+    let reader = {
+        let s = s.clone();
+        let a = actor.clone();
+        let scope = f.scope.clone();
+        std::thread::spawn(move || s.read_exact_thread_as(&a, &scope, Duration::from_secs(3)))
+    };
+    let until = Instant::now() + Duration::from_secs(3);
+    while !f.dir.path().join("read-entered").exists() {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    s.start_turn_as(
+        &actor,
+        &f.scope,
+        "revoked-queued".into(),
+        "never send".into(),
+    )
+    .unwrap();
+    f.actor_grants(&id, &[]);
+    std::fs::write(f.dir.path().join("read-release"), "").unwrap();
+    assert!(matches!(
+        reader.join().unwrap(),
+        Err(SupervisorError::Denied)
+    ));
+    f.wait_operation(&s, "revoked-queued", OperationPhase::Rejected);
+    assert!(!f.dir.path().join("actor-turn-count").exists());
+    assert!(matches!(
+        s.operation_as(&actor, &f.scope, "revoked-queued"),
+        Err(SupervisorError::Denied)
+    ));
+    s.stop(&f.token, &f.scope, Duration::from_secs(3)).unwrap();
+}
+
+#[test]
+fn actor_precise_interrupt_rejects_old_turn_and_forged_scope() {
+    let f = Fixture::new();
+    let s = f.supervisor();
+    let mut config = f.config(false);
+    config.args[1] = "history".into();
+    s.start(
+        config,
+        f.token.clone(),
+        Arc::new(EngineForumFacade::new(f.engine.clone(), f.token.clone())),
+        ThreadAdmission::New,
+    )
+    .unwrap();
+    f.running(&s);
+    s.start_turn_as(&f.admin, &f.scope, "a".into(), "a".into())
+        .unwrap();
+    f.wait_operation(&s, "a", OperationPhase::Confirmed);
+    s.start_turn_as(&f.admin, &f.scope, "b".into(), "b".into())
+        .unwrap();
+    f.wait_operation(&s, "b", OperationPhase::Accepted);
+    assert!(s
+        .interrupt_turn_as(&f.admin, &f.scope, "turn-1".into(), Duration::from_secs(1))
+        .is_err());
+    assert_eq!(
+        s.interrupt_turn_as(&f.admin, &f.scope, "turn-2".into(), Duration::from_secs(1))
+            .unwrap()["interruptedTurn"],
+        "turn-2"
+    );
+    let mut stale = f.scope.clone();
+    stale.binding_generation += 1;
+    assert!(matches!(
+        s.get_as(&f.admin, &stale),
+        Err(SupervisorError::Denied)
+    ));
+    let mut absent = f.scope.clone();
+    absent.session_id = "unknown-session".into();
+    assert!(matches!(
+        s.get_as(&f.admin, &absent),
+        Err(SupervisorError::Denied)
+    ));
+    let foreign = Fixture::new();
+    assert!(matches!(
+        s.get_as(&foreign.admin, &f.scope),
+        Err(SupervisorError::Denied)
+    ));
+    let (ungranted, _) = f.actor(&[]);
+    assert!(matches!(
+        s.get_as(&ungranted, &f.scope),
+        Err(SupervisorError::Denied)
+    ));
+    s.stop_as(&f.admin, &f.scope, Duration::from_secs(3))
+        .unwrap();
+}
+
+#[test]
+fn actor_manager_turn_preserves_worker_callback_identity() {
+    let f = Fixture::new();
+    let s = f.supervisor();
+    s.start(
+        f.config(false),
+        f.token.clone(),
+        Arc::new(EngineForumFacade::new(f.engine.clone(), f.token.clone())),
+        ThreadAdmission::New,
+    )
+    .unwrap();
+    f.running(&s);
+    s.start_turn_as(&f.admin, &f.scope, "manager-callback".into(), f.envelope())
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        let topics = f.topics();
+        if topics.to_string().contains("actual callback") {
+            let rendered = topics.to_string();
+            let topic = topics["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|topic| topic["title"] == "actual callback")
+                .unwrap();
+            assert_eq!(
+                topic["author"], f.scope.identity_id,
+                "callback author must remain the worker"
+            );
+            assert!(!rendered.contains(&f.token));
+            assert!(!rendered.contains(&f.admin));
+            break;
+        }
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    s.stop_as(&f.admin, &f.scope, Duration::from_secs(3))
+        .unwrap();
+}
+
+#[test]
+fn actor_registry_fence_blocks_queued_provider_turn_but_keeps_terminal_status_visible() {
+    let f = Fixture::new();
+    let s = Arc::new(f.supervisor());
+    let mut config = f.config(false);
+    config.args[1] = "normal".into();
+    let script = std::fs::read_to_string(&config.args[0]).unwrap().replace(
+        "elif method=='thread/read':",
+        "elif method=='thread/read':\n  import pathlib,time\n  pathlib.Path('read-entered').touch()\n  while not pathlib.Path('read-release').exists(): time.sleep(0.01)",
+    ).replace("elif method=='turn/start':", "elif method=='turn/start':\n  open('fenced-turn-count','a').write('sent\\n')");
+    std::fs::write(&config.args[0], script).unwrap();
+    s.start(
+        config,
+        f.token.clone(),
+        Arc::new(EngineForumFacade::new(f.engine.clone(), f.token.clone())),
+        ThreadAdmission::New,
+    )
+    .unwrap();
+    f.running(&s);
+    let reader = {
+        let s = s.clone();
+        let actor = f.admin.clone();
+        let scope = f.scope.clone();
+        std::thread::spawn(move || s.read_exact_thread_as(&actor, &scope, Duration::from_secs(3)))
+    };
+    let until = Instant::now() + Duration::from_secs(3);
+    while !f.dir.path().join("read-entered").exists() {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    s.start_turn_as(
+        &f.admin,
+        &f.scope,
+        "fenced-queued".into(),
+        "never send".into(),
+    )
+    .unwrap();
+    f.registry
+        .fence_binding_timeout(
+            &f.scope.session_id,
+            f.scope.binding_generation,
+            Duration::ZERO,
+        )
+        .unwrap();
+    std::fs::write(f.dir.path().join("read-release"), "").unwrap();
+    let _ = reader.join().unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while s.active_count() != 0 {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let op = s.operation_as(&f.admin, &f.scope, "fenced-queued").unwrap();
+    assert!(matches!(
+        op.phase,
+        OperationPhase::Unknown | OperationPhase::Rejected
+    ));
+    assert!(!f.dir.path().join("fenced-turn-count").exists());
+    assert!(s.get_as(&f.admin, &f.scope).unwrap().worker_exited);
+}
+
+#[test]
 fn supervisor_options_are_bounded() {
     let options = SupervisorOptions::default();
     assert!(options.queue_capacity > 0);
@@ -381,6 +677,34 @@ struct Fixture {
     registry: OwnedCodexRegistry,
 }
 impl Fixture {
+    fn actor(&self, grants: &[&str]) -> (String, String) {
+        let invite = exec(
+            &self.engine,
+            &self.admin,
+            Some(&self.scope.space_id),
+            "members.invite",
+            json!({"roles":["observer"]}),
+        );
+        let member = exec(
+            &self.engine,
+            invite["invite_token"].as_str().unwrap(),
+            Some(&self.scope.space_id),
+            "members.register",
+            json!({"name":"controller"}),
+        );
+        let id = member["id"].as_str().unwrap().to_string();
+        self.actor_grants(&id, grants);
+        (member["credential"].as_str().unwrap().to_string(), id)
+    }
+    fn actor_grants(&self, id: &str, grants: &[&str]) {
+        exec(
+            &self.engine,
+            &self.admin,
+            Some(&self.scope.space_id),
+            "endpoints.grant",
+            json!({"endpoint_id":self.scope.endpoint_id,"member_id":id,"operations":grants}),
+        );
+    }
     fn grants(&self, operations: &[&str]) {
         exec(
             &self.engine,
