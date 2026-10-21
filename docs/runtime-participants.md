@@ -70,6 +70,16 @@ registry facts. It must not do provider/network I/O, wait for events, or reenter
 Engine/ParticipantService. A real adapter must retain unknowns rather than infer
 absence from an incomplete marker query. This ledger never performs retries.
 
+For rebind and resume, the caller's `expected_generation` is the current durable
+generation. The trusted host must be prepared for the **next** generation before
+the call. The service checks CAS, calculates that next generation with checked
+addition, then presents it in `BindingContext.binding_generation` for admission;
+`previous_binding` still contains the prior durable binding. Admission failure
+rolls back all ledger changes. Success commits exactly the admitted generation;
+same-request replay rechecks the committed generation without incrementing it.
+Receipts and checkpoints use that committed generation. Pause also increments
+with checked addition. Exhaustion returns `Conflict` without changing the ledger.
+
 After restart the service can read durable inbox/checkpoint/operation history
 without an active provider. Receipt/checkpoint mutation rechecks trusted ownership;
 a changed host instance/generation requires explicit rebind/resume. The service

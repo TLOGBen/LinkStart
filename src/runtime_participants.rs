@@ -431,7 +431,7 @@ impl ParticipantService {
                     if r.args.get("initial_cursor").is_some() {
                         return Err(error("Invalid", "rebind preserves the initial boundary"));
                     }
-                    b["binding_generation"] = json!(number(&b, "binding_generation")? + 1);
+                    b["binding_generation"] = json!(next_binding_generation(&b)?);
                 } else {
                     if number(&r.args, "expected_generation")? != 0 {
                         return Err(error("Conflict", "new binding generation must be zero"));
@@ -560,14 +560,14 @@ impl ParticipantService {
             }
             "participants.pause" => {
                 b["paused"] = json!(true);
-                b["binding_generation"] = json!(number(&b, "binding_generation")? + 1);
+                b["binding_generation"] = json!(next_binding_generation(&b)?);
                 l.bindings[index.unwrap()] = b.clone();
                 json!({"binding":b,"provider_turn_cancelled":false})
             }
             "participants.resume" => {
+                b["binding_generation"] = json!(next_binding_generation(&b)?);
                 b["admission"] =
                     serde_json::to_value(self.admit(l, &b, auth, true)?).map_err(internal)?;
-                b["binding_generation"] = json!(number(&b, "binding_generation")? + 1);
                 b["paused"] = json!(false);
                 l.bindings[index.unwrap()] = b.clone();
                 b
@@ -669,6 +669,11 @@ impl ParticipantService {
         }
         Ok(result)
     }
+}
+fn next_binding_generation(binding: &Value) -> Result<u64, ApiError> {
+    number(binding, "binding_generation")?
+        .checked_add(1)
+        .ok_or_else(|| error("Conflict", "binding generation exhausted"))
 }
 fn event_provenance(event: &Value) -> Value {
     event

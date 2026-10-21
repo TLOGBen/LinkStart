@@ -766,24 +766,44 @@ fn source_projection_envelopes_preserve_each_version_and_do_not_relabel_human_co
     let pid = binding["participant_id"].as_str().unwrap();
     let endpoint=f.engine.execute(&f.token,&req("github-endpoint","endpoints.register",&f.sid,json!({"name":"approved source","kind":"github","config":{"repository":"acme/project","allow_write_back":false}}))).unwrap();
     let remote = tempfile::tempdir().unwrap();
-    let script = remote.path().join("fake-gh.ps1");
+    let script = remote.path().join("fake-gh.rs");
+    let program = remote.path().join(if cfg!(windows) {
+        "fake-gh.exe"
+    } else {
+        "fake-gh"
+    });
     let responses = remote.path().join("issues.json");
     std::fs::write(
         &script,
-        format!(
-            r#"
-$ErrorActionPreference='Stop'
-[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false)
-$methodIndex=[Array]::IndexOf($args,'--method')
-if ($args[0] -ne 'api' -or ($methodIndex -ge 0 -and $args[$methodIndex+1] -ne 'GET')) {{ throw 'unexpected command or mutation' }}
-if ($args[1] -match '/issues\?') {{ [Console]::Out.Write([IO.File]::ReadAllText('{}')) }}
-elseif ($args[1] -match '/pulls\?') {{ [Console]::Out.Write('[[]]') }}
-else {{ throw 'unexpected endpoint' }}
+        r#"
+fn main() {
+    let args:Vec<String>=std::env::args().skip(1).collect();
+    assert_eq!(args[1],"api","unexpected command");
+    if let Some(index)=args.iter().position(|a|a=="--method") {
+        assert_eq!(args[index+1],"GET","external mutations are forbidden in this fixture");
+    }
+    if args[2].contains("/issues?") {print!("{}",std::fs::read_to_string(&args[0]).unwrap());}
+    else if args[2].contains("/pulls?") {print!("[[]]");}
+    else {panic!("unexpected endpoint");}
+}
 "#,
-            responses.to_string_lossy().replace('\'', "''")
-        ),
     )
     .unwrap();
+    // Compile a std-only executable with the Rust toolchain already required by
+    // the suite; the source boundary remains a real subprocess on every OS.
+    let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let built = std::process::Command::new(compiler)
+        .args(["--edition=2021", "--crate-name", "participant_fake_gh"])
+        .arg(&script)
+        .arg("-o")
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "fake gh fixture compilation failed: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
     let snapshot = |version: &str, login: &str, id: u64| json!([[{"node_id":"I_PARTICIPANT","number":1,"title":"versioned source","body":format!("source {version}"),"state":"open","html_url":"https://github.com/acme/project/issues/1","user":{"id":id,"login":login,"node_id":format!("U_{login}")},"created_at":"2026-10-20T00:00:00Z","updated_at":version}]]);
     std::fs::write(
         &responses,
@@ -795,13 +815,8 @@ else {{ throw 'unexpected endpoint' }}
         repository: "acme/project".into(),
         allow_write_back: false,
     }];
-    config.gh_program = "pwsh.exe".into();
-    config.gh_prefix_args = vec![
-        "-NoProfile".into(),
-        "-NonInteractive".into(),
-        "-File".into(),
-        script.to_string_lossy().into_owned(),
-    ];
+    config.gh_program = program;
+    config.gh_prefix_args = vec![responses.to_string_lossy().into_owned()];
     let jobs = SourceJobs::open_with_config_factory(
         &f.dir.path().join("jobs"),
         f.engine.clone(),
@@ -978,4 +993,143 @@ else {{ throw 'unexpected endpoint' }}
         repaired["intents"][1]["state"],
         legacy["intents"][1]["state"]
     );
+}
+
+#[test]
+fn resume_admits_prospective_generation_and_rolls_back_failed_admission() {
+    struct StrictGenerationHost {
+        expected: AtomicU64,
+        calls: std::sync::Mutex<Vec<u64>>,
+    }
+    impl TrustedHost for StrictGenerationHost {
+        fn admit(&self, c: &BindingContext) -> Result<OwnedAdmission, ApiError> {
+            self.calls.lock().unwrap().push(c.binding_generation);
+            if c.binding_generation != self.expected.load(Ordering::SeqCst) {
+                return Err(ApiError {
+                    code: "Denied".into(),
+                    message: "owned registry requires exact prospective generation".into(),
+                });
+            }
+            let mut admission = Host.admit(c)?;
+            admission.host_generation = c.binding_generation;
+            Ok(admission)
+        }
+    }
+    let f = Fixture::new();
+    let host = Arc::new(StrictGenerationHost {
+        expected: AtomicU64::new(1),
+        calls: std::sync::Mutex::new(vec![]),
+    });
+    let s = ParticipantService::open(f.dir.path(), f.engine.clone(), host.clone()).unwrap();
+    let b = f.bind(&s);
+    let pid = b["participant_id"].as_str().unwrap();
+    let topic = f
+        .engine
+        .execute(
+            &f.token,
+            &req(
+                "task",
+                "topics.create",
+                &f.sid,
+                json!({"title":"task","body":"work","kind":"task"}),
+            ),
+        )
+        .unwrap();
+    let events = f
+        .call(
+            &s,
+            "inbox",
+            "participants.read",
+            json!({"participant_id":pid}),
+        )
+        .unwrap();
+    f.call(
+        &s,
+        "pause",
+        "participants.pause",
+        json!({"participant_id":pid,"expected_generation":1}),
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(f.dir.path().join("v2-participants.sqlite")).unwrap();
+    let raw = || {
+        db.query_row("SELECT json FROM participant_ledger WHERE id=1", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap()
+    };
+    let paused = raw();
+    let args = json!({"participant_id":pid,"expected_generation":2});
+    host.expected.store(4, Ordering::SeqCst);
+    assert_eq!(
+        f.call(&s, "resume", "participants.resume", args.clone())
+            .unwrap_err()
+            .code,
+        "Denied"
+    );
+    assert_eq!(
+        raw(),
+        paused,
+        "failed admission must not change binding, cursor, or receipts"
+    );
+    assert_eq!(
+        *host.calls.lock().unwrap().last().unwrap(),
+        3,
+        "resume must present its prospective generation, like rebind"
+    );
+    host.expected.store(3, Ordering::SeqCst);
+    let resumed = f
+        .call(&s, "resume", "participants.resume", args.clone())
+        .unwrap();
+    assert_eq!(resumed["binding_generation"], 3);
+    assert_eq!(resumed["admission"]["host_generation"], 3);
+    assert_eq!(
+        f.call(&s, "resume", "participants.resume", args).unwrap(),
+        resumed,
+        "same-request replay must remain admitted by exact-generation registry"
+    );
+    f.call(&s,"handled","participants.receipt",json!({"participant_id":pid,"binding_generation":3,"event_id":events["events"][0]["event_id"],"state":"handled"})).unwrap();
+    let checkpoint=f.call(&s,"checkpoint","work.checkpoint.set",json!({"participant_id":pid,"binding_generation":3,"work_id":"work","expected_revision":0,"topic_id":topic["id"],"assignment_revision":0,"completed":[],"pending":[],"unknown":[],"artifacts":[]})).unwrap();
+    assert_eq!(checkpoint["revision"], 1);
+    assert_eq!(host.calls.lock().unwrap().as_slice(), [1, 3, 3, 3, 3, 3]);
+}
+
+#[test]
+fn binding_generation_exhaustion_rejects_each_transition_without_changing_ledger() {
+    let f = Fixture::new();
+    let s = f.service();
+    let b = f.bind(&s);
+    let pid = b["participant_id"].as_str().unwrap();
+    let db = rusqlite::Connection::open(f.dir.path().join("v2-participants.sqlite")).unwrap();
+    let raw = || {
+        db.query_row("SELECT json FROM participant_ledger WHERE id=1", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap()
+    };
+    // Boundary fixture only: reaching u64::MAX by normal requests is impractical.
+    let mut exhausted: Value = serde_json::from_str(&raw()).unwrap();
+    exhausted["bindings"][0]["binding_generation"] = json!(u64::MAX);
+    db.execute(
+        "UPDATE participant_ledger SET json=?1 WHERE id=1",
+        [exhausted.to_string()],
+    )
+    .unwrap();
+    let before = raw();
+    for tool in [
+        "participants.pause",
+        "participants.resume",
+        "participants.bind",
+    ] {
+        let mut args = json!({"participant_id":pid,"expected_generation":u64::MAX});
+        if tool == "participants.bind" {
+            args["endpoint_id"] = json!(f.eid);
+            args["session_id"] = json!("replacement-session");
+            args["attachment_id"] = json!(f.attachment);
+            args["adapter_kind"] = json!("test-owned");
+        }
+        let error = f.call(&s, tool, tool, args).unwrap_err();
+        assert_eq!(error.code, "Conflict");
+        assert!(error.message.contains("generation exhausted"));
+        assert_eq!(raw(), before);
+    }
 }
