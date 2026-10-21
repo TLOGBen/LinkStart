@@ -607,6 +607,8 @@ impl AgentRunner {
         Ok(())
     }
     fn deliver(&self, credential: &str, expected: &JobRecord) -> Result<JobSnapshot, ApiError> {
+        #[cfg(test)]
+        self.test_event("before_delivery_read");
         let latest = self.record(&expected.request.job_id)?;
         #[cfg(test)]
         self.test_event("before_delivery");
@@ -2177,15 +2179,63 @@ mod tests {
             started: tx,
             release: AtomicBool::new(false),
         });
-        let runner = AgentRunner::open(dir.path(), engine, fake.clone()).unwrap();
+        let runner = AgentRunner::open(dir.path(), engine.clone(), fake.clone()).unwrap();
+        let (before_worker, release_worker) = pause_event(&runner, "before_worker", 1);
         let job = JobRequest {
             job_id: "queued".into(),
             space_id: sid.into(),
             mission_topic_id: mission.into(),
         };
         let accepted = runner.start(&token, &job).unwrap();
+        before_worker.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(accepted.status, "queued");
-        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(runner.get(&token, &job.job_id).unwrap().status, "queued");
+        assert_eq!(runner.start(&token, &job).unwrap().status, "queued");
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runner.active_count(), 1);
+        release_worker.send(()).unwrap();
+        rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(runner.get(&token, &job.job_id).unwrap().status, "running");
+        assert_eq!(runner.start(&token, &job).unwrap().status, "running");
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.active_count(), 1);
+        fake.release.store(true, Ordering::SeqCst);
+        wait_for_worker(&runner);
+        let completed = runner.get(&token, &job.job_id).unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.topic_ids.len(), 1);
+        assert_actual_child_receipts(dir.path(), &engine, &token, &job, &completed.topic_ids);
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.active_count(), 0);
+    }
+
+    #[test]
+    fn start_returns_latest_running_when_worker_advances_before_delivery_read() {
+        let (dir, engine, _owner, _admin, token, ids) = setup();
+        let (sid, mission) = ids.split_once('|').unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fake = Arc::new(GateProcess {
+            calls: AtomicUsize::new(0),
+            started: tx,
+            release: AtomicBool::new(false),
+        });
+        let runner = AgentRunner::open(dir.path(), engine, fake.clone()).unwrap();
+        let job = JobRequest {
+            job_id: "queued".into(),
+            space_id: sid.into(),
+            mission_topic_id: mission.into(),
+        };
+        let (delivery_read, finish_delivery) = pause_event(&runner, "before_delivery_read", 1);
+        let starter = runner.clone();
+        let start_token = token.clone();
+        let start_job = job.clone();
+        let start_thread = std::thread::spawn(move || starter.start(&start_token, &start_job));
+        delivery_read.recv_timeout(Duration::from_secs(10)).unwrap();
+        rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(runner.get(&token, &job.job_id).unwrap().status, "running");
+        finish_delivery.send(()).unwrap();
+        let accepted = start_thread.join().unwrap().unwrap();
+        assert_eq!(accepted.status, "running");
         assert_eq!(runner.get(&token, &job.job_id).unwrap().status, "running");
         assert_eq!(runner.active_count(), 1);
         assert_eq!(runner.start(&token, &job).unwrap().status, "running");
