@@ -5,6 +5,363 @@ use linkstart::{
 };
 use serde_json::{json, Value};
 use std::time::Duration;
+fn alternate_scope(f: &Fixture, other_space: bool) -> (String, String, WorkerBinding) {
+    let (admin, worker, mut binding) = if other_space {
+        let owner = std::fs::read_to_string(owner_token_path(f.dir.path())).unwrap();
+        let s = call(&f.e, &owner, None, "spaces.create", json!({"name":"other"}));
+        let admin = s["administrator"]["credential"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let sid = s["space"]["id"].as_str().unwrap();
+        let hb = call(&f.e, &admin, Some(sid), "members.heartbeat", json!({}));
+        let binding = WorkerBinding {
+            space_id: sid.into(),
+            endpoint_id: String::new(),
+            identity_id: hb["identity_id"].as_str().unwrap().into(),
+            attachment_id: hb["attachment_id"].as_str().unwrap().into(),
+        };
+        (admin.clone(), admin, binding)
+    } else {
+        (f.admin.clone(), f.worker.clone(), f.binding.clone())
+    };
+    let endpoint = call(
+        &f.e,
+        &admin,
+        Some(&binding.space_id),
+        "endpoints.register",
+        json!({"name":"alternate","kind":"terminal"}),
+    );
+    binding.endpoint_id = endpoint["id"].as_str().unwrap().into();
+    call(
+        &f.e,
+        &admin,
+        Some(&binding.space_id),
+        "endpoints.grant",
+        json!({"endpoint_id":binding.endpoint_id,"member_id":binding.identity_id,"operations":["send"]}),
+    );
+    (admin, worker, binding)
+}
+#[test]
+fn scope_namespaces_cross_space() {
+    scope_namespace_case(true);
+}
+#[test]
+fn scope_namespaces_cross_endpoint() {
+    scope_namespace_case(false);
+}
+fn scope_namespace_case(other_space: bool) {
+    {
+        let f = Fixture::new();
+        f.provision();
+        let (admin, worker, binding) = alternate_scope(&f, other_space);
+        f.store
+            .provision_worker_slot(&admin, "other-slot", binding.clone(), &worker)
+            .unwrap();
+        let mut foreign = f.plan();
+        foreign.binding = binding.clone();
+        foreign.worker_slot = "other-slot".into();
+        f.store
+            .install(&admin, "shared-plan", None, foreign)
+            .unwrap();
+        let db = rusqlite::Connection::open(f.dir.path().join("v2-launch-policy.sqlite")).unwrap();
+        let before: (String, u64, bool) = db
+            .query_row(
+                "SELECT document,revision,revoked FROM launch_plans WHERE id='shared-plan'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let missing = f
+            .store
+            .approve(
+                &f.admin,
+                &f.binding.space_id,
+                &f.binding.endpoint_id,
+                "missing",
+                1,
+            )
+            .err()
+            .unwrap();
+        let foreign = f
+            .store
+            .approve(
+                &f.admin,
+                &f.binding.space_id,
+                &f.binding.endpoint_id,
+                "shared-plan",
+                1,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(
+            (&missing.code, &missing.message),
+            (&foreign.code, &foreign.message)
+        );
+        let missing = f
+            .store
+            .revoke(
+                &f.admin,
+                &f.binding.space_id,
+                &f.binding.endpoint_id,
+                "missing",
+                1,
+            )
+            .unwrap_err();
+        let foreign = f
+            .store
+            .revoke(
+                &f.admin,
+                &f.binding.space_id,
+                &f.binding.endpoint_id,
+                "shared-plan",
+                1,
+            )
+            .unwrap_err();
+        assert_eq!(
+            (&missing.code, &missing.message),
+            (&foreign.code, &foreign.message)
+        );
+        assert_eq!(
+            f.store
+                .install(&f.admin, "shared-plan", None, f.plan())
+                .unwrap(),
+            1
+        );
+        let after: (String, u64, bool) = db
+            .query_row(
+                "SELECT document,revision,revoked FROM launch_plans WHERE document=?1",
+                [&before.0],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+        assert!(f
+            .store
+            .approve(
+                &admin,
+                &binding.space_id,
+                &binding.endpoint_id,
+                "shared-plan",
+                1
+            )
+            .is_ok());
+    }
+}
+#[test]
+fn worker_slots_cross_space() {
+    worker_slot_case(true);
+}
+#[test]
+fn worker_slots_cross_endpoint() {
+    worker_slot_case(false);
+}
+fn worker_slot_case(other_space: bool) {
+    {
+        let f = Fixture::new();
+        f.provision();
+        let (admin, worker, binding) = alternate_scope(&f, other_space);
+        f.store
+            .provision_worker_slot(&admin, "worker-slot", binding.clone(), &worker)
+            .unwrap();
+        let mut plan = f.plan();
+        plan.binding = binding.clone();
+        f.store.install(&admin, "plan", None, plan).unwrap();
+        assert!(f
+            .store
+            .approve(&admin, &binding.space_id, &binding.endpoint_id, "plan", 1)
+            .is_ok());
+        f.store.install(&f.admin, "plan", None, f.plan()).unwrap();
+        assert!(f.approve(1).is_ok());
+    }
+}
+#[test]
+fn extreme_timeout_obeys_platform_deadline_without_panic() {
+    let f = Fixture::new();
+    f.provision();
+    let mut p = f.plan();
+    p.timeout = Duration::from_millis(u64::MAX);
+    let supported = std::time::Instant::now().checked_add(p.timeout).is_some();
+    let result = f.store.install(&f.admin, "plan", None, p);
+    if supported {
+        assert_eq!(result.unwrap(), 1);
+        assert!(f.approve(1).is_ok());
+    } else {
+        assert_eq!(result.unwrap_err().code, "Invalid");
+    }
+}
+fn legacy_fixture(f: &Fixture, version: u64) {
+    f.provision();
+    f.store.install(&f.admin, "plan", None, f.plan()).unwrap();
+    f.store
+        .install(&f.admin, "plan", Some(1), f.plan())
+        .unwrap();
+    f.store
+        .install(&f.admin, "revoked", None, f.plan())
+        .unwrap();
+    f.store
+        .revoke(
+            &f.admin,
+            &f.binding.space_id,
+            &f.binding.endpoint_id,
+            "revoked",
+            1,
+        )
+        .unwrap();
+    let db = rusqlite::Connection::open(f.dir.path().join("v2-launch-policy.sqlite")).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE;
+        ALTER TABLE worker_slots RENAME TO slots_v2_fixture;
+        ALTER TABLE launch_plans RENAME TO plans_v2_fixture;
+        CREATE TABLE worker_slots(id TEXT PRIMARY KEY,binding TEXT NOT NULL,credential TEXT NOT NULL);
+        CREATE TABLE launch_plans(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,revoked INTEGER NOT NULL DEFAULT 0,document TEXT NOT NULL);
+        INSERT INTO worker_slots SELECT id,binding,credential FROM slots_v2_fixture;
+        INSERT INTO launch_plans SELECT id,revision,revoked,document FROM plans_v2_fixture;
+        DROP TABLE slots_v2_fixture; DROP TABLE plans_v2_fixture;
+        CREATE TABLE unrelated_state(id INTEGER PRIMARY KEY,value TEXT NOT NULL);
+        INSERT INTO unrelated_state VALUES(17,'must remain unchanged'); COMMIT;").unwrap();
+    db.pragma_update(None, "user_version", version).unwrap();
+}
+fn storage_snapshot(
+    db: &rusqlite::Connection,
+) -> (
+    Vec<(String, String, String)>,
+    Vec<(String, u64, bool, String)>,
+    String,
+) {
+    let slots = db
+        .prepare("SELECT id,binding,credential FROM worker_slots ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let plans = db
+        .prepare("SELECT id,revision,revoked,document FROM launch_plans ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let unrelated = db
+        .query_row("SELECT value FROM unrelated_state WHERE id=17", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    (slots, plans, unrelated)
+}
+#[test]
+fn legacy_migration_preserves_rows_secrets_revisions_and_reopen_is_idempotent() {
+    for version in [0, 1] {
+        let f = Fixture::new();
+        legacy_fixture(&f, version);
+        let db = rusqlite::Connection::open(f.dir.path().join("v2-launch-policy.sqlite")).unwrap();
+        let before = storage_snapshot(&db);
+        for _ in 0..2 {
+            let reopened = LaunchPolicyStore::open(
+                f.dir.path(),
+                f.e.clone(),
+                OwnedCodexRegistry::open(f.dir.path(), f.e.clone()).unwrap(),
+            )
+            .unwrap();
+            assert!(before == storage_snapshot(&db));
+            assert_eq!(
+                db.query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
+                    .unwrap(),
+                2
+            );
+            assert!(reopened
+                .approve(
+                    &f.admin,
+                    &f.binding.space_id,
+                    &f.binding.endpoint_id,
+                    "plan",
+                    2
+                )
+                .is_ok());
+            assert_eq!(
+                reopened
+                    .approve(
+                        &f.admin,
+                        &f.binding.space_id,
+                        &f.binding.endpoint_id,
+                        "revoked",
+                        2
+                    )
+                    .err()
+                    .unwrap()
+                    .code,
+                "Conflict"
+            );
+        }
+        let worker_columns: u64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('worker_slots')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(worker_columns, 5);
+    }
+}
+#[test]
+fn malformed_legacy_document_rolls_back_both_tables_and_unrelated_state() {
+    let f = Fixture::new();
+    legacy_fixture(&f, 1);
+    let db = rusqlite::Connection::open(f.dir.path().join("v2-launch-policy.sqlite")).unwrap();
+    db.execute(
+        "UPDATE launch_plans SET document='PRIVATE-MIGRATION-SENTINEL' WHERE id='revoked'",
+        [],
+    )
+    .unwrap();
+    let before = storage_snapshot(&db);
+    let error = LaunchPolicyStore::open(
+        f.dir.path(),
+        f.e.clone(),
+        OwnedCodexRegistry::open(f.dir.path(), f.e.clone()).unwrap(),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(!error.contains(&f.worker) && !error.contains("PRIVATE-MIGRATION-SENTINEL"));
+    assert!(before == storage_snapshot(&db));
+    assert_eq!(
+        db.query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('worker_slots')",
+            [],
+            |r| r.get::<_, u64>(0)
+        )
+        .unwrap(),
+        3
+    );
+    assert_eq!(db.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('worker_slots_v1','launch_plans_v1')",[],|r|r.get::<_,u64>(0)).unwrap(),0);
+}
+#[test]
+fn unknown_future_schema_is_rejected_without_mutation() {
+    let f = Fixture::new();
+    legacy_fixture(&f, 99);
+    let db = rusqlite::Connection::open(f.dir.path().join("v2-launch-policy.sqlite")).unwrap();
+    let before = storage_snapshot(&db);
+    let error = LaunchPolicyStore::open(
+        f.dir.path(),
+        f.e.clone(),
+        OwnedCodexRegistry::open(f.dir.path(), f.e.clone()).unwrap(),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert_eq!(error, "unsupported launch policy schema version");
+    assert!(before == storage_snapshot(&db));
+    assert_eq!(
+        db.query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
+            .unwrap(),
+        99
+    );
+}
 #[test]
 fn identifier_and_persisted_timeout_boundaries() {
     let f = Fixture::new();
@@ -63,7 +420,7 @@ fn exact_space_is_required_even_for_owner() {
             .err()
             .unwrap()
             .code,
-        "Denied"
+        "LaunchApprovalRequired"
     );
 }
 #[test]

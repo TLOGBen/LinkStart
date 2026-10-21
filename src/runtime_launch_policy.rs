@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 fn error(code: &str, message: &str) -> ApiError {
     ApiError {
@@ -24,6 +24,111 @@ fn internal(_: impl std::fmt::Display) -> ApiError {
 }
 fn valid_id(id: &str) -> bool {
     !id.trim().is_empty() && id.len() <= 256 && !id.contains('\0')
+}
+fn valid_timeout(timeout: Duration) -> bool {
+    timeout.as_millis() > 0
+        && timeout.as_millis() <= u64::MAX as u128
+        && timeout.subsec_nanos() % 1_000_000 == 0
+        && Instant::now().checked_add(timeout).is_some()
+}
+const SCHEMA_V2: &str = "
+CREATE TABLE worker_slots(space_id TEXT NOT NULL,endpoint_id TEXT NOT NULL,id TEXT NOT NULL,binding TEXT NOT NULL,credential TEXT NOT NULL,PRIMARY KEY(space_id,endpoint_id,id));
+CREATE TABLE launch_plans(space_id TEXT NOT NULL,endpoint_id TEXT NOT NULL,id TEXT NOT NULL,revision INTEGER NOT NULL,revoked INTEGER NOT NULL DEFAULT 0,document TEXT NOT NULL,PRIMARY KEY(space_id,endpoint_id,id));";
+
+/// Schema changes, row copying and version publication share one SQLite transaction.
+/// Legacy JSON and credential bytes are preserved; migration never reauthorizes or repairs them.
+fn migrate(db: &mut Connection) -> anyhow::Result<()> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: u64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    anyhow::ensure!(version <= 2, "unsupported launch policy schema version");
+    if version == 2 {
+        tx.prepare("SELECT space_id,endpoint_id,id,binding,credential FROM worker_slots LIMIT 0")?;
+        tx.prepare(
+            "SELECT space_id,endpoint_id,id,revision,revoked,document FROM launch_plans LIMIT 0",
+        )?;
+        tx.commit()?;
+        return Ok(());
+    }
+    let tables: u64 = tx.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('worker_slots','launch_plans')", [], |r| r.get(0))?;
+    if tables == 0 {
+        tx.execute_batch(SCHEMA_V2)?;
+    } else {
+        anyhow::ensure!(tables == 2, "incomplete legacy launch policy schema");
+        tx.execute_batch("ALTER TABLE worker_slots RENAME TO worker_slots_v1; ALTER TABLE launch_plans RENAME TO launch_plans_v1;")?;
+        tx.execute_batch(SCHEMA_V2)?;
+        {
+            let mut statement = tx.prepare("SELECT id,binding,credential FROM worker_slots_v1")?;
+            let rows = statement.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, encoded, credential) = row?;
+                let b: WorkerBinding = serde_json::from_str(&encoded)
+                    .map_err(|_| anyhow::anyhow!("invalid legacy worker binding"))?;
+                anyhow::ensure!(
+                    valid_id(&id)
+                        && [
+                            &b.space_id,
+                            &b.endpoint_id,
+                            &b.identity_id,
+                            &b.attachment_id
+                        ]
+                        .iter()
+                        .all(|id| valid_id(id))
+                        && !credential.is_empty(),
+                    "invalid legacy worker slot"
+                );
+                tx.execute(
+                    "INSERT INTO worker_slots VALUES(?1,?2,?3,?4,?5)",
+                    params![b.space_id, b.endpoint_id, id, encoded, credential],
+                )?;
+            }
+        }
+        {
+            let mut statement =
+                tx.prepare("SELECT id,revision,revoked,document FROM launch_plans_v1")?;
+            let rows = statement.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, revision, revoked, encoded) = row?;
+                let p: StoredPlan = serde_json::from_str(&encoded)
+                    .map_err(|_| anyhow::anyhow!("invalid legacy launch document"))?;
+                anyhow::ensure!(
+                    valid_id(&id)
+                        && valid_id(&p.binding.space_id)
+                        && valid_id(&p.binding.endpoint_id)
+                        && revision > 0
+                        && [0, 1].contains(&revoked),
+                    "invalid legacy launch row"
+                );
+                tx.execute(
+                    "INSERT INTO launch_plans VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![
+                        p.binding.space_id,
+                        p.binding.endpoint_id,
+                        id,
+                        revision,
+                        revoked,
+                        encoded
+                    ],
+                )?;
+            }
+        }
+        tx.execute_batch("DROP TABLE worker_slots_v1; DROP TABLE launch_plans_v1;")?;
+    }
+    tx.execute_batch("PRAGMA user_version=2;")?;
+    tx.commit()?;
+    Ok(())
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -104,9 +209,11 @@ impl LaunchPolicyStore {
         if path.exists() {
             crate::runtime_core::protect(&path)?;
         }
-        let db = Connection::open(&path)?;
+        let mut db = Connection::open(&path)?;
+        db.busy_timeout(Duration::from_secs(5))?;
         // DELETE journal stays inside the protected parent, avoiding persistent WAL secrets.
-        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS worker_slots(id TEXT PRIMARY KEY,binding TEXT NOT NULL,credential TEXT NOT NULL); CREATE TABLE IF NOT EXISTS launch_plans(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,revoked INTEGER NOT NULL DEFAULT 0,document TEXT NOT NULL);")?;
+        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")?;
+        migrate(&mut db)?;
         crate::runtime_core::protect(&path)?;
         Ok(Self {
             path,
@@ -166,8 +273,8 @@ impl LaunchPolicyStore {
         let row: Option<(String, String)> = self
             .db()?
             .query_row(
-                "SELECT binding,credential FROM worker_slots WHERE id=?1",
-                [id],
+                "SELECT binding,credential FROM worker_slots WHERE space_id=?1 AND endpoint_id=?2 AND id=?3",
+                params![b.space_id,b.endpoint_id,id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
@@ -219,8 +326,8 @@ impl LaunchPolicyStore {
             let encoded = serde_json::to_string(&binding).map_err(internal)?;
             let old: Option<(String, String)> = tx
                 .query_row(
-                    "SELECT binding,credential FROM worker_slots WHERE id=?1",
-                    [id],
+                    "SELECT binding,credential FROM worker_slots WHERE space_id=?1 AND endpoint_id=?2 AND id=?3",
+                    params![binding.space_id,binding.endpoint_id,id],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()
@@ -232,8 +339,8 @@ impl LaunchPolicyStore {
                 return Ok(());
             }
             tx.execute(
-                "INSERT INTO worker_slots VALUES(?1,?2,?3)",
-                params![id, encoded, credential],
+                "INSERT INTO worker_slots VALUES(?1,?2,?3,?4,?5)",
+                params![binding.space_id,binding.endpoint_id,id, encoded, credential],
             )
             .map_err(internal)?;
             tx.commit().map_err(internal)
@@ -251,10 +358,7 @@ impl LaunchPolicyStore {
             || plan.model.trim().is_empty()
             || plan.provider_version.trim().is_empty()
             || plan.capability_evidence.trim().is_empty()
-            || plan.timeout.is_zero()
-            || plan.timeout.as_millis() == 0
-            || plan.timeout.subsec_nanos() % 1_000_000 != 0
-            || plan.timeout.as_millis() > u64::MAX as u128
+            || !valid_timeout(plan.timeout)
             || plan.args.iter().any(|a| a.contains('\0'))
         {
             return Err(error("Invalid", "invalid trusted launch plan"));
@@ -299,7 +403,7 @@ impl LaunchPolicyStore {
             let mut db = self.db()?;
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(internal)?;
             let old: Option<(u64, bool, String)> = tx.query_row(
-                "SELECT revision,revoked,document FROM launch_plans WHERE id=?1", [id],
+                "SELECT revision,revoked,document FROM launch_plans WHERE space_id=?1 AND endpoint_id=?2 AND id=?3", params![stored.binding.space_id,stored.binding.endpoint_id,id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             ).optional().map_err(internal)?;
             if let Some((_, _, ref prior)) = old {
@@ -317,8 +421,8 @@ impl LaunchPolicyStore {
                 _ => return Err(error("Conflict", "exact previous plan revision required")),
             };
             tx.execute(
-                "INSERT INTO launch_plans VALUES(?1,?2,0,?3) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,revoked=0,document=excluded.document",
-                params![id, revision, document],
+                "INSERT INTO launch_plans VALUES(?1,?2,?3,?4,0,?5) ON CONFLICT(space_id,endpoint_id,id) DO UPDATE SET revision=excluded.revision,revoked=0,document=excluded.document",
+                params![stored.binding.space_id,stored.binding.endpoint_id,id, revision, document],
             ).map_err(internal)?;
             tx.commit().map_err(internal)?;
             Ok(revision)
@@ -366,8 +470,8 @@ impl LaunchPolicyStore {
         let row: Option<(u64, bool, String)> = self
             .db()?
             .query_row(
-                "SELECT revision,revoked,document FROM launch_plans WHERE id=?1",
-                [id],
+                "SELECT revision,revoked,document FROM launch_plans WHERE space_id=?1 AND endpoint_id=?2 AND id=?3",
+                params![space,endpoint,id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
@@ -382,7 +486,7 @@ impl LaunchPolicyStore {
         if revision != expected_revision || revoked {
             return Err(error("Conflict", "plan revision stale or revoked"));
         }
-        if p.timeout_ms == 0
+        if !valid_timeout(Duration::from_millis(p.timeout_ms))
             || !valid_id(&p.worker_slot)
             || p.model.trim().is_empty()
             || p.provider_version.trim().is_empty()
@@ -428,8 +532,8 @@ impl LaunchPolicyStore {
                 let current: Option<(u64, bool, String)> = self
                     .db()?
                     .query_row(
-                        "SELECT revision,revoked,document FROM launch_plans WHERE id=?1",
-                        [id],
+                        "SELECT revision,revoked,document FROM launch_plans WHERE space_id=?1 AND endpoint_id=?2 AND id=?3",
+                        params![space,endpoint,id],
                         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
                     .optional()
@@ -470,7 +574,7 @@ impl LaunchPolicyStore {
         };
         self.admin(actor, &b, || {
             let db = self.db()?;
-            let row: Option<String> = db.query_row("SELECT document FROM launch_plans WHERE id=?1", [id], |r| r.get(0))
+            let row: Option<String> = db.query_row("SELECT document FROM launch_plans WHERE space_id=?1 AND endpoint_id=?2 AND id=?3", params![space,endpoint,id], |r| r.get(0))
                 .optional().map_err(internal)?;
             let p: StoredPlan = serde_json::from_str(&row.ok_or_else(|| error("LaunchApprovalRequired", "plan missing"))?).map_err(internal)?;
             if p.binding.space_id != space || p.binding.endpoint_id != endpoint {
@@ -478,8 +582,8 @@ impl LaunchPolicyStore {
             }
             let next = expected_revision.checked_add(1).filter(|n| *n <= i64::MAX as u64)
                 .ok_or_else(|| error("Conflict", "revision exhausted"))?;
-            let changed = db.execute("UPDATE launch_plans SET revision=?1,revoked=1 WHERE id=?2 AND revision=?3 AND revoked=0",
-                params![next,id,expected_revision]).map_err(internal)?;
+            let changed = db.execute("UPDATE launch_plans SET revision=?1,revoked=1 WHERE space_id=?2 AND endpoint_id=?3 AND id=?4 AND revision=?5 AND revoked=0",
+                params![next,space,endpoint,id,expected_revision]).map_err(internal)?;
             if changed != 1 {
                 return Err(error("Conflict", "exact current revision required"));
             }
