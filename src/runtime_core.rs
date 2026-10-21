@@ -163,7 +163,9 @@ fn member_credential(secret: &str, key: &str, epoch: u64) -> String {
 }
 fn credential_active(member: &Value, time: u64) -> bool {
     member["credential_revoked"] != true
-        && member["credential_expires_at"].as_u64().is_none_or(|expiry| time < expiry)
+        && member["credential_expires_at"]
+            .as_u64()
+            .is_none_or(|expiry| time < expiry)
 }
 // Both role and credential writers must preserve the same usable administrator set.
 fn preserve_active_administrator(
@@ -177,8 +179,10 @@ fn preserve_active_administrator(
         && credential_active(target, time)
         && (!admin(next_roles) || disables_credential)
         && !s.members.iter().any(|m| {
-            m["space_id"] == target["space_id"] && m["id"] != target["id"]
-                && admin(&m["roles"]) && credential_active(m, time)
+            m["space_id"] == target["space_id"]
+                && m["id"] != target["id"]
+                && admin(&m["roles"])
+                && credential_active(m, time)
         })
     {
         return Err(err("Conflict", "cannot disable the final active human_admin or manager; hand off or use local owner recovery"));
@@ -275,7 +279,11 @@ fn public_member(m: &Value) -> Value {
     let mut m = m.clone();
     m.as_object_mut().unwrap().remove("credential_hash");
     // Legacy persisted members predate credential lifecycle metadata.
-    for (key, default) in [("credential_epoch", json!(0)), ("credential_expires_at", Value::Null), ("credential_revoked", json!(false))] {
+    for (key, default) in [
+        ("credential_epoch", json!(0)),
+        ("credential_expires_at", Value::Null),
+        ("credential_revoked", json!(false)),
+    ] {
         m.as_object_mut().unwrap().entry(key).or_insert(default);
     }
     m
@@ -333,8 +341,12 @@ fn permission(owner: bool, member: Option<&Value>, r: &ToolRequest) -> Result<()
     let manage = admin(roles);
     let allowed = match r.tool.as_str() {
         "spaces.create" => false,
-        "members.invite" | "members.set_roles" | "members.rotate_credential"
-        | "members.revoke_credential" | "settings.set" | "endpoints.grant" => manage,
+        "members.invite"
+        | "members.set_roles"
+        | "members.rotate_credential"
+        | "members.revoke_credential"
+        | "settings.set"
+        | "endpoints.grant" => manage,
         "topics.create" => manage || posting(roles),
         "task.act" => match r.args["action"].as_str().unwrap_or("") {
             "comment" => manage || posting(roles),
@@ -353,14 +365,26 @@ fn permission(owner: bool, member: Option<&Value>, r: &ToolRequest) -> Result<()
         Err(err("Denied", "current roles do not permit this operation"))
     }
 }
-fn credential_target<'a>(s: &'a State, owner: bool, caller: Option<&Value>, r: &ToolRequest) -> Result<&'a Value, ApiError> {
+fn credential_target<'a>(
+    s: &'a State,
+    owner: bool,
+    caller: Option<&Value>,
+    r: &ToolRequest,
+) -> Result<&'a Value, ApiError> {
     let mid = text(&r.args, "member_id")?;
-    let target = s.members.iter().find(|m| m["id"] == mid && m["space_id"].as_str() == r.space_id.as_deref())
+    let target = s
+        .members
+        .iter()
+        .find(|m| m["id"] == mid && m["space_id"].as_str() == r.space_id.as_deref())
         .ok_or_else(|| err("NotFound", "member not found in requested space"))?;
-    if target["kind"] == "human" && !owner
+    if target["kind"] == "human"
+        && !owner
         && !caller.is_some_and(|m| m["kind"] == "human" && has(&m["roles"], "human_admin"))
     {
-        return Err(err("Denied", "human credentials require a verified human administrator or owner"));
+        return Err(err(
+            "Denied",
+            "human credentials require a verified human administrator or owner",
+        ));
     }
     Ok(target)
 }
@@ -535,7 +559,9 @@ impl Engine {
         let member = s
             .members
             .iter()
-            .find(|m| m["credential_hash"] == hash(credential) && credential_active(m, (self.clock)()))
+            .find(|m| {
+                m["credential_hash"] == hash(credential) && credential_active(m, (self.clock)())
+            })
             .cloned();
         let invitation = if request.tool == "members.register" {
             s.invites
@@ -563,7 +589,10 @@ impl Engine {
         if invitation.is_none() {
             permission(owner, member.as_ref(), request)?;
         }
-        if matches!(request.tool.as_str(), "members.rotate_credential" | "members.revoke_credential") {
+        if matches!(
+            request.tool.as_str(),
+            "members.rotate_credential" | "members.revoke_credential"
+        ) {
             credential_target(&s, owner, member.as_ref(), request)?;
         }
         if let Some(role) = required_role {
