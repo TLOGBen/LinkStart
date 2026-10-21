@@ -77,6 +77,7 @@ struct Manifest {
 }
 struct Metrics {
     produced: AtomicU64,
+    pending_outputs: AtomicU64,
     lost_from: AtomicU64,
     lost_to: AtomicU64,
     closed: AtomicBool,
@@ -110,10 +111,16 @@ pub struct HistoryStore {
     inner: Arc<Inner>,
 }
 enum Command {
-    Register(Target),
+    Register(Registration, mpsc::SyncSender<Result<Target, String>>),
     Output(Target, u64, Vec<u8>),
     Barrier(mpsc::SyncSender<Result<(), String>>),
-    Forget(PathBuf, mpsc::SyncSender<Result<(), String>>),
+}
+struct Registration {
+    endpoint_id: String,
+    view: SessionView,
+    root: PathBuf,
+    instance: String,
+    retention: Retention,
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -182,6 +189,37 @@ fn protect(path: &Path) -> Result<(), String> {
     Ok(())
 }
 static FILE_LOCK: Mutex<()> = Mutex::new(());
+// Lock order is process mutex -> root OS lock. No queue reply is awaited while
+// holding either. The OS lock covers writer authority checks AND mutations,
+// including handoff/recovery, registration, retirement and journal/checkpoints.
+struct RootMutation {
+    _process: std::sync::MutexGuard<'static, ()>,
+    _file: File,
+}
+impl RootMutation {
+    fn lock(root: &Path) -> Result<Self, String> {
+        let process = FILE_LOCK.lock().map_err(error)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join(".writer-lock"))
+            .map_err(error)?;
+        file.lock().map_err(error)?;
+        Ok(Self {
+            _process: process,
+            _file: file,
+        })
+    }
+}
+fn ensure_root_current(root: &Path, writer: &str) -> Result<(), String> {
+    let instance: String = read_json(&root.join(".writer-instance.json"))?;
+    if instance != writer {
+        return Err("history writer fenced by a newer runtime".into());
+    }
+    Ok(())
+}
 fn recover_tail(session: &Path) -> Result<bool, String> {
     let path = session.join("events.jsonl");
     let size = std::fs::metadata(&path).map_err(error)?.len();
@@ -206,7 +244,6 @@ fn recover_tail(session: &Path) -> Result<bool, String> {
     Ok(true)
 }
 fn recover(root: &Path, instance: &str) -> Result<(), String> {
-    let _guard = FILE_LOCK.lock().map_err(error)?;
     for entry in std::fs::read_dir(root).map_err(error)? {
         let entry = entry.map_err(error)?;
         if !entry.file_type().map_err(error)?.is_dir() {
@@ -327,7 +364,6 @@ fn remove_session(
     expected_sessions: &Path,
 ) -> Result<(), String> {
     valid_id(id)?;
-    let _guard = FILE_LOCK.lock().map_err(error)?;
     let root = std::fs::canonicalize(sessions).map_err(error)?;
     let target = std::fs::canonicalize(sessions.join(id)).map_err(error)?;
     if root != expected_sessions
@@ -372,15 +408,15 @@ impl HistoryStore {
         if root.parent() != Some(state_root.as_path()) {
             return Err("connection history directory resolves outside state root".into());
         }
-        protect(&root)?;
         let instance = uuid::Uuid::new_v4().to_string();
         {
-            let _guard = FILE_LOCK.lock().map_err(error)?;
+            let _guard = RootMutation::lock(&root)?;
+            protect(&root)?;
             // The writer fence must survive a missing/broken session checkpoint.
             // Reopening a runtime fences older writers before recovery touches data.
             atomic_json(&root.join(".writer-instance.json"), &instance)?;
+            recover(&root, &instance)?;
         }
-        recover(&root, &instance)?;
         let (sender, rx) = mpsc::sync_channel(retention.queue_capacity);
         let shared_error = Arc::new(Mutex::new(None));
         let writer_error = shared_error.clone();
@@ -419,106 +455,26 @@ impl HistoryStore {
         if sinks.contains_key(&key) {
             return Err("session history is already registered".into());
         }
-        let endpoint = self.inner.root.join(endpoint_id);
-        let sessions_dir = endpoint.join("sessions");
-        std::fs::create_dir_all(&endpoint).map_err(error)?;
-        let resolved_endpoint = std::fs::canonicalize(&endpoint).map_err(error)?;
-        if resolved_endpoint.parent() != Some(self.inner.root.as_path()) {
-            return Err("endpoint history resolves outside state directory".into());
-        }
-        std::fs::create_dir_all(&sessions_dir).map_err(error)?;
-        let resolved_sessions = std::fs::canonicalize(&sessions_dir).map_err(error)?;
-        if resolved_endpoint.parent() != Some(self.inner.root.as_path())
-            || resolved_sessions.parent() != Some(resolved_endpoint.as_path())
-        {
-            return Err("session directory resolves outside connection history".into());
-        }
-        std::fs::create_dir_all(endpoint.join("artifacts")).map_err(error)?;
-        let manifest_path = endpoint.join("manifest.json");
-        let mut manifest = if manifest_path.exists() {
-            read_json::<Manifest>(&manifest_path)?
-        } else {
-            Manifest {
-                version: 1,
-                endpoint_id: endpoint_id.into(),
-                sessions: vec![],
-            }
-        };
-        if manifest.endpoint_id != endpoint_id {
-            return Err("history manifest endpoint mismatch".into());
-        }
-        if manifest.sessions.iter().any(|s| s.id == view.id) {
-            return Err("recorded session cannot be silently reused".into());
-        }
-        while manifest.sessions.len() >= self.inner.retention.max_sessions_per_endpoint {
-            let candidate=manifest.sessions.iter().position(|session|read_json::<Checkpoint>(&sessions_dir.join(&session.id).join("checkpoint.json")).is_ok_and(|cp|!["recording","live","root_exited_children_live","stop_pending"].contains(&cp.status.as_str()))).ok_or("history capacity is occupied by active sessions; stop and flush before admission")?;
-            let old_id = manifest.sessions[candidate].id.clone();
-            valid_id(&old_id)?;
-            let old_path = sessions_dir.join(&old_id);
-            let (tx, rx) = mpsc::sync_channel(1);
-            self.inner
-                .sender
-                .try_send(Command::Forget(old_path.clone(), tx))
-                .map_err(|_| "history retirement backpressure".to_string())?;
-            rx.recv_timeout(Duration::from_secs(1))
-                .map_err(|_| "history retirement flush pending".to_string())??;
-            manifest.sessions.remove(candidate);
-            atomic_json(&manifest_path, &manifest)?;
-            remove_session(&sessions_dir, &old_id, &self.inner.root, &resolved_sessions)?;
-            sinks.remove(&format!("{endpoint_id}/{old_id}"));
-        }
-        let path = sessions_dir.join(&view.id);
-        std::fs::create_dir_all(&path).map_err(error)?;
-        if std::fs::canonicalize(&path).map_err(error)?.parent()
-            != Some(resolved_sessions.as_path())
-        {
-            return Err("session history resolves outside known session directory".into());
-        }
-        let checkpoint = Checkpoint {
-            endpoint_id: endpoint_id.into(),
-            session_id: view.id.clone(),
-            instance_id: view.instance_id.clone(),
-            generation: view.generation,
-            status: "recording".into(),
-            durable_cursor: 0,
-            retained_from: 0,
-            raw_cursor: 0,
-            unknown_tail: true,
-            process_resume: "unsupported".into(),
-            updated_at: now(),
-            writer_instance: self.inner.instance.clone(),
-        };
-        atomic_json(&path.join("checkpoint.json"), &checkpoint)?;
-        File::create(path.join("events.jsonl"))
-            .map_err(error)?
-            .sync_all()
-            .map_err(error)?;
-        manifest.sessions.push(view.clone());
-        atomic_json(&manifest_path, &manifest)?;
-        let target = Target {
-            path,
-            metrics: Arc::new(Metrics {
-                produced: AtomicU64::new(0),
-                lost_from: AtomicU64::new(u64::MAX),
-                lost_to: AtomicU64::new(0),
-                closed: AtomicBool::new(false),
-                status: Mutex::new(None),
-            }),
-            writer_instance: self.inner.instance.clone(),
-            retention: self.inner.retention.clone(),
-            safe_root: self.inner.root.clone(),
-        };
-        if self
-            .inner
+        let (reply, result) = mpsc::sync_channel(1);
+        self.inner
             .sender
-            .try_send(Command::Register(target.clone()))
-            .is_err()
-        {
-            let mut failed = checkpoint;
-            failed.status = "recording_failed".into();
-            atomic_json(&target.path.join("checkpoint.json"), &failed)?;
-            return Err("history registration backpressure".into());
-        }
+            .try_send(Command::Register(
+                Registration {
+                    endpoint_id: endpoint_id.into(),
+                    view: view.clone(),
+                    root: self.inner.root.clone(),
+                    instance: self.inner.instance.clone(),
+                    retention: self.inner.retention.clone(),
+                },
+                reply,
+            ))
+            .map_err(|_| "history registration backpressure".to_string())?;
+        // Filesystem registration was synchronous before this command boundary.
+        // Wait for completion without holding root/process mutation authority.
+        let target = result
+            .recv()
+            .map_err(|_| "history writer stopped during registration".to_string())??;
+        sinks.retain(|_, sink| sink.target.path.exists());
         let sink = HistorySink {
             target,
             sender: self.inner.sender.clone(),
@@ -650,6 +606,10 @@ impl HistorySink {
     pub fn output(&self, bytes: &[u8]) -> bool {
         let mut accepted = true;
         for chunk in bytes.chunks(8192) {
+            self.target
+                .metrics
+                .pending_outputs
+                .fetch_add(1, Ordering::AcqRel);
             let start = self
                 .target
                 .metrics
@@ -660,6 +620,10 @@ impl HistorySink {
                 .try_send(Command::Output(self.target.clone(), start, chunk.to_vec()))
                 .is_err()
             {
+                self.target
+                    .metrics
+                    .pending_outputs
+                    .fetch_sub(1, Ordering::AcqRel);
                 self.target
                     .metrics
                     .lost_from
@@ -717,10 +681,7 @@ impl Disk {
         })
     }
     fn ensure_current(&self) -> Result<bool, String> {
-        let instance: String = read_json(&self.target.safe_root.join(".writer-instance.json"))?;
-        if instance != self.target.writer_instance {
-            return Err("history writer fenced by a newer runtime".into());
-        }
+        ensure_root_current(&self.target.safe_root, &self.target.writer_instance)?;
         let bytes = match std::fs::read(self.target.path.join("checkpoint.json")) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -795,7 +756,7 @@ impl Disk {
         Ok(())
     }
     fn output(&mut self, start: u64, bytes: Vec<u8>) -> Result<(), String> {
-        let _guard = FILE_LOCK.lock().map_err(error)?;
+        let _guard = RootMutation::lock(&self.target.safe_root)?;
         self.ensure_current()?;
         self.gap_to(start)?;
         let chunk_size = ((self.target.retention.segment_bytes - 512) / 4).clamp(1, 8192);
@@ -817,7 +778,10 @@ impl Disk {
         Ok(())
     }
     fn flush(&mut self) -> Result<(), String> {
-        let _guard = FILE_LOCK.lock().map_err(error)?;
+        let _guard = RootMutation::lock(&self.target.safe_root)?;
+        self.flush_locked()
+    }
+    fn flush_locked(&mut self) -> Result<(), String> {
         if let Some(e) = &self.append_error {
             return Err(format!("history append failed; repair storage and restart runtime for journal recovery: {e}"));
         }
@@ -873,47 +837,175 @@ impl Disk {
         Ok(())
     }
 }
+fn register_session(
+    registration: Registration,
+    disks: &mut HashMap<PathBuf, Disk>,
+) -> Result<Target, String> {
+    let _guard = RootMutation::lock(&registration.root)?;
+    ensure_root_current(&registration.root, &registration.instance)?;
+    let endpoint_id = registration.endpoint_id.as_str();
+    let view = &registration.view;
+    let endpoint = registration.root.join(endpoint_id);
+    let sessions_dir = endpoint.join("sessions");
+    std::fs::create_dir_all(&endpoint).map_err(error)?;
+    let resolved_endpoint = std::fs::canonicalize(&endpoint).map_err(error)?;
+    if resolved_endpoint.parent() != Some(registration.root.as_path()) {
+        return Err("endpoint history resolves outside state directory".into());
+    }
+    std::fs::create_dir_all(&sessions_dir).map_err(error)?;
+    let resolved_sessions = std::fs::canonicalize(&sessions_dir).map_err(error)?;
+    if resolved_endpoint.parent() != Some(registration.root.as_path())
+        || resolved_sessions.parent() != Some(resolved_endpoint.as_path())
+    {
+        return Err("session directory resolves outside connection history".into());
+    }
+    std::fs::create_dir_all(endpoint.join("artifacts")).map_err(error)?;
+    let manifest_path = endpoint.join("manifest.json");
+    let mut manifest = if manifest_path.exists() {
+        read_json::<Manifest>(&manifest_path)?
+    } else {
+        Manifest {
+            version: 1,
+            endpoint_id: endpoint_id.into(),
+            sessions: vec![],
+        }
+    };
+    if manifest.endpoint_id != endpoint_id {
+        return Err("history manifest endpoint mismatch".into());
+    }
+    if manifest.sessions.iter().any(|s| s.id == view.id) {
+        return Err("recorded session cannot be silently reused".into());
+    }
+    while manifest.sessions.len() >= registration.retention.max_sessions_per_endpoint {
+        let candidate = manifest
+            .sessions
+            .iter()
+            .position(|session| {
+                let path = sessions_dir.join(&session.id);
+                if disks.get(&path).is_some_and(|disk| {
+                    !disk.target.metrics.closed.load(Ordering::Acquire)
+                        || disk.target.metrics.pending_outputs.load(Ordering::Acquire) != 0
+                }) {
+                    return false;
+                }
+                read_json::<Checkpoint>(&sessions_dir.join(&session.id).join("checkpoint.json"))
+                    .is_ok_and(|cp| {
+                        ![
+                            "recording",
+                            "live",
+                            "root_exited_children_live",
+                            "stop_pending",
+                        ]
+                        .contains(&cp.status.as_str())
+                    })
+            })
+            .ok_or(
+                "history capacity is occupied by active sessions; stop and flush before admission",
+            )?;
+        let old_id = manifest.sessions[candidate].id.clone();
+        valid_id(&old_id)?;
+        let old_path = sessions_dir.join(&old_id);
+        if let Some(disk) = disks.get_mut(&old_path) {
+            if !disk.target.metrics.closed.load(Ordering::Acquire)
+                || disk.target.metrics.pending_outputs.load(Ordering::Acquire) != 0
+            {
+                return Err("history capacity is occupied by a reader before EOF".into());
+            }
+            disk.flush_locked()?;
+        }
+        // EOF and zero pending output prove that even chunks enqueued AFTER
+        // this registration command have drained before retirement. Drop the
+        // file handle before Windows directory removal.
+        disks.remove(&old_path);
+        manifest.sessions.remove(candidate);
+        atomic_json(&manifest_path, &manifest)?;
+        remove_session(
+            &sessions_dir,
+            &old_id,
+            &registration.root,
+            &resolved_sessions,
+        )?;
+    }
+    let path = sessions_dir.join(&view.id);
+    std::fs::create_dir_all(&path).map_err(error)?;
+    if std::fs::canonicalize(&path).map_err(error)?.parent() != Some(resolved_sessions.as_path()) {
+        return Err("session history resolves outside known session directory".into());
+    }
+    let checkpoint = Checkpoint {
+        endpoint_id: endpoint_id.into(),
+        session_id: view.id.clone(),
+        instance_id: view.instance_id.clone(),
+        generation: view.generation,
+        status: "recording".into(),
+        durable_cursor: 0,
+        retained_from: 0,
+        raw_cursor: 0,
+        unknown_tail: true,
+        process_resume: "unsupported".into(),
+        updated_at: now(),
+        writer_instance: registration.instance.clone(),
+    };
+    atomic_json(&path.join("checkpoint.json"), &checkpoint)?;
+    File::create(path.join("events.jsonl"))
+        .map_err(error)?
+        .sync_all()
+        .map_err(error)?;
+    manifest.sessions.push(view.clone());
+    atomic_json(&manifest_path, &manifest)?;
+    let target = Target {
+        path,
+        metrics: Arc::new(Metrics {
+            produced: AtomicU64::new(0),
+            pending_outputs: AtomicU64::new(0),
+            lost_from: AtomicU64::new(u64::MAX),
+            lost_to: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            status: Mutex::new(None),
+        }),
+        writer_instance: registration.instance.clone(),
+        retention: registration.retention.clone(),
+        safe_root: registration.root.clone(),
+    };
+    let disk = Disk::open(target.clone()).map_err(|e| {
+        format!("history registration failed; repair storage and restart runtime for recovery: {e}")
+    })?;
+    disks.insert(target.path.clone(), disk);
+    Ok(target)
+}
 fn writer(rx: mpsc::Receiver<Command>, shared_error: Arc<Mutex<Option<String>>>) {
     let mut sessions = HashMap::<PathBuf, Disk>::new();
     let mut registration_error = None;
     loop {
         let command = rx.recv_timeout(Duration::from_millis(100));
         let result = match command {
-            Ok(Command::Register(target)) => match Disk::open(target.clone()) {
-                Ok(disk) => {
-                    sessions.insert(target.path, disk);
-                    Ok(())
+            Ok(Command::Register(registration, reply)) => {
+                let result = register_session(registration, &mut sessions);
+                if let Err(e) = &result {
+                    if e.starts_with("history registration failed;") {
+                        registration_error = Some(e.clone());
+                    }
                 }
-                Err(e) => {
-                    let message = format!("history registration failed; repair storage and restart runtime for recovery: {e}");
-                    registration_error = Some(message.clone());
-                    Err(message)
-                }
-            },
+                let _ = reply.send(result.clone());
+                // Admission rejection is returned to its caller; it is not a
+                // persistent error of previously registered journals.
+                Ok(())
+            }
             Ok(Command::Output(target, start, bytes)) => {
                 let end = start + bytes.len() as u64;
                 let result = sessions
                     .get_mut(&target.path)
                     .ok_or_else(|| "history session registration missing".to_string())
                     .and_then(|disk| disk.output(start, bytes));
+                target
+                    .metrics
+                    .pending_outputs
+                    .fetch_sub(1, Ordering::AcqRel);
                 if result.is_err() {
                     // A checkpoint access fault may reject a complete queued chunk.
                     // Recovery must disclose those missing raw bytes, never certify them.
                     target.metrics.lost_from.fetch_min(start, Ordering::AcqRel);
                     target.metrics.lost_to.fetch_max(end, Ordering::AcqRel);
                 }
-                result
-            }
-            Ok(Command::Forget(path, reply)) => {
-                let result = if let Some(disk) = sessions.get_mut(&path) {
-                    disk.flush()
-                } else {
-                    Ok(())
-                };
-                if result.is_ok() {
-                    sessions.remove(&path);
-                }
-                let _ = reply.send(result.clone());
                 result
             }
             Ok(Command::Barrier(reply)) => {

@@ -6,6 +6,8 @@ requires both modules. It adds no HTTP adapter, UI, provider agent or model call
 
 Run the public consumer on Windows with an unused state-directory path:
 
+Rust 1.89 or newer is required (`std::fs::File::lock`).
+
 ```powershell
 cargo run --example native_history --locked -- C:\scratch\linkstart-native-example
 ```
@@ -38,6 +40,13 @@ means delivery unknown and must not trigger automatic retry. This is not an OS
 sandbox. Unix process-tree force cleanup is unsupported; the public example is
 Windows-only.
 
+Release and lease expiry reject future input admission. They do not cancel or
+recall an input request already accepted into the bounded native writer queue.
+An accepted request can complete after its caller times out or releases control,
+including after another controller acquires a new lease. The host must treat a
+timeout as unknown delivery and must not promise that release cancels pending
+native input. Force/shutdown likewise cannot retract bytes already delivered.
+
 ## Persistence and limits
 
 Use `create_recorded` to enable history; `create` deliberately remains unrecorded.
@@ -48,6 +57,20 @@ rejects new recording and requires reader EOF. Checkpoint failures remain errors
 after repairing a checkpoint target, a new successful barrier may recover it.
 Journal append/rotation failures require storage repair and runtime restart.
 Opening a new store fences older writers using a root writer-instance record.
+Every root handoff/recovery, session registration/retirement, journal append,
+rotation and checkpoint replacement uses the same OS file lock while checking
+current writer authority. This also serializes cooperating processes sharing the
+root; it assumes all writers use this library and the filesystem honors OS locks.
+Registration and retention run on the history writer thread and synchronously
+return their result; no queue reply is awaited while holding mutation authority.
+The lock file is persistent and must not be removed/replaced while stores exist.
+Filesystem/lock I/O can block; this does not add an unconditional wall-clock
+deadline to registration or OS I/O. Reader output enqueue remains nonblocking.
+Retention requires a closed lifecycle, reader EOF and zero queued/in-flight output
+chunks for current sessions, then flushes before removing a journal. An admission
+queued before the reader finished can return capacity occupied until those later
+chunks drain; the host may retry admission. Process exit alone is not reader EOF.
+A public sink producer must finish its output before close_output.
 
 Persisted history is recovery evidence. `process_resume` remains `unsupported`;
 neither native process state nor provider conversations are resumed. State uses
