@@ -2,6 +2,7 @@ mod cli;
 mod daemon;
 mod discovery;
 mod help;
+mod runtime_identity;
 mod server;
 mod store;
 mod tool_client;
