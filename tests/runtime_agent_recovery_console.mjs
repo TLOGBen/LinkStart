@@ -1,0 +1,24 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+const source=fs.readFileSync(new URL('../web/runtime-console/live.js',import.meta.url),'utf8');
+const {createDecompositionJob,canDecompose}=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
+let sequence=0;
+const job=createDecompositionJob(async()=>{throw new Error('unexpected generation');},()=>`explicit-${++sequence}`);
+const snapshot={job_id:'saved',mission_topic_id:'mission',space_id:'space',status:'unknown',topic_ids:['already-committed'],
+  recovery:{eligibility:'eligible',publication:'durable'}};
+const reads=[];
+await job.inspect(async args=>{reads.push(args);return snapshot;},'saved','mission');
+assert.deepEqual(reads,[{job_id:'saved',mission_topic_id:'mission'}]);
+const attempted=[];
+await assert.rejects(job.recover(async(args,id)=>{attempted.push(id);assert.deepEqual(args,{job_id:'saved',mission_topic_id:'mission'});throw new Error('response lost');}));
+assert.deepEqual(attempted,['explicit-1']);
+await assert.rejects(job.recover(async()=>assert.fail('mutation before observation')));
+assert.equal(sequence,1);
+await job.inspect(async()=>snapshot,'saved','mission');
+await job.recover(async(args,id)=>{attempted.push(id);return {...snapshot,status:'applying',recovery:{eligibility:'active',attempt_id:id}};});
+assert.deepEqual(attempted,['explicit-1','explicit-1'],'explicit retry after observation retains immutable attempt ID');
+await assert.rejects(job.inspect(async()=>({...snapshot,mission_topic_id:'other'}),'saved','mission'));
+assert.equal(canDecompose({kind:'owner',roles:['task_decomposer']}),false);
+assert.equal(canDecompose({kind:'agent',roles:['observer']}),false);
+assert.equal(canDecompose({kind:'agent',roles:['task_decomposer']}),true);
+console.log('Recovery console state unit checks PASS; these are not live-browser evidence');
