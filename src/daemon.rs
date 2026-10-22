@@ -54,15 +54,12 @@ pub(crate) fn start_daemon(a: &StartArgs) -> Result<Value> {
             "--port",
             &a.port.to_string(),
         ])
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     #[cfg(windows)]
-    {
-        // 沒有 CREATE_NO_WINDOW 時，console-subsystem 的 daemon run 從無 console 的
-        // parent（DETACHED_PROCESS）被生出來，Windows 會配一個常駐的空白 console 視窗。
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
+    let mut child = win_process::spawn_detached(&command)?;
+    #[cfg(not(windows))]
     let mut child = command.spawn()?;
     let address = format!("{}:{}", a.host, a.port);
     for _ in 0..100 {
@@ -110,6 +107,138 @@ mod win_process {
         fn GetExitCodeProcess(handle: isize, code: *mut u32) -> i32;
         fn TerminateProcess(handle: isize, code: u32) -> i32;
         fn CloseHandle(handle: isize) -> i32;
+    }
+    use std::os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    };
+    use std::{ffi::c_void, io, ptr};
+    #[repr(C)]
+    struct StartupInfo {
+        cb: u32,
+        reserved: *mut u16,
+        desktop: *mut u16,
+        title: *mut u16,
+        x: u32,
+        y: u32,
+        x_size: u32,
+        y_size: u32,
+        x_chars: u32,
+        y_chars: u32,
+        fill: u32,
+        flags: u32,
+        show: u16,
+        reserved_size: u16,
+        reserved_bytes: *mut u8,
+        stdin: *mut c_void,
+        stdout: *mut c_void,
+        stderr: *mut c_void,
+    }
+    #[repr(C)]
+    struct ProcessInfo {
+        process: *mut c_void,
+        thread: *mut c_void,
+        pid: u32,
+        tid: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateProcessW(
+            application: *const u16,
+            command: *mut u16,
+            process_security: *mut c_void,
+            thread_security: *mut c_void,
+            inherit_handles: i32,
+            flags: u32,
+            environment: *mut c_void,
+            directory: *const u16,
+            startup: *mut StartupInfo,
+            info: *mut ProcessInfo,
+        ) -> i32;
+    }
+    pub struct DetachedChild {
+        handle: OwnedHandle,
+        pid: u32,
+    }
+    impl DetachedChild {
+        pub fn id(&self) -> u32 {
+            self.pid
+        }
+        pub fn try_wait(&mut self) -> io::Result<Option<()>> {
+            let mut code = 0;
+            // SAFETY: the owned handle remains valid throughout this query.
+            if unsafe { GetExitCodeProcess(self.handle.as_raw_handle() as isize, &mut code) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok((code != STILL_ACTIVE).then_some(()))
+        }
+    }
+    // Rust's stable Command API inherits unrelated inheritable handles on Windows.
+    // A daemon must not retain the control caller's pipe: launch with inheritance
+    // disabled. This helper intentionally supports this fixed command only (no env/cwd overrides).
+    pub fn spawn_detached(command: &std::process::Command) -> io::Result<DetachedChild> {
+        fn quote(arg: &std::ffi::OsStr, output: &mut Vec<u16>) -> io::Result<()> {
+            output.push(34);
+            let mut slashes = 0;
+            for unit in arg.encode_wide() {
+                if unit == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "NUL in daemon argument",
+                    ));
+                }
+                if unit == 92 {
+                    slashes += 1;
+                    continue;
+                }
+                output.extend(std::iter::repeat_n(
+                    92,
+                    if unit == 34 { slashes * 2 + 1 } else { slashes },
+                ));
+                slashes = 0;
+                output.push(unit);
+            }
+            output.extend(std::iter::repeat_n(92, slashes * 2));
+            output.push(34);
+            Ok(())
+        }
+        let mut application: Vec<u16> = command.get_program().encode_wide().collect();
+        application.push(0);
+        let mut line = Vec::new();
+        quote(command.get_program(), &mut line)?;
+        for arg in command.get_args() {
+            line.push(32);
+            quote(arg, &mut line)?;
+        }
+        line.push(0);
+        // SAFETY: both structures are C layouts and all-null is a valid initial
+        // state. Application/command buffers remain alive until CreateProcessW returns.
+        unsafe {
+            let mut startup: StartupInfo = std::mem::zeroed();
+            startup.cb = std::mem::size_of::<StartupInfo>() as u32;
+            let mut info: ProcessInfo = std::mem::zeroed();
+            if CreateProcessW(
+                application.as_ptr(),
+                line.as_mut_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                0x0800_0000,
+                ptr::null_mut(),
+                ptr::null(),
+                &mut startup,
+                &mut info,
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let handle = OwnedHandle::from_raw_handle(info.process);
+            drop(OwnedHandle::from_raw_handle(info.thread));
+            Ok(DetachedChild {
+                handle,
+                pid: info.pid,
+            })
+        }
     }
     const QUERY: u32 = 0x1000;
     const TERMINATE: u32 = 0x0001;

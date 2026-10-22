@@ -4,6 +4,7 @@ mod help;
 mod server;
 mod store;
 mod util;
+mod tool_client;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -34,6 +35,7 @@ async fn main() -> Result<()> {
         command: None,
         json: false,
     })) {
+        Command::Tool(a) => tool_client::run(a)?,
         Command::Help(h) => {
             if h.json {
                 json_line(main_help_json())

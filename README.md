@@ -157,6 +157,12 @@ python3 -m unittest -v tests/test_codex_adapter.py
 
 `.github/workflows/release.yml` 在原生 Windows／Linux／macOS runners 建置；Linux 驗 static musl，macOS 組 universal binary，assembly 重算 manifest SHA-256。只有與 Cargo version 完全一致的 `v*` tag 且所有 gates 通過才建立 Release。
 
+## Unified Runtime 開發預覽
+
+目前工作目錄正在實作 v2；尚未發布。原 `/v1` 介面保留。同一個 Rust daemon 提供 `/console` 人類管理頁與 `POST /v2/tools`，GUI、CLI 使用同一權限與收據。介面說明見 [Runtime 使用方式](docs/runtime-v2.md)。
+
+實際驗證狀態以 `.codex/implementation/` 與 `.codex/prove-it/` 當次版本紀錄為準。原 `src/v2/` 是設計骨架；可執行的實作在 `src/runtime_*.rs`，不能把骨架的所有能力當成已完成。
+
 ## License
 
 [MIT](LICENSE)

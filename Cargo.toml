@@ -2,6 +2,7 @@
 name = "linkstart"
 version = "0.1.6"
 edition = "2021"
+rust-version = "1.89"
 description = "LinkStart v1 Preview stable core"
 license = "MIT"
 repository = "https://github.com/TLOGBen/LinkStart"
@@ -9,6 +10,7 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1"
+portable-pty = "0.9"
 axum = { version = "0.7", features = ["json"] }
 clap = { version = "4.5", features = ["derive"] }
 futures-util = "0.3"

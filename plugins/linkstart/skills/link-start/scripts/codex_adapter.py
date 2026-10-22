@@ -591,6 +591,28 @@ def default_lease_path(context_path: Path) -> Path:
 def process_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        # Signal zero is not the POSIX existence probe on Windows. Observe a
+        # process handle without sending console events or termination signals.
+        import ctypes
+        from ctypes import wintypes
+
+        if pid > 0xFFFFFFFF:
+            return False
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE only
+        if not handle:
+            return False
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == 0x00000102  # WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True

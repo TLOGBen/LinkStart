@@ -181,6 +181,7 @@ pub(crate) async fn serve(a: StartArgs) -> Result<()> {
         )?,
     )?;
     let state = AppState { store, host };
+    let (v2, mut shutdown) = linkstart::runtime_http::router(&a.state.state_dir, &state.host)?;
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/connections", post(register_connection))
@@ -208,9 +209,25 @@ pub(crate) async fn serve(a: StartArgs) -> Result<()> {
         .route("/v1/connections/:id/feedback/:app", post(feedback))
         .layer(axum::middleware::from_fn_with_state(state.clone(), cors))
         .layer(RequestBodyLimitLayer::new(MAX_BODY))
-        .with_state(state);
+        .with_state(state)
+        .merge(v2);
     println!("LinkStart daemon listening on http://{addr}");
-    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
+    let mut transport_drain = shutdown.clone();
+    let serving = std::future::IntoFuture::into_future(axum::serve(tokio::net::TcpListener::bind(addr).await?, app).with_graceful_shutdown(async move {
+        while !*shutdown.borrow() { if shutdown.changed().await.is_err(){break;} }
+    }));
+    tokio::pin!(serving);
+    // Runtime signals only after owned children, workers and durable history are safe.
+    // A v1 SSE client may never close; bound only the remaining HTTP transport drain.
+    tokio::select! {
+        result = &mut serving => result?,
+        _ = async move {
+            while !*transport_drain.borrow() {
+                if transport_drain.changed().await.is_err() { return; }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        } => {},
+    }
     Ok(())
 }
 pub(crate) async fn health(State(_s): State<AppState>) -> Json<Value> {

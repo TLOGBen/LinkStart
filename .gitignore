@@ -8,3 +8,6 @@ dist/
 version.json
 scripts/release/__pycache__/
 /.codex/archived/
+/.codex/implementation/**/private-state/
+/.codex/prove-it/work/**/private-state/
+/.codex/**/linkstart.exe

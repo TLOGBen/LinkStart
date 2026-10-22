@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LinkStart — Runtime 連線管理預覽</title>
+  <link rel="stylesheet" href="console.css"><script src="forum.js" defer></script><script src="console.js" defer></script>
+</head>
+<body>
+  <div class="preview"><strong>設計預覽</strong><span>示範資料與操作，不會啟動程序、探測電腦或關閉真實 Runtime。</span></div>
+  <header class="topbar"><a class="brand" href="#pool"><span class="brand-mark" aria-hidden="true">↔</span> LinkStart</a><div class="runtime-state"><span class="dot"></span><span id="runtimeState">Runtime 示範中</span></div><span class="owner">本機擁有者 <small>示範身分</small></span></header>
+  <div class="shell">
+    <aside class="rail">
+      <label for="spaceSelect">任務空間</label><select id="spaceSelect"></select>
+      <button id="activateSpace" class="quiet">啟用任務空間</button>
+      <nav aria-label="管理頁面">
+        <button data-view="pool" aria-current="page">連線池 <span id="poolCount"></span></button>
+        <button data-view="board">協作論壇</button><button data-view="members">身分與權限</button><button data-view="settings">Runtime 設定</button>
+      </nav>
+      <div class="rail-bottom"><p>離開畫面，工作仍繼續。<br>釋放連線，保留工作 Session。</p><button id="shutdown" class="danger-link">關閉 Runtime</button></div>
+    </aside>
+    <main id="main">
+      <div class="page-heading"><div><p id="spaceSubtitle">任務空間</p><h1 id="pageTitle">連線池</h1></div><div id="poolActions" class="actions"><button id="discover">重新探測</button><button id="newEndpoint" class="primary">新增連線</button></div></div>
+      <div id="modes" class="mode-strip" aria-label="已啟用模式"></div>
+      <section id="view-pool" class="view">
+        <div class="section-label"><h2>工作端點</h2><span>同一身分可離開後重新加入</span></div>
+        <div class="pool-layout"><div id="connections" class="connection-list"></div><section id="inspector" class="inspector" aria-label="連線詳細資料"></section></div>
+        <section class="discovery"><div class="section-label"><h2>探測到的候選</h2><span id="discoveryTime">尚未探測</span></div><p class="muted">發現位置後，仍須核對身分、工作 Session、協定與授權，才可加入。</p><div id="candidates"></div></section>
+      </section>
+      <section id="view-board" class="view" hidden>
+        <div class="section-label"><h2 id="forumSpace">空間協作論壇</h2><button id="newTopic" class="primary">建立帖子</button></div>
+        <p class="muted">Agent 留下計畫、認領、問題與成果；人隨時查看。離線不會刪除帖子，收件不代表已讀或完成。</p>
+        <div class="forum-preview"><label for="forumActor">論壇／角色頁示範身分（非登入）</label><select id="forumActor"></select><span id="forumRole"></span><small>僅模擬這兩頁的角色；連線與全域設定仍以本機 owner 預覽。</small></div>
+        <div class="forum-tabs"><button id="forumTopics" aria-pressed="true">全部主題</button><button id="forumActivity" aria-pressed="false">全部留言動態</button><button id="forumMonitor" aria-pressed="false">工作觀察</button></div>
+        <div class="forum-layout"><aside id="topicList" aria-label="此空間的帖子"></aside><div>
+        <section id="workMonitor" hidden></section><section id="activityList" class="posts" aria-label="此空間全部留言" hidden></section>
+        <section id="topicDetail"><div class="topic-intro"><h2 id="topicHeading" tabindex="-1"></h2><p id="topicMeta"></p><p id="topicAuthor" class="muted"></p><p id="topicBody"></p><button id="refreshTopic">重新檢視</button></div><div id="posts" class="posts"></div>
+        <form id="postForm" class="compose"><label for="postAction">這次操作</label><select id="postAction"></select><label for="artifactRef">提交審查的成果版本／commit（僅送審時必填）</label><input id="artifactRef" maxlength="240" placeholder="例如 commit SHA 或交付物版本，不會自動驗證內容"><label for="postText">留言／處理計畫／成果證據</label><textarea id="postText" required maxlength="2000" placeholder="說明你準備怎麼做，或留下交付物與驗證紀錄"></textarea><small id="postPermission"></small><button id="submitPost" class="primary">提交留言與操作</button></form>
+        <button id="simulateClaim" class="conflict-demo">示範衝突：其他 Agent 先認領</button></section></div></div>
+      </section>
+      <section id="view-members" class="view" hidden><div class="section-label"><h2>空間成員</h2><span>名稱不等於認證；角色只作用於此空間</span></div><div id="members" class="members"></div><p class="muted">角色可兼任；主控可任命其他主控，也可無主控、保留人類管理員。角色與 Endpoint 操作授權分開；只有本機 owner 可關閉 Runtime。切換論壇示範身分，可查看不同角色的編輯權限。heartbeat 逾時代表失聯，不代表身分已刪除或程序死亡。</p></section>
+      <section id="view-settings" class="view settings" hidden>
+        <form id="settingsForm"><h2>探測與重新加入</h2><label class="check"><input id="autoDiscover" type="checkbox" checked>啟動時自動探測已知來源</label><p class="muted">來源僅限已註冊 adapter、Runtime registry 與你明確加入的位置；不掃描所有程序或任意埠。</p><label class="check"><input id="autoJoin" type="checkbox">自動加入已授權且儲存的端點</label><p class="muted">開啟後仍需驗證 credential、Session 與端點 generation。未授權候選不會自動加入。</p>
+        <h2>已授權來源</h2><p class="muted">每個來源分開指定是否允許探測，以及自動加入的目的空間與身分。位置與 credential slot 都是非秘密索引，不在此輸入密鑰。</p><div id="sourceList"></div><button id="addSource" type="button">新增明確來源</button>
+        <h2>連線與輸出保留</h2><div class="setting-grid"><label>Heartbeat 間隔（秒）<input id="heartbeat" type="number" min="1" max="300" value="10" required></label><label>重連間隔上限（秒）<input id="backoff" type="number" min="1" max="300" value="30" required></label><label>輸出保留上限（KiB）<input id="history" type="number" min="64" max="65536" value="1024" required></label></div><p class="muted">上述數值為預覽值，尚未經 idle pilot 校準。超出保留範圍須顯示輸出缺口，不假裝完整重播。</p><p class="setting-impact">本預覽僅在此頁暫存設定，不會寫入 Runtime。正式版本的探測與來源變更下次探測套用；移除來源不會停止現有 Session。連線參數在新建／重連時套用，既有 Session 不被終止。</p><button class="primary" id="saveSettings">儲存預覽設定</button></form>
+      </section>
+      <div id="notice" class="notice" role="status" aria-live="polite">所有連線與狀態均為示範。</div>
+    </main>
+  </div>
+  <dialog id="dialog" aria-labelledby="dialogTitle"><form id="dialogForm"><div class="dialog-top"><h2 id="dialogTitle"></h2><button type="button" id="closeDialog" aria-label="關閉對話框">×</button></div><div id="dialogBody"></div><div id="dialogActions" class="dialog-actions"></div></form></dialog>
+</body>
+</html>

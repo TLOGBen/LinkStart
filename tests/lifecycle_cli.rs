@@ -19,17 +19,24 @@ fn port() -> u16 {
         .port()
 }
 fn control(dir: &TempDir, port: u16, args: &[&str]) -> Value {
-    let output = Command::new(bin())
-        .args(args)
-        .args([
-            "--json",
-            "--state-dir",
-            dir.path().to_str().unwrap(),
-            "--port",
-            &port.to_string(),
-        ])
-        .output()
+    eprintln!("control start: {args:?}");
+    let mut command = Command::new(bin());
+    command.args(args).args([
+        "--json",
+        "--state-dir",
+        dir.path().to_str().unwrap(),
+        "--port",
+        &port.to_string(),
+    ]);
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = send.send(command.output());
+    });
+    let output = receive
+        .recv_timeout(Duration::from_secs(8))
+        .expect("control output must reach EOF while the detached daemon stays alive")
         .unwrap();
+    eprintln!("control returned: {args:?}");
     assert!(
         output.status.success(),
         "stderr={}",
@@ -38,7 +45,36 @@ fn control(dir: &TempDir, port: u16, args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).expect("exactly one JSON stdout value")
 }
 fn alive(pid: u64) -> bool {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+            fn GetExitCodeProcess(handle: isize, code: *mut u32) -> i32;
+            fn CloseHandle(handle: isize) -> i32;
+        }
+        unsafe {
+            let h = OpenProcess(0x1000, 0, pid as u32);
+            if h == 0 {
+                return false;
+            }
+            let mut code = 0;
+            let ok = GetExitCodeProcess(h, &mut code) != 0;
+            CloseHandle(h);
+            return ok && code == 259;
+        }
+    }
+    #[cfg(not(windows))]
     std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+struct DaemonCleanup(std::path::PathBuf);
+impl Drop for DaemonCleanup {
+    fn drop(&mut self) {
+        let _ = Command::new(bin())
+            .args(["daemon", "stop", "--state-dir"])
+            .arg(&self.0)
+            .output();
+    }
 }
 fn health(port: u16) -> bool {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -55,6 +91,7 @@ fn health(port: u16) -> bool {
 #[test]
 fn lifecycle_json_is_one_truthful_control_result() {
     let dir = TempDir::new().unwrap();
+    let _cleanup = DaemonCleanup(dir.path().to_path_buf());
     let p = port();
     let started = control(&dir, p, &["daemon", "start"]);
     assert_eq!(started["state"], "started");

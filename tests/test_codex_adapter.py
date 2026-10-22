@@ -850,6 +850,27 @@ class CodexOriginAdapterTest(unittest.TestCase):
         )
         self.assertTrue(context_deleted)
 
+    @unittest.skipUnless(os.name == "nt", "Windows process handle semantics")
+    def test_process_alive_does_not_terminate_the_observed_process(self) -> None:
+        child = subprocess.Popen(
+            [sys.executable, "-u", "-c",
+             "print('ready', flush=True); input(); print('still-alive', flush=True)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8",
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
+        )
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            self.assertTrue(adapter.process_alive(child.pid))
+            output, error = child.communicate("continue\n", timeout=5)
+            self.assertEqual(output.strip(), "still-alive", error)
+            self.assertEqual(child.returncode, 0)
+            self.assertFalse(adapter.process_alive(child.pid))
+        finally:
+            if child.poll() is None:
+                child.terminate()
+            child.communicate(timeout=5)
+
     def test_adapter_cli_parent_exit_keeps_lease_armed_until_explicit_close(self) -> None:
         capability = "a" * 64
         with tempfile.TemporaryDirectory() as directory:
