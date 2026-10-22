@@ -288,23 +288,24 @@ pub(crate) fn stop_daemon(state_dir: &FsPath) -> Result<bool> {
     };
     let record: DaemonRecord =
         serde_json::from_slice(&bytes).context("invalid daemon discovery record")?;
-    let address = match crate::runtime_identity::inspect(&record)? {
+    let mut peer = match crate::runtime_identity::inspect(&record)? {
         crate::runtime_identity::Inspection::Stale => {
             crate::discovery::remove_if_matches(state_dir, &bytes)?;
             return Ok(true);
         }
         crate::runtime_identity::Inspection::Reusable(address) => address,
     };
+    let address = peer.address;
     {
         // Read the existing owner token only. Initializing Engine here could
         // rotate authority while trying to stop a different live instance.
         let credential = fs::read_to_string(linkstart::runtime_core::owner_token_path(state_dir))
             .context("cannot read existing runtime owner credential")?;
-        let call = |tool: &str, args: Value| -> Result<Value> {
+        let mut call = |tool: &str, args: Value| -> Result<Value> {
             let body = serde_json::to_vec(
                 &json!({"request_id":uuid::Uuid::new_v4().to_string(),"tool":tool,"args":args}),
             )?;
-            let (status, value) = crate::tool_client::post(address, credential.trim(), &body)
+            let (status, value) = crate::tool_client::post(&mut peer, credential.trim(), &body)
                 .context("runtime shutdown transport failed; effects may already exist; inspect before retry")?;
             if !(200..300).contains(&status) {
                 bail!("runtime shutdown returned HTTP {status}; daemon was not replaced; inspect before retry")
@@ -321,6 +322,9 @@ pub(crate) fn stop_daemon(state_dir: &FsPath) -> Result<bool> {
             bail!("runtime shutdown pending or unconfirmed; effects may already exist; daemon was not replaced; inspect before retry")
         }
     }
+    // Both sensitive responses are complete. Release our idle keep-alive peer
+    // before witnessing exit so it cannot prolong the server's graceful drain.
+    drop(peer);
     // The runtime schedules its stop signal after 150 ms and bounds remaining
     // SSE transport drain at two seconds. Leave room for both before witnessing
     // process/listener exit; this does not extend or bypass owned cleanup.
