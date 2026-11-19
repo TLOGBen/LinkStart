@@ -389,6 +389,11 @@ impl TerminalManager {
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         }
+        // Children inherit "ignore Ctrl-C" from whoever launched the daemon (IDEs,
+        // agents, services). Restore normal processing so owned terminals can be
+        // interrupted, including the graceful stop's Ctrl-C.
+        #[cfg(windows)]
+        owned_job::restore_ctrl_c_inheritance();
         let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         // No caller-specified executable runs until its trusted launcher belongs
         // to the job; every later descendant inherits that job atomically.
@@ -580,6 +585,13 @@ pub(crate) mod owned_job {
         fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
         fn TerminateJobObject(job: Handle, code: u32) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
+        fn SetConsoleCtrlHandler(handler: *mut c_void, add: i32) -> i32;
+    }
+    pub fn restore_ctrl_c_inheritance() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            SetConsoleCtrlHandler(ptr::null_mut(), 0);
+        });
     }
     pub struct Job(usize);
     impl Job {
@@ -943,8 +955,6 @@ mod tests {
                         "Start-Sleep 3".into(),
                     ]
                 } else {
-                    // One owned root, no descendant: Unix tree-force remains
-                    // unsupported. Exercise real PTY Ctrl-C cleanup instead.
                     vec!["-c".into(), "exec sleep 30".into()]
                 },
                 None,
@@ -960,7 +970,6 @@ mod tests {
         );
         assert!(result.unwrap_err().contains("not delivered"));
         assert!(started.elapsed() < Duration::from_secs(1));
-        #[cfg(windows)]
         assert_eq!(
             manager
                 .force_owned(&s.id, Duration::from_secs(3))
@@ -968,20 +977,6 @@ mod tests {
                 .status,
             "exited"
         );
-        #[cfg(not(windows))]
-        {
-            let cleanup_started = Instant::now();
-            let unsupported = manager
-                .force_owned(&s.id, Duration::from_secs(3))
-                .unwrap_err();
-            assert!(unsupported.contains("Unsupported"));
-            let stopped = manager.stop_owned(&s.id, Duration::from_secs(3)).unwrap();
-            assert_eq!(
-                stopped.status, "exited",
-                "real owned root must exit after PTY Ctrl-C"
-            );
-            assert!(cleanup_started.elapsed() < Duration::from_secs(4));
-            assert_eq!(manager.observe(&s.id, 0).unwrap().status, "exited");
-        }
+        assert_eq!(manager.observe(&s.id, 0).unwrap().status, "exited");
     }
 }

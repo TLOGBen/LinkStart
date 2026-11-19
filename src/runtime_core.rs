@@ -91,22 +91,231 @@ pub(crate) fn protect(path: &Path) -> anyhow::Result<()> {
         )?;
     }
     #[cfg(windows)]
-    {
-        let output = std::process::Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                include_str!("storage_acl.ps1"),
-            ])
-            .env_remove("PSModulePath")
-            .env("LINKSTART_STORAGE_PATH", path)
-            .output()?;
-        anyhow::ensure!(
-            output.status.success(),
-            "cannot protect runtime storage ACL: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    storage_acl::protect(path)
+        .map_err(|e| anyhow::anyhow!("cannot protect runtime storage ACL: {e}"))?;
+    Ok(())
+}
+// Native replacement for a per-call PowerShell process (~0.5 s each on Windows).
+// Same rules: owner must be the current user or LocalSystem; no explicit Allow ACE
+// for anyone else; then a protected DACL granting only the current user FullControl.
+#[cfg(windows)]
+mod storage_acl {
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt, path::Path, ptr};
+    type Psid = *mut c_void;
+    #[repr(C)]
+    struct Acl {
+        revision: u8,
+        sbz1: u8,
+        size: u16,
+        count: u16,
+        sbz2: u16,
+    }
+    #[repr(C)]
+    struct AceHeader {
+        kind: u8,
+        flags: u8,
+        size: u16,
+    }
+    const SE_FILE_OBJECT: u32 = 1;
+    const OWNER_INFO: u32 = 0x1;
+    const DACL_INFO: u32 = 0x4;
+    const PROTECTED_DACL: u32 = 0x8000_0000;
+    const INHERITED_ACE: u8 = 0x10;
+    const ACL_REVISION: u32 = 2;
+    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+    const CONTAINER_AND_OBJECT_INHERIT: u32 = 0x3;
+    const TOKEN_QUERY: u32 = 0x8;
+    const TOKEN_USER: u32 = 1;
+    const WIN_LOCAL_SYSTEM_SID: u32 = 22;
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn GetNamedSecurityInfoW(
+            name: *const u16,
+            kind: u32,
+            info: u32,
+            owner: *mut Psid,
+            group: *mut Psid,
+            dacl: *mut *mut Acl,
+            sacl: *mut *mut Acl,
+            descriptor: *mut *mut c_void,
+        ) -> u32;
+        fn SetNamedSecurityInfoW(
+            name: *mut u16,
+            kind: u32,
+            info: u32,
+            owner: Psid,
+            group: Psid,
+            dacl: *mut Acl,
+            sacl: *mut Acl,
+        ) -> u32;
+        fn GetAce(acl: *mut Acl, index: u32, ace: *mut *mut c_void) -> i32;
+        fn EqualSid(a: Psid, b: Psid) -> i32;
+        fn GetLengthSid(sid: Psid) -> u32;
+        fn InitializeAcl(acl: *mut Acl, len: u32, revision: u32) -> i32;
+        fn AddAccessAllowedAceEx(
+            acl: *mut Acl,
+            revision: u32,
+            flags: u32,
+            mask: u32,
+            sid: Psid,
+        ) -> i32;
+        fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+        fn GetTokenInformation(
+            token: *mut c_void,
+            class: u32,
+            data: *mut c_void,
+            len: u32,
+            ret: *mut u32,
+        ) -> i32;
+        fn CreateWellKnownSid(kind: u32, domain: Psid, sid: Psid, size: *mut u32) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    }
+    fn last_error(what: &str) -> String {
+        format!("{what}: {}", std::io::Error::last_os_error())
+    }
+    pub fn protect(path: &Path) -> Result<(), String> {
+        let is_dir = path.is_dir();
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        unsafe {
+            // Current user SID, kept alive in `user_buf` for the whole call.
+            let mut token = ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(last_error("OpenProcessToken"));
+            }
+            let mut user_buf = vec![0u64; 64];
+            let mut ret = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TOKEN_USER,
+                user_buf.as_mut_ptr().cast(),
+                (user_buf.len() * 8) as u32,
+                &mut ret,
+            );
+            CloseHandle(token);
+            if ok == 0 {
+                return Err(last_error("GetTokenInformation"));
+            }
+            let user: Psid = *(user_buf.as_ptr() as *const Psid);
+            let mut system_buf = vec![0u64; 16];
+            let mut system_len = (system_buf.len() * 8) as u32;
+            let system: Psid = system_buf.as_mut_ptr().cast();
+            if CreateWellKnownSid(
+                WIN_LOCAL_SYSTEM_SID,
+                ptr::null_mut(),
+                system,
+                &mut system_len,
+            ) == 0
+            {
+                return Err(last_error("CreateWellKnownSid"));
+            }
+            let trusted = |sid: Psid| EqualSid(sid, user) != 0 || EqualSid(sid, system) != 0;
+
+            let (mut owner, mut dacl, mut descriptor) =
+                (ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+            let status = GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_INFO | DACL_INFO,
+                &mut owner,
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            );
+            if status != 0 {
+                return Err(format!(
+                    "GetNamedSecurityInfoW: {}",
+                    std::io::Error::from_raw_os_error(status as i32)
+                ));
+            }
+            let checked = (|| {
+                if owner.is_null() || !trusted(owner) {
+                    return Err("untrusted runtime storage owner".to_string());
+                }
+                if !dacl.is_null() {
+                    for i in 0..u32::from((*dacl).count) {
+                        let mut ace = ptr::null_mut();
+                        if GetAce(dacl, i, &mut ace) == 0 {
+                            return Err(last_error("GetAce"));
+                        }
+                        let header = &*(ace as *const AceHeader);
+                        if header.flags & INHERITED_ACE != 0 {
+                            continue;
+                        }
+                        match header.kind {
+                            // ACCESS_ALLOWED and ACCESS_ALLOWED_CALLBACK: SID follows header + mask.
+                            0 | 9 => {
+                                let sid = (ace as *mut u8).add(8) as Psid;
+                                if !trusted(sid) {
+                                    return Err(
+                                        "untrusted explicit runtime storage ACE".to_string()
+                                    );
+                                }
+                            }
+                            // Compound/object Allow layouts are never written by Runtime; refuse them.
+                            4 | 5 | 11 => {
+                                return Err("untrusted explicit runtime storage ACE".to_string())
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            LocalFree(descriptor);
+            checked?;
+
+            let len = 8 + 8 + GetLengthSid(user);
+            let mut acl_buf = vec![0u32; (len as usize).div_ceil(4)];
+            let acl: *mut Acl = acl_buf.as_mut_ptr().cast();
+            if InitializeAcl(acl, len, ACL_REVISION) == 0 {
+                return Err(last_error("InitializeAcl"));
+            }
+            let flags = if is_dir {
+                CONTAINER_AND_OBJECT_INHERIT
+            } else {
+                0
+            };
+            if AddAccessAllowedAceEx(acl, ACL_REVISION, flags, FILE_ALL_ACCESS, user) == 0 {
+                return Err(last_error("AddAccessAllowedAceEx"));
+            }
+            let status = SetNamedSecurityInfoW(
+                wide.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_INFO | PROTECTED_DACL,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                acl,
+                ptr::null_mut(),
+            );
+            if status != 0 {
+                return Err(format!(
+                    "SetNamedSecurityInfoW: {}",
+                    std::io::Error::from_raw_os_error(status as i32)
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+// A previous process's SQLite close can delete -wal/-shm after this process takes
+// the init lock. A file that vanishes (or is mid-delete) needs no protection.
+fn protect_if_present(path: &Path) -> anyhow::Result<()> {
+    for attempt in 0..50 {
+        if !path.exists() {
+            return Ok(());
+        }
+        match protect(path) {
+            Ok(()) => return Ok(()),
+            Err(_) if !path.exists() => return Ok(()),
+            Err(e) if attempt == 49 => return Err(e),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
     }
     Ok(())
 }
@@ -467,10 +676,7 @@ impl Engine {
         initialize_lock.lock()?;
         protect(&lock_path)?;
         for name in ["v2.sqlite3", "v2.sqlite3-wal", "v2.sqlite3-shm"] {
-            let path = dir.join(name);
-            if path.exists() {
-                protect(&path)?;
-            }
+            protect_if_present(&dir.join(name))?;
         }
         let secret = initialize_owner_token(dir)?;
         let mut db = Connection::open(dir.join("v2.sqlite3"))?;
@@ -1593,6 +1799,38 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(windows)]
+    fn protect_is_fast_and_leaves_protected_owner_only_dacl() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("state 空間");
+        std::fs::create_dir(&sub).unwrap();
+        let file = sub.join("secret.token");
+        std::fs::write(&file, "x").unwrap();
+        for path in [&sub, &file] {
+            let started = Instant::now();
+            protect(path).unwrap();
+            assert!(
+                started.elapsed() < Duration::from_millis(200),
+                "protect took {:?}",
+                started.elapsed()
+            );
+        }
+        let script = "$ErrorActionPreference='Stop'; $u=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; foreach($p in @($env:ACL_TEST_PATH,(Join-Path $env:ACL_TEST_PATH 'secret.token'))) { $a=Get-Acl -LiteralPath $p; if(!$a.AreAccessRulesProtected){throw 'inheriting DACL'}; $own=@($a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | ? { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -eq $u -and ($_.FileSystemRights -band 'FullControl') -eq 'FullControl' }); if($own.Count -lt 1){throw 'owner FullControl missing'}; foreach($r in $a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])) { if($r.AccessControlType -eq 'Allow' -and $r.IdentityReference.Value -notin @($u,'S-1-5-18')){throw 'untrusted SID'} } }";
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env_remove("PSModulePath")
+            .env("ACL_TEST_PATH", &sub)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::write(&file, "still writable by owner").unwrap();
+    }
     #[test]
     fn session_maintainer_cannot_mint_github_authority() {
         let dir = tempfile::tempdir().unwrap();
