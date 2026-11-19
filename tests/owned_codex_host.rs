@@ -12,6 +12,11 @@ use std::{
     },
     time::Duration,
 };
+// How long a fake provider may take to answer one request. A Python fake on a
+// busy machine (the full suite runs every test binary) answers initialize well
+// after 500 ms; that became Unknown{initialize} (HUNT-2026-003). Tests of a lost
+// reply still wait this long once.
+const PROVIDER_TIMEOUT: Duration = Duration::from_secs(5);
 fn python_executable() -> PathBuf {
     #[cfg(windows)]
     return PathBuf::from("python");
@@ -104,7 +109,7 @@ impl Fixture {
                     workspace: self._dir.path().into(),
                     model: "gpt-6-luna".into(),
                     scope: self.scope.clone(),
-                    timeout: Duration::from_millis(500),
+                    timeout: PROVIDER_TIMEOUT,
                     profile: ExecutionProfile::ReadOnlyForum,
                 },
                 &self.token,
@@ -125,7 +130,7 @@ impl Fixture {
             workspace: self._dir.path().into(),
             model: "gpt-6-luna".into(),
             scope: self.scope.clone(),
-            timeout: Duration::from_millis(500),
+            timeout: PROVIDER_TIMEOUT,
             profile,
         }
     }

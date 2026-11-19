@@ -227,6 +227,24 @@ class RuntimeHttp(unittest.TestCase):
         status,listing=self.post({'request_id':'cli-readback','tool':'spaces.list','args':{}},tokenfile.read_text())
         self.assertEqual(listing['items'][0]['id'],created['space']['id'])
 
+    def test_cli_tool_direct_address_needs_no_private_state(self):
+        # A sandboxed agent holds only an address and its own credential file.
+        owner=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()
+        agent_dir=pathlib.Path(self.tmp.name)/'agent-only'
+        agent_dir.mkdir()
+        credential=agent_dir/'agent.cred'
+        credential.write_text(owner)
+        missing=str(agent_dir/'no-such-state')
+        request=json.dumps({'request_id':'direct-list','tool':'spaces.list','args':{}})
+        result=subprocess.run([str(BIN),'tool','--address','127.0.0.1:%d'%self.port,'--state-dir',missing,'--credential-file',str(credential)],input=request,text=True,capture_output=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('items',json.loads(result.stdout))
+        self.assertFalse(pathlib.Path(missing).exists())
+        refused=subprocess.run([str(BIN),'tool','--address','192.0.2.1:%d'%self.port,'--credential-file',str(credential)],input=request,text=True,capture_output=True,timeout=10)
+        self.assertNotEqual(refused.returncode,0)
+        self.assertIn('loopback',refused.stderr)
+        self.assertNotIn(owner,refused.stdout+refused.stderr)
+
     def test_console_serves_real_module_without_secrets(self):
         with urllib.request.urlopen(self.base+'/console') as response:
             html=response.read().decode()
@@ -293,6 +311,59 @@ class RuntimeHttp(unittest.TestCase):
         self.assertIn('628318',output['text'])
         call('terminal.release',dict(endpoint_id=eid,**lease),space_id=sid)
         call('terminal.force',{'endpoint_id':eid},space_id=sid)
+
+    def test_slow_terminal_operation_does_not_stall_other_agents(self):
+        # Agent A's terminal ignores Ctrl-C, so each graceful stop waits its full deadline.
+        stubborn="import signal,time\nsignal.signal(signal.SIGINT,signal.SIG_IGN)\nprint('STUBBORN_READY',flush=True)\ntime.sleep(60)\n"
+        token,sid,slow=self.recorded_terminal('slow',stubborn)
+        _,_,fast=self.recorded_terminal('fast',"print('FAST_READY',flush=True)\nimport time\ntime.sleep(60)\n")
+        slow_eid=slow['endpoint']['id']; fast_eid=fast['endpoint']['id']
+        def observe(eid,space):
+            return self.post(dict(request_id=str(time.time_ns()),tool='terminal.observe',space_id=space,args={'endpoint_id':eid,'cursor':0}),token)
+        slow_space=[s for s in self.post(dict(request_id='ls',tool='spaces.list',args={}),token)[1]['items'] if s['name']=='slow'][0]['id']
+        fast_space=[s for s in self.post(dict(request_id='lf',tool='spaces.list',args={}),token)[1]['items'] if s['name']=='fast'][0]['id']
+        for eid,space,marker in [(slow_eid,slow_space,'STUBBORN_READY'),(fast_eid,fast_space,'FAST_READY')]:
+            for _ in range(100):
+                status,view=observe(eid,space)
+                if status==200 and marker in view['text']:break
+                time.sleep(.05)
+            self.assertIn(marker,view['text'])
+        stopping=threading.Event()
+        def stop_loop():
+            while not stopping.is_set():
+                self.post(dict(request_id=str(time.time_ns()),tool='terminal.stop',space_id=slow_space,args={'endpoint_id':slow_eid}),token)
+        worker=threading.Thread(target=stop_loop);worker.start()
+        latencies=[];health=[]
+        try:
+            time.sleep(.1)
+            for _ in range(15):
+                started=time.monotonic();status,_=observe(fast_eid,fast_space);latencies.append(time.monotonic()-started)
+                self.assertEqual(status,200)
+                started=time.monotonic()
+                with urllib.request.urlopen(self.base+'/v2/health',timeout=5) as r:json.load(r)
+                health.append(time.monotonic()-started)
+        finally:
+            stopping.set();worker.join(timeout=10)
+        latencies.sort();health.sort()
+        self.assertLess(latencies[int(len(latencies)*.9)],.12,latencies)
+        self.assertLess(health[int(len(health)*.9)],.12,health)
+        for eid,space in [(slow_eid,slow_space),(fast_eid,fast_space)]:
+            self.post(dict(request_id=str(time.time_ns()),tool='terminal.force',space_id=space,args={'endpoint_id':eid}),token)
+
+    def test_observe_keeps_request_id_and_grant_checks(self):
+        token,sid,created=self.recorded_terminal('observe-checks',"print('OBS_READY',flush=True)\nimport time\ntime.sleep(60)\n")
+        eid=created['endpoint']['id']
+        status,value=self.post(dict(request_id='',tool='terminal.observe',space_id=sid,args={'endpoint_id':eid,'cursor':0}),token)
+        self.assertEqual(status,400,value)
+        _,invite=self.post(dict(request_id='obs-invite',tool='members.invite',space_id=sid,args={'roles':['observer']}),token)
+        _,member=self.post(dict(request_id='obs-reg',tool='members.register',space_id=sid,args={'name':'watcher'}),invite['invite_token'])
+        self.post(dict(request_id='obs-grant',tool='endpoints.grant',space_id=sid,args={'endpoint_id':eid,'member_id':member['id'],'operations':['observe']}),token)
+        status,_=self.post(dict(request_id='obs-1',tool='terminal.observe',space_id=sid,args={'endpoint_id':eid,'cursor':0}),member['credential'])
+        self.assertEqual(status,200)
+        self.post(dict(request_id='obs-revoke',tool='endpoints.grant',space_id=sid,args={'endpoint_id':eid,'member_id':member['id'],'operations':[]}),token)
+        status,value=self.post(dict(request_id='obs-2',tool='terminal.observe',space_id=sid,args={'endpoint_id':eid,'cursor':0}),member['credential'])
+        self.assertEqual(status,403,value)
+        self.post(dict(request_id='obs-force',tool='terminal.force',space_id=sid,args={'endpoint_id':eid}),token)
 
     def test_terminal_write_delivers_whitespace_only_keys(self):
         script="print('KEYS_READY',flush=True)\nfor n in (1,2):\n    print('LINE%d=%r'%(n,input()),flush=True)\n"

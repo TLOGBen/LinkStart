@@ -5,9 +5,21 @@ use std::{
     time::{Duration, Instant},
 };
 pub(crate) fn run(a: crate::cli::ToolArgs) -> Result<()> {
-    let bytes = crate::discovery::read(&a.state_dir)?.context("daemon discovery record missing")?;
-    let record: crate::cli::DaemonRecord = serde_json::from_slice(&bytes)?;
-    let mut peer = crate::runtime_identity::require(&record)?;
+    let mut peer = if let Some(address) = a.address {
+        if !address.ip().is_loopback() {
+            bail!("--address must be a loopback address")
+        }
+        // Sandboxed agents cannot read discovery, so this connection's Runtime
+        // identity is NOT verified; the credential still travels only on it.
+        let stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(3))?;
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        crate::runtime_identity::VerifiedPeer { address, stream }
+    } else {
+        let bytes =
+            crate::discovery::read(&a.state_dir)?.context("daemon discovery record missing")?;
+        let record: crate::cli::DaemonRecord = serde_json::from_slice(&bytes)?;
+        crate::runtime_identity::require(&record)?
+    };
     let credential = std::fs::read_to_string(a.credential_file)?;
     let credential = credential.trim();
     if credential.is_empty() || credential.contains(['\r', '\n']) {
