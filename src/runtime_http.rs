@@ -181,7 +181,7 @@ async fn style() -> impl axum::response::IntoResponse {
 }
 async fn health(State(s): State<HttpState>) -> Json<Value> {
     Json(
-        json!({"status":if s.draining.load(std::sync::atomic::Ordering::SeqCst){"draining"}else{"ready"},"protocol":"v2"}),
+        json!({"status":if s.draining.load(std::sync::atomic::Ordering::SeqCst)||s.gate.is_poisoned(){"draining"}else{"ready"},"protocol":"v2"}),
     )
 }
 type Reply = (StatusCode, Json<Value>);
@@ -268,26 +268,36 @@ fn observe_unlocked(
     token: &str,
     r: &ToolRequest,
 ) -> Result<Value, crate::runtime_core::ApiError> {
+    if r.request_id.trim().is_empty() {
+        return Err(error("Invalid", "request_id required"));
+    }
     let eid = field(&r.args, "endpoint_id")?;
-    s.engine.execute(
-        token,
-        &ToolRequest {
-            request_id: format!("auth:{}", uuid::Uuid::new_v4()),
-            tool: "endpoint.authorize".into(),
-            space_id: r.space_id.clone(),
-            args: json!({"endpoint_id":eid,"operation":"observe"}),
-        },
-    )?;
+    let authorize = || {
+        s.engine.execute(
+            token,
+            &ToolRequest {
+                request_id: format!("auth:{}", uuid::Uuid::new_v4()),
+                tool: "endpoint.authorize".into(),
+                space_id: r.space_id.clone(),
+                args: json!({"endpoint_id":eid,"operation":"observe"}),
+            },
+        )
+    };
+    authorize()?;
     let sid = owned_sessions(s)?.get(eid).cloned().ok_or_else(|| {
         error(
             "Interrupted",
             "terminal is not owned by this runtime; explicit new session required",
         )
     })?;
-    Ok(json!(s
+    let view = s
         .terminals
         .observe(&sid, r.args["cursor"].as_u64().unwrap_or(0))
-        .map_err(|e| error("NativeError", e))?))
+        .map_err(|e| error("NativeError", e))?;
+    // Outside the gate a revocation can commit while observe waits for the
+    // session; re-check so output produced after it is never returned.
+    authorize()?;
+    Ok(json!(view))
 }
 fn owned_sessions(
     s: &HttpState,

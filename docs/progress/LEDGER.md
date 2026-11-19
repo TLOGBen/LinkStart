@@ -49,7 +49,8 @@
 - **K5**（#14 review）：加鎖前的空窗期如果寫入了較新的 in-memory fallback，恢復流程只合併加鎖前讀到的舊版本，最新的私有錯誤紀錄會遺失（`runtime_agent.rs:534/565/664`）。
 - **K6**（假說 storage-init）：`protect_if_present` 在「刪除中」時依賴約 1 秒內完成；可以改成刪除中就跳過，移除這個時間前提。其他資料庫（participants、launch_policy、control_bridge）的 `protect` 用的是同樣的「先檢查存在再設 ACL」寫法，也可能時好時壞。
 - **K7**（假說的第二份推導）：其他程序的 SQLite 寫入交易如果超過 `busy_timeout` 的 10 秒，`Engine::open` 會以 `SQLITE_BUSY` 失敗。
-- **K8**（`--address`）：不驗證 Runtime 身分，Runtime 被替換時可能把成員憑證送給別人。
+- **K8**（`--address`，#15 review 第 1 項，中高嚴重度）：不驗證 Runtime 身分。舊的 port 如果被其他本機程序佔走，成員憑證會被送過去。建議的修法是在送出憑證前，讓伺服器先證明它知道這個憑證（nonce＋HMAC）。在這之前，不要讓 agent 拿真正的憑證使用 `--address`。
+- **K9**（#15 review 第 5 項）：`spawn_blocking` 裡發生 panic 時，會變成 `Internal` 500。對於會改變狀態的工具，應該回 `UnknownEffect`，代表結果未知，而不是確定失敗。
 
 ## 紀錄
 

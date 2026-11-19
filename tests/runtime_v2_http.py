@@ -350,6 +350,21 @@ class RuntimeHttp(unittest.TestCase):
         for eid,space in [(slow_eid,slow_space),(fast_eid,fast_space)]:
             self.post(dict(request_id=str(time.time_ns()),tool='terminal.force',space_id=space,args={'endpoint_id':eid}),token)
 
+    def test_observe_keeps_request_id_and_grant_checks(self):
+        token,sid,created=self.recorded_terminal('observe-checks',"print('OBS_READY',flush=True)\nimport time\ntime.sleep(60)\n")
+        eid=created['endpoint']['id']
+        status,value=self.post(dict(request_id='',tool='terminal.observe',space_id=sid,args={'endpoint_id':eid,'cursor':0}),token)
+        self.assertEqual(status,400,value)
+        _,invite=self.post(dict(request_id='obs-invite',tool='members.invite',space_id=sid,args={'roles':['observer']}),token)
+        _,member=self.post(dict(request_id='obs-reg',tool='members.register',space_id=sid,args={'name':'watcher'}),invite['invite_token'])
+        self.post(dict(request_id='obs-grant',tool='endpoints.grant',space_id=sid,args={'endpoint_id':eid,'member_id':member['id'],'operations':['observe']}),token)
+        status,_=self.post(dict(request_id='obs-1',tool='terminal.observe',space_id=sid,args={'endpoint_id':eid,'cursor':0}),member['credential'])
+        self.assertEqual(status,200)
+        self.post(dict(request_id='obs-revoke',tool='endpoints.grant',space_id=sid,args={'endpoint_id':eid,'member_id':member['id'],'operations':[]}),token)
+        status,value=self.post(dict(request_id='obs-2',tool='terminal.observe',space_id=sid,args={'endpoint_id':eid,'cursor':0}),member['credential'])
+        self.assertEqual(status,403,value)
+        self.post(dict(request_id='obs-force',tool='terminal.force',space_id=sid,args={'endpoint_id':eid}),token)
+
     def test_terminal_write_delivers_whitespace_only_keys(self):
         script="print('KEYS_READY',flush=True)\nfor n in (1,2):\n    print('LINE%d=%r'%(n,input()),flush=True)\n"
         token,sid,created=self.recorded_terminal('keys',script)
