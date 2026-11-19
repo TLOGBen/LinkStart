@@ -12,6 +12,8 @@ pub(crate) struct Cli {
 }
 #[derive(Subcommand)]
 pub(crate) enum Command {
+    /// Invoke a v2 tool using a JSON request on stdin; credential stays out of argv.
+    Tool(ToolArgs),
     Help(HelpArgs),
     Version(JsonFlag),
     Status(StateArgs),
@@ -37,6 +39,13 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: FeedbackCommand,
     },
+}
+#[derive(Args)]
+pub(crate) struct ToolArgs {
+    #[arg(long, default_value_os_t=default_state_dir())]
+    pub(crate) state_dir: PathBuf,
+    #[arg(long)]
+    pub(crate) credential_file: PathBuf,
 }
 #[derive(Args)]
 pub(crate) struct JsonFlag {

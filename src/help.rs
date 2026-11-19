@@ -7,7 +7,8 @@ pub(crate) fn main_help_json() -> Value {
         "name":"linkstart",
         "version":VERSION,
         "protocolMajor":PROTOCOL,
-        "commands":["version","status","ps","doctor","daemon start|stop|restart","connections list","apps list","monitor wait|ack","feedback send"],
+        "commands":["version","status","ps","doctor","daemon start|stop|restart","connections list","apps list","monitor wait|ack","feedback send","tool"],
+        "runtimeV2":{"console":"http://<daemon-address>/console","toolCommand":"linkstart tool --state-dir <dir> --credential-file <path> < request.json","request":{"request_id":"stable caller request id","tool":"spaces.list","args":{}},"notes":["JSON request is read from stdin; secrets are read from a protected file, never argv","GUI and CLI share POST /v2/tools and server authorization","native terminal is raw bytes, not a structured Agent SDK","unconfirmed native effects are never automatically retried"]},
         "operations":{
             "attach":{"endpoint":"POST /v1/connections","requiredFields":["protocolMajor"],"optionalFields":["callsign"],"responseIdentities":["connectionId","callsign","capability","status"]},
             "register":{"endpoint":"POST /v1/apps","authorization":"Bearer <connection capability>","requiredFields":["protocolMajor","connectionId","manifest.appId","manifest.displayName","manifest.originPolicy.exactOrigin"],"responseIdentities":["instanceId","capability","origin","status"]},
@@ -29,5 +30,9 @@ pub(crate) fn main_help_json() -> Value {
 }
 
 pub(crate) fn print_human_help(cmd: Option<&str>) {
-    match cmd { Some(c)=>println!("linkstart {c}\n使用 `linkstart {c} --json` 取得機器可讀結果。"), None=>println!("LinkStart v1 Preview 本機 Runtime\n\n用法：linkstart <命令>\n\n命令：version、status、ps、doctor、daemon start|stop|restart、connections list、apps list、monitor wait|ack、feedback send\n\n所有狀態輸出都會遮蔽 capability。使用 `linkstart help --json` 取得機器可讀說明。") }
+    match cmd {
+        Some("tool") => println!("linkstart tool --state-dir <目錄> --credential-file <憑證檔> < request.json\n從 stdin 讀取 JSON 工具請求，透過 Runtime HTTP 執行並回傳 JSON。憑證由檔案讀取，不放在命令參數。\n請求範例：{{\"request_id\":\"read-spaces-1\",\"tool\":\"spaces.list\",\"args\":{{}}}}"),
+        Some(c) => println!("linkstart {c}\n使用 `linkstart {c} --json` 取得機器可讀結果。"),
+        None => println!("LinkStart 本機 Runtime\n\n用法：linkstart <命令>\n\n命令：version、status、ps、doctor、daemon start|stop|restart、connections list、apps list、monitor wait|ack、feedback send、tool\n\nUnified Runtime 開發預覽：`linkstart help tool` 說明共用工具入口；管理頁位於 daemon 的 /console。\n所有狀態輸出都會遮蔽 capability。使用 `linkstart help --json` 取得機器可讀說明。"),
+    }
 }

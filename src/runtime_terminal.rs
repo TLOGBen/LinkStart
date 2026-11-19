@@ -42,6 +42,10 @@ struct Session {
     history: Option<crate::runtime_history::HistorySink>,
     #[cfg(windows)]
     job: owned_job::Job,
+    // False once the owned process group was seen empty. Its id may then be
+    // reused by an unrelated group, so it is never signalled again.
+    #[cfg(not(windows))]
+    group_open: bool,
 }
 struct OutputBuffer {
     bytes: VecDeque<u8>,
@@ -62,6 +66,8 @@ impl Drop for Inner {
             let mut s = session.lock().unwrap();
             #[cfg(windows)]
             let _ = s.job.terminate();
+            #[cfg(not(windows))]
+            s.kill_group_if_open();
             let _ = s.child.kill();
         }
     }
@@ -120,9 +126,7 @@ impl TerminalManager {
                 #[cfg(windows)]
                 s.job.terminate()?;
                 #[cfg(not(windows))]
-                {
-                    return Err("owned process-tree force is Unsupported on this platform".into());
-                }
+                s.kill_group_if_open();
             } else {
                 let _ = s
                     .input
@@ -386,6 +390,11 @@ impl TerminalManager {
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         }
+        // Children inherit "ignore Ctrl-C" from whoever launched the daemon (IDEs,
+        // agents, services). Restore normal processing so owned terminals can be
+        // interrupted, including the graceful stop's Ctrl-C.
+        #[cfg(windows)]
+        owned_job::restore_ctrl_c_inheritance();
         let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         // No caller-specified executable runs until its trusted launcher belongs
         // to the job; every later descendant inherits that job atomically.
@@ -437,6 +446,10 @@ impl TerminalManager {
             history: history.clone(),
             #[cfg(windows)]
             job,
+            // portable-pty makes each Unix child a setsid session and group leader,
+            // so the group id equals the child pid.
+            #[cfg(not(windows))]
+            group_open: true,
         }));
         // Continuously drain the native pipe: clients never own the reader.
         let capacity = self.inner.capacity;
@@ -561,6 +574,20 @@ pub(crate) mod owned_job {
         fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
         fn TerminateJobObject(job: Handle, code: u32) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
+        fn SetConsoleCtrlHandler(handler: *const c_void, add: i32) -> i32;
+    }
+    // The daemon never stops on a console Ctrl-C/Break (a child sharing its hidden
+    // console can raise one); it stops through its own shutdown. Handlers are not
+    // inherited, so children keep default processing.
+    unsafe extern "system" fn swallow_ctrl_c(event: u32) -> i32 {
+        (event <= 1) as i32
+    }
+    pub fn restore_ctrl_c_inheritance() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            SetConsoleCtrlHandler(ptr::null(), 0);
+            SetConsoleCtrlHandler(swallow_ctrl_c as *const c_void, 1);
+        });
     }
     pub struct Job(usize);
     impl Job {
@@ -633,10 +660,30 @@ pub(crate) mod owned_job {
     }
 }
 impl Session {
+    // While any member remains, the kernel keeps the group id reserved, so a
+    // signal to it can only reach owned processes.
+    #[cfg(not(windows))]
+    fn group_live(&mut self) -> bool {
+        if self.group_open {
+            let pid = self.view.process_id.unwrap_or(0) as libc::pid_t;
+            self.group_open = pid > 0 && unsafe { libc::killpg(pid, 0) } == 0;
+        }
+        self.group_open
+    }
+    #[cfg(not(windows))]
+    fn kill_group_if_open(&mut self) {
+        if self.group_live() {
+            let pid = self.view.process_id.unwrap_or(0) as libc::pid_t;
+            unsafe { libc::killpg(pid, libc::SIGKILL) };
+        }
+    }
     fn refresh(&mut self) {
         if let Ok(Some(_)) = self.child.try_wait() {
             #[cfg(windows)]
-            if self.job.active().unwrap_or(true) {
+            let children_live = self.job.active().unwrap_or(true);
+            #[cfg(not(windows))]
+            let children_live = self.group_live();
+            if children_live {
                 self.view.status = "root_exited_children_live".into();
                 self.control = None;
                 if let Some(history) = &self.history {
@@ -808,7 +855,6 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
     #[test]
-    #[cfg(windows)]
     fn owned_tree_stop_reports_truth_and_force_cleans_descendant() {
         let manager = TerminalManager::new();
         // A child with an actual descendant that ignores interactive Ctrl-C.
@@ -820,7 +866,10 @@ mod tests {
         let args = if cfg!(windows) {
             vec!["-NoProfile","-Command","$p=Start-Process -WindowStyle Hidden -PassThru powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep 120'; Write-Output ('DESCENDANT='+$p.Id); Start-Sleep 120"]
         } else {
-            vec!["-c", "sleep 120 & echo DESCENDANT=$!; wait"]
+            vec![
+                "-c",
+                "trap '' INT HUP; sleep 120 & echo DESCENDANT=$!; wait",
+            ]
         };
         let s = manager
             .create(
@@ -871,8 +920,68 @@ mod tests {
             "owned descendant must exit"
         );
         #[cfg(not(windows))]
-        let _ = descendant;
+        {
+            let until = Instant::now() + Duration::from_secs(3);
+            while std::path::Path::new(&format!("/proc/{descendant}")).exists() {
+                assert!(Instant::now() < until, "owned descendant must exit");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         assert!(manager.shutdown(Duration::from_millis(100)).is_empty());
+    }
+    #[test]
+    #[cfg(not(windows))]
+    fn unix_graceful_stop_never_reports_exit_while_descendants_live() {
+        let manager = TerminalManager::new();
+        // The root exits on Ctrl-C; its child ignores INT/HUP and stays in the group.
+        let s = manager
+            .create(
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "(trap '' INT HUP; exec sleep 120) & echo DESCENDANT=$!; wait".into(),
+                ],
+                None,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let descendant = loop {
+            let text = manager.observe(&s.id, 0).unwrap().text;
+            if let Some(pid) = text.split("DESCENDANT=").nth(1).and_then(|t| {
+                t.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<u32>()
+                    .ok()
+            }) {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "must observe descendant: {text}");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let stopped = manager
+            .stop_owned(&s.id, Duration::from_millis(500))
+            .unwrap();
+        assert_ne!(
+            stopped.status, "exited",
+            "descendant {descendant} is still alive"
+        );
+        assert!(std::path::Path::new(&format!("/proc/{descendant}")).exists());
+        let forced = manager.force_owned(&s.id, Duration::from_secs(3)).unwrap();
+        assert_eq!(forced.status, "exited");
+        let until = Instant::now() + Duration::from_secs(3);
+        while std::path::Path::new(&format!("/proc/{descendant}")).exists() {
+            assert!(Instant::now() < until, "owned descendant must exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // A closed group is never signalled again, even on repeated force.
+        assert_eq!(
+            manager
+                .force_owned(&s.id, Duration::from_secs(1))
+                .unwrap()
+                .status,
+            "exited"
+        );
     }
     #[test]
     fn heartbeat_renews_only_current_terminal_controller() {
@@ -916,8 +1025,6 @@ mod tests {
                         "Start-Sleep 3".into(),
                     ]
                 } else {
-                    // One owned root, no descendant: Unix tree-force remains
-                    // unsupported. Exercise real PTY Ctrl-C cleanup instead.
                     vec!["-c".into(), "exec sleep 30".into()]
                 },
                 None,
@@ -933,7 +1040,6 @@ mod tests {
         );
         assert!(result.unwrap_err().contains("not delivered"));
         assert!(started.elapsed() < Duration::from_secs(1));
-        #[cfg(windows)]
         assert_eq!(
             manager
                 .force_owned(&s.id, Duration::from_secs(3))
@@ -941,20 +1047,6 @@ mod tests {
                 .status,
             "exited"
         );
-        #[cfg(not(windows))]
-        {
-            let cleanup_started = Instant::now();
-            let unsupported = manager
-                .force_owned(&s.id, Duration::from_secs(3))
-                .unwrap_err();
-            assert!(unsupported.contains("Unsupported"));
-            let stopped = manager.stop_owned(&s.id, Duration::from_secs(3)).unwrap();
-            assert_eq!(
-                stopped.status, "exited",
-                "real owned root must exit after PTY Ctrl-C"
-            );
-            assert!(cleanup_started.elapsed() < Duration::from_secs(4));
-            assert_eq!(manager.observe(&s.id, 0).unwrap().status, "exited");
-        }
+        assert_eq!(manager.observe(&s.id, 0).unwrap().status, "exited");
     }
 }
