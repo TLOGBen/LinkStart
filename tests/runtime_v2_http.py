@@ -2,6 +2,9 @@
 import hashlib, json, os, pathlib, socket, subprocess, sys, tempfile, threading, time, unittest, urllib.request, urllib.error
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 BIN=pathlib.Path(os.environ.get('LINKSTART_BIN',str(ROOT/'target/debug/linkstart.exe')))
+WINDOWS=os.name=='nt'
+SHELL={'command':'cmd.exe','args':['/Q']} if WINDOWS else {'command':'/bin/sh','args':[]}
+def shell_once(line):return {'command':'cmd.exe','args':['/Q','/C',line]} if WINDOWS else {'command':'/bin/sh','args':['-c',line]}
 
 class RuntimeHttp(unittest.TestCase):
     def cli_control(self, action):
@@ -276,13 +279,13 @@ class RuntimeHttp(unittest.TestCase):
             self.assertEqual(status,200,value)
             return value
         sid=call('spaces.create',{'name':'terminal'})['space']['id']
-        args={'command':'cmd.exe','args':['/Q'],'name':'owned shell'}
+        args=dict(SHELL,name='owned shell')
         created=call('terminal.create',args,'create-terminal',sid)
         eid=created['endpoint']['id']
         replay=call('terminal.create',args,'create-terminal',sid)
         self.assertEqual(created['session']['id'],replay['session']['id'])
         lease=call('terminal.acquire',{'endpoint_id':eid},space_id=sid)
-        call('terminal.write',dict(endpoint_id=eid,input='set /a 314159*2\r\n',**lease),space_id=sid)
+        call('terminal.write',dict(endpoint_id=eid,input=('set /a 314159*2' if WINDOWS else 'echo $((314159*2))')+'\r\n',**lease),space_id=sid)
         for _ in range(60):
             output=call('terminal.observe',{'endpoint_id':eid,'cursor':0},space_id=sid)
             if '628318' in output['text']:break
@@ -321,7 +324,7 @@ class RuntimeHttp(unittest.TestCase):
             return self.post(dict(request_id=rid or str(time.time_ns()),tool=tool,space_id=sid,args=args),credential)
         _,space=self.post(dict(request_id='history-space',tool='spaces.create',args={'name':'history'}),token)
         sid=space['space']['id']
-        status,created=call('terminal.create',{'command':'cmd.exe','args':['/Q','/C','echo HISTORY_71629'],'name':'recorded'})
+        status,created=call('terminal.create',dict(shell_once('echo HISTORY_71629'),name='recorded'))
         self.assertEqual(status,200,created)
         eid=created['endpoint']['id']; old=created['session']['id']
         for _ in range(60):
@@ -414,7 +417,7 @@ class RuntimeHttp(unittest.TestCase):
         _,space=self.post(dict(request_id='restart-space',tool='spaces.create',args={'name':'restart'}),token)
         sid=space['space']['id']
         def call(tool,args={},rid=None):return self.post(dict(request_id=rid or str(time.time_ns()),tool=tool,space_id=sid,args=args),token)
-        _,created=call('terminal.create',{'command':'cmd.exe','args':['/Q']})
+        _,created=call('terminal.create',SHELL)
         eid=created['endpoint']['id']; old=created['session']['id']
         _,lease=call('terminal.acquire',{'endpoint_id':eid})
         status,value=call('terminal.restart',{'endpoint_id':eid,'expected_session_id':old})
@@ -435,7 +438,7 @@ class RuntimeHttp(unittest.TestCase):
         _,space=self.post(dict(request_id='failure-space',tool='spaces.create',args={'name':'checkpoint failure'}),token)
         sid=space['space']['id']
         def call(tool,args={}):return self.post(dict(request_id=str(time.time_ns()),tool=tool,space_id=sid,args=args),token)
-        _,created=call('terminal.create',{'command':'cmd.exe','args':['/Q']})
+        _,created=call('terminal.create',SHELL)
         eid=created['endpoint']['id'];session=created['session']['id']
         _,lease=call('terminal.acquire',{'endpoint_id':eid})
         call('terminal.write',dict(endpoint_id=eid,input='echo RECOVERY_58317\r\n',**lease))

@@ -114,15 +114,18 @@ impl TerminalManager {
                 history.status(&s.view);
             }
             if s.view.status == "exited" {
+                // The leader may exit first; its group can still hold descendants.
+                #[cfg(not(windows))]
+                if force {
+                    kill_owned_group(s.view.process_id)?;
+                }
                 return Ok(s.view.clone());
             }
             if force {
                 #[cfg(windows)]
                 s.job.terminate()?;
                 #[cfg(not(windows))]
-                {
-                    return Err("owned process-tree force is Unsupported on this platform".into());
-                }
+                kill_owned_group(s.view.process_id)?;
             } else {
                 let _ = s
                     .input
@@ -513,6 +516,22 @@ impl TerminalManager {
     }
 }
 
+// portable-pty makes each Unix child a session and process-group leader (setsid),
+// so the group id equals the child pid and holds every descendant that stayed in it.
+#[cfg(not(windows))]
+fn kill_owned_group(pid: Option<u32>) -> Result<(), String> {
+    let pid = pid.ok_or("native child lacks process id")? as libc::pid_t;
+    if unsafe { libc::killpg(pid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(format!("owned process-group force failed: {e}"))
+    }
+}
+
 #[cfg(windows)]
 pub(crate) mod owned_job {
     use std::{ffi::c_void, io, mem, ptr};
@@ -808,7 +827,6 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
     #[test]
-    #[cfg(windows)]
     fn owned_tree_stop_reports_truth_and_force_cleans_descendant() {
         let manager = TerminalManager::new();
         // A child with an actual descendant that ignores interactive Ctrl-C.
@@ -820,7 +838,10 @@ mod tests {
         let args = if cfg!(windows) {
             vec!["-NoProfile","-Command","$p=Start-Process -WindowStyle Hidden -PassThru powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep 120'; Write-Output ('DESCENDANT='+$p.Id); Start-Sleep 120"]
         } else {
-            vec!["-c", "sleep 120 & echo DESCENDANT=$!; wait"]
+            vec![
+                "-c",
+                "trap '' INT HUP; sleep 120 & echo DESCENDANT=$!; wait",
+            ]
         };
         let s = manager
             .create(
@@ -871,7 +892,13 @@ mod tests {
             "owned descendant must exit"
         );
         #[cfg(not(windows))]
-        let _ = descendant;
+        {
+            let until = Instant::now() + Duration::from_secs(3);
+            while std::path::Path::new(&format!("/proc/{descendant}")).exists() {
+                assert!(Instant::now() < until, "owned descendant must exit");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         assert!(manager.shutdown(Duration::from_millis(100)).is_empty());
     }
     #[test]
