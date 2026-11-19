@@ -415,6 +415,13 @@ fn field<'a>(args: &'a Value, name: &str) -> Result<&'a str, crate::runtime_core
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| error("Invalid", format!("{name} required")))
 }
+// Raw terminal input: whitespace-only keys (Enter, Tab, Space) are real keystrokes.
+fn raw_input(args: &Value) -> Result<&str, crate::runtime_core::ApiError> {
+    args["input"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| error("Invalid", "input required"))
+}
 fn dispatch(
     s: &HttpState,
     n: &mut NativeState,
@@ -793,7 +800,7 @@ fn dispatch(
                     identity,
                     field(&r.args, "lease")?,
                     generation()?,
-                    field(&r.args, "input")?.as_bytes(),
+                    raw_input(&r.args)?.as_bytes(),
                 )
                 .map_err(native)?;
             json!({"accepted":true})

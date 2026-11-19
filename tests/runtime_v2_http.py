@@ -291,6 +291,30 @@ class RuntimeHttp(unittest.TestCase):
         call('terminal.release',dict(endpoint_id=eid,**lease),space_id=sid)
         call('terminal.force',{'endpoint_id':eid},space_id=sid)
 
+    def test_terminal_write_delivers_whitespace_only_keys(self):
+        script="print('KEYS_READY',flush=True)\nfor n in (1,2):\n    print('LINE%d=%r'%(n,input()),flush=True)\n"
+        token,sid,created=self.recorded_terminal('keys',script)
+        eid=created['endpoint']['id']
+        def call(tool,args):return self.post(dict(request_id=str(time.time_ns()),tool=tool,space_id=sid,args=args),token)
+        def wait_for(text):
+            for _ in range(100):
+                status,view=call('terminal.observe',{'endpoint_id':eid,'cursor':0})
+                if status==200 and text in view['text']:return view
+                time.sleep(.05)
+            self.fail(text+' absent: '+repr(view))
+        wait_for('KEYS_READY')
+        status,lease=call('terminal.acquire',{'endpoint_id':eid})
+        self.assertEqual(status,200,lease)
+        status,value=call('terminal.write',dict(endpoint_id=eid,input='',**lease))
+        self.assertEqual(status,400,value)
+        for key in ['\r',' ','\r']:
+            status,value=call('terminal.write',dict(endpoint_id=eid,input=key,**lease))
+            self.assertEqual(status,200,(repr(key),value))
+        wait_for("LINE1=''")
+        wait_for("LINE2=' '")
+        call('terminal.release',dict(endpoint_id=eid,**lease))
+        call('terminal.force',{'endpoint_id':eid})
+
     def test_history_restart_recovery_and_revocation(self):
         token=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()
         def call(tool,args={},credential=token,rid=None):
