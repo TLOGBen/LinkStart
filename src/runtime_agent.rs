@@ -783,18 +783,25 @@ impl AgentRunner {
         if unresolved {
             record.recovery_reason = Some("unresolved_receipt_evidence".into());
         }
-        let Some(plan) = record.plan.clone() else {
-            // Uncertainty about actual children outranks the missing plan.
-            record
+        // Uncertainty about actual children outranks any plan problem.
+        let plan_problem = |record: &mut JobRecord, reason: &str| {
+            if !record
                 .recovery_reason
-                .get_or_insert_with(|| "missing_durable_plan".into());
+                .as_deref()
+                .is_some_and(|r| r.starts_with("unresolved_"))
+            {
+                record.recovery_reason = Some(reason.into());
+            }
+        };
+        let Some(plan) = record.plan.clone() else {
+            plan_problem(record, "missing_durable_plan");
             return Ok(());
         };
         let serialized = serde_json::to_string(&plan).map_err(internal)?;
         let valid = validate_plan(plan.clone())
             .is_ok_and(|p| serde_json::to_string(&p).ok().as_deref() == Some(&serialized));
         if !valid {
-            record.recovery_reason = Some("invalid_saved_plan".into());
+            plan_problem(record, "invalid_saved_plan");
             return Ok(());
         }
         if record.schema_version > 1
@@ -802,7 +809,7 @@ impl AgentRunner {
             || (record.renderer_version == 1
                 && record.plan_hash.as_deref() != Some(&digest(&serialized)))
         {
-            record.recovery_reason = Some("incompatible_saved_plan".into());
+            plan_problem(record, "incompatible_saved_plan");
             return Ok(());
         }
         let mut ids = std::collections::HashMap::new();
@@ -818,14 +825,12 @@ impl AgentRunner {
                         ids.insert(task.key.clone(), topic_id.clone());
                         matched += 1;
                     }
-                    _ => {
-                        record.recovery_reason = Some("receipt_plan_conflict".into());
-                    }
+                    _ => plan_problem(record, "receipt_plan_conflict"),
                 }
             }
         }
         if matched != receipts.len() {
-            record.recovery_reason = Some("receipt_plan_conflict".into());
+            plan_problem(record, "receipt_plan_conflict");
         }
         // Legacy migration is allowed only after exact old renderer checks.
         if record.renderer_version == 0 && record.recovery_reason.is_none() {
@@ -2106,13 +2111,27 @@ mod tests {
 
     #[test]
     fn recovery_missing_plan_preserves_unresolved_committed_receipt_diagnostic() {
+        unresolved_receipt_outranks_plan_problem("review-missing-plan-unresolved-receipt", |r| {
+            r.plan = None
+        });
+    }
+
+    #[test]
+    fn recovery_incompatible_plan_preserves_unresolved_committed_receipt_diagnostic() {
+        unresolved_receipt_outranks_plan_problem(
+            "review-incompatible-plan-unresolved-receipt",
+            |r| r.renderer_version = 2,
+        );
+    }
+
+    fn unresolved_receipt_outranks_plan_problem(job_id: &str, break_plan: impl Fn(&mut JobRecord)) {
         let (dir, engine, _owner, _admin, token, ids) = setup();
         let (sid, mission) = ids.split_once('|').unwrap();
         let process = two_task_process();
         let original = AgentRunner::open(dir.path(), engine.clone(), process.clone()).unwrap();
         original.db.lock().unwrap().execute_batch("CREATE TRIGGER review_partial BEFORE UPDATE ON agent_jobs WHEN json_array_length(json_extract(NEW.record,'$.topic_ids')) > 0 BEGIN SELECT RAISE(FAIL,'review publication fault'); END;").unwrap();
         let job = JobRequest {
-            job_id: "review-missing-plan-unresolved-receipt".into(),
+            job_id: job_id.into(),
             space_id: sid.into(),
             mission_topic_id: mission.into(),
         };
@@ -2136,7 +2155,7 @@ mod tests {
             durable.topic_ids.is_empty(),
             "agent checkpoint must not contain the child"
         );
-        durable.plan = None;
+        break_plan(&mut durable);
         original
             .db
             .lock()
