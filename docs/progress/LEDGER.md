@@ -15,7 +15,7 @@
 
 ## 下一步
 
-Review #12，並重現各項 blocker（Linux public HTTP 失敗、#13 Windows 啟動延遲、#14 F1／F2 與 CI）。
+依序合併 #12 → #13 → #14 到 main，然後開始做 A2 前導片：兩個不同的真實 CLI 在同一個 TaskSpace 裡，從瀏覽器和 CLI 兩個入口操作，並完成一次交接。做 A2 時一併處理 K1（全域鎖）。
 
 ## 驗收項目
 
@@ -32,12 +32,24 @@ Review #12，並重現各項 blocker（Linux public HTTP 失敗、#13 Windows �
 
 ## PR 狀態
 
-| PR | 分支 | head | 狀態 | 卡點 |
+| PR | 分支 | head | 狀態 | 驗證 |
 |---|---|---|---|---|
-| #12 | feature/cli-runtime-shutdown | `f49b44f` | Draft | 已修空白按鍵被拒（F1-terminal）；待 review、Linux public HTTP 4 項失敗、incarnation 缺口（由 #13 修） |
-| #13 | feature/runtime-incarnation | `024624b` | Draft | Windows 啟動／重啟超過 8 秒門檻；需 rebase 到 `f49b44f` |
-| #14 | feature/agent-saved-plan-recovery | `7088aca` | Draft | F1 診斷被覆寫、F2 舊 generation 錯誤污染；CI 三平台失敗 |
+| #12 | feature/cli-runtime-shutdown | `a1571fb` | 可合併 | Windows／Linux：`cargo test --locked --no-fail-fast` 全過；public HTTP 各 20/20；fmt 和 CI 的 Python 測試全過。獨立 review 找到 5 項：3 項已修，2 項轉為 K1、K2 |
+| #13 | feature/runtime-incarnation | 待 merge `a1571fb` | 可合併（在 #12 之後） | 在 `6ca145b`（含 `245ebdb`）上，Windows／Linux 全套通過；原本的 8 秒門檻問題已由 native ACL 修正解決 |
+| #14 | feature/agent-saved-plan-recovery | `abe9294` | 可合併（在 #12 之後） | F1／F2 都先確認測試失敗（RED），修正後通過（GREEN）；Windows／Linux 全套通過 |
+
+## 已知問題（未修，已排入切片）
+
+- **K1**：`/v2/tools` 的全域 std Mutex 在 tokio 工作執行緒上包住了會阻塞的原生終端操作（`terminal.create` 最多可等 5 秒）。只要有一個操作卡住，其他 agent 的所有呼叫和 `/v2/health` 都會跟著卡住。位置：`src/runtime_http.rs:236-264`。排在 A2。
+- **K2**：`NativeState.receipts` 會隨著每次寫入或續約無限增長。排在 A7（長時間執行）。
 
 ## 紀錄
 
-- 2026-11-19：Claude 接手。前導測試發現，`terminal.write` 會把只含空白的輸入（例如單獨的 Enter）當成無效而拒絕。已補測試，先確認測試失敗（RED），修正後通過（GREEN），並用真的 Claude Code 實測通過。
+- 2026-11-19：Claude 接手。前導測試發現 `terminal.write` 會拒絕只含空白的輸入（例如單獨的 Enter），已修正並用真的 Claude Code 實測通過。
+- 2026-11-19：#12 新增的修正：
+  - Linux 的強制結束改為對整個程序群組送 `killpg`，並且只在群組還有成員時才送訊號。
+  - Windows 的 ACL 改用原生 API。daemon 啟動從 6–9 秒降到約 0.4 秒，這也是 #13 那個 8 秒門檻問題的根因。
+  - SQLite 暫存檔在初始化時的競態。
+  - Ctrl-C 忽略旗標會被子程序繼承，導致 Windows 上的優雅停止失效。
+  - lifecycle 測試會因為 port 重用而互相干擾。
+- 2026-11-19：本機在測試失敗時留下 3 個 `linkstart.exe`（PID 48212、39048、36576）。自動模式不允許直接結束程序，所以這 3 個程序仍在執行。

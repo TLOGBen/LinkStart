@@ -42,6 +42,10 @@ struct Session {
     history: Option<crate::runtime_history::HistorySink>,
     #[cfg(windows)]
     job: owned_job::Job,
+    // False once the owned process group was seen empty. Its id may then be
+    // reused by an unrelated group, so it is never signalled again.
+    #[cfg(not(windows))]
+    group_open: bool,
 }
 struct OutputBuffer {
     bytes: VecDeque<u8>,
@@ -62,6 +66,8 @@ impl Drop for Inner {
             let mut s = session.lock().unwrap();
             #[cfg(windows)]
             let _ = s.job.terminate();
+            #[cfg(not(windows))]
+            s.kill_group_if_open();
             let _ = s.child.kill();
         }
     }
@@ -114,18 +120,13 @@ impl TerminalManager {
                 history.status(&s.view);
             }
             if s.view.status == "exited" {
-                // The leader may exit first; its group can still hold descendants.
-                #[cfg(not(windows))]
-                if force {
-                    kill_owned_group(s.view.process_id)?;
-                }
                 return Ok(s.view.clone());
             }
             if force {
                 #[cfg(windows)]
                 s.job.terminate()?;
                 #[cfg(not(windows))]
-                kill_owned_group(s.view.process_id)?;
+                s.kill_group_if_open();
             } else {
                 let _ = s
                     .input
@@ -445,6 +446,10 @@ impl TerminalManager {
             history: history.clone(),
             #[cfg(windows)]
             job,
+            // portable-pty makes each Unix child a setsid session and group leader,
+            // so the group id equals the child pid.
+            #[cfg(not(windows))]
+            group_open: true,
         }));
         // Continuously drain the native pipe: clients never own the reader.
         let capacity = self.inner.capacity;
@@ -521,22 +526,6 @@ impl TerminalManager {
     }
 }
 
-// portable-pty makes each Unix child a session and process-group leader (setsid),
-// so the group id equals the child pid and holds every descendant that stayed in it.
-#[cfg(not(windows))]
-fn kill_owned_group(pid: Option<u32>) -> Result<(), String> {
-    let pid = pid.ok_or("native child lacks process id")? as libc::pid_t;
-    if unsafe { libc::killpg(pid, libc::SIGKILL) } == 0 {
-        return Ok(());
-    }
-    let e = std::io::Error::last_os_error();
-    if e.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(format!("owned process-group force failed: {e}"))
-    }
-}
-
 #[cfg(windows)]
 pub(crate) mod owned_job {
     use std::{ffi::c_void, io, mem, ptr};
@@ -585,12 +574,19 @@ pub(crate) mod owned_job {
         fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
         fn TerminateJobObject(job: Handle, code: u32) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
-        fn SetConsoleCtrlHandler(handler: *mut c_void, add: i32) -> i32;
+        fn SetConsoleCtrlHandler(handler: *const c_void, add: i32) -> i32;
+    }
+    // The daemon never stops on a console Ctrl-C/Break (a child sharing its hidden
+    // console can raise one); it stops through its own shutdown. Handlers are not
+    // inherited, so children keep default processing.
+    unsafe extern "system" fn swallow_ctrl_c(event: u32) -> i32 {
+        (event <= 1) as i32
     }
     pub fn restore_ctrl_c_inheritance() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| unsafe {
-            SetConsoleCtrlHandler(ptr::null_mut(), 0);
+            SetConsoleCtrlHandler(ptr::null(), 0);
+            SetConsoleCtrlHandler(swallow_ctrl_c as *const c_void, 1);
         });
     }
     pub struct Job(usize);
@@ -664,10 +660,30 @@ pub(crate) mod owned_job {
     }
 }
 impl Session {
+    // While any member remains, the kernel keeps the group id reserved, so a
+    // signal to it can only reach owned processes.
+    #[cfg(not(windows))]
+    fn group_live(&mut self) -> bool {
+        if self.group_open {
+            let pid = self.view.process_id.unwrap_or(0) as libc::pid_t;
+            self.group_open = pid > 0 && unsafe { libc::killpg(pid, 0) } == 0;
+        }
+        self.group_open
+    }
+    #[cfg(not(windows))]
+    fn kill_group_if_open(&mut self) {
+        if self.group_live() {
+            let pid = self.view.process_id.unwrap_or(0) as libc::pid_t;
+            unsafe { libc::killpg(pid, libc::SIGKILL) };
+        }
+    }
     fn refresh(&mut self) {
         if let Ok(Some(_)) = self.child.try_wait() {
             #[cfg(windows)]
-            if self.job.active().unwrap_or(true) {
+            let children_live = self.job.active().unwrap_or(true);
+            #[cfg(not(windows))]
+            let children_live = self.group_live();
+            if children_live {
                 self.view.status = "root_exited_children_live".into();
                 self.control = None;
                 if let Some(history) = &self.history {
@@ -912,6 +928,60 @@ mod tests {
             }
         }
         assert!(manager.shutdown(Duration::from_millis(100)).is_empty());
+    }
+    #[test]
+    #[cfg(not(windows))]
+    fn unix_graceful_stop_never_reports_exit_while_descendants_live() {
+        let manager = TerminalManager::new();
+        // The root exits on Ctrl-C; its child ignores INT/HUP and stays in the group.
+        let s = manager
+            .create(
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "(trap '' INT HUP; exec sleep 120) & echo DESCENDANT=$!; wait".into(),
+                ],
+                None,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let descendant = loop {
+            let text = manager.observe(&s.id, 0).unwrap().text;
+            if let Some(pid) = text.split("DESCENDANT=").nth(1).and_then(|t| {
+                t.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<u32>()
+                    .ok()
+            }) {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "must observe descendant: {text}");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let stopped = manager
+            .stop_owned(&s.id, Duration::from_millis(500))
+            .unwrap();
+        assert_ne!(
+            stopped.status, "exited",
+            "descendant {descendant} is still alive"
+        );
+        assert!(std::path::Path::new(&format!("/proc/{descendant}")).exists());
+        let forced = manager.force_owned(&s.id, Duration::from_secs(3)).unwrap();
+        assert_eq!(forced.status, "exited");
+        let until = Instant::now() + Duration::from_secs(3);
+        while std::path::Path::new(&format!("/proc/{descendant}")).exists() {
+            assert!(Instant::now() < until, "owned descendant must exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // A closed group is never signalled again, even on repeated force.
+        assert_eq!(
+            manager
+                .force_owned(&s.id, Duration::from_secs(1))
+                .unwrap()
+                .status,
+            "exited"
+        );
     }
     #[test]
     fn heartbeat_renews_only_current_terminal_controller() {
