@@ -596,9 +596,10 @@ impl AgentRunner {
                         record.prior_errors.push(error.clone());
                     }
                 }
-            }
-            if record.error.is_none() {
-                record.error = original.error.clone();
+                // A pre-lock error belongs to its own generation only.
+                if record.error.is_none() {
+                    record.error = original.error.clone();
+                }
             }
             let replay: Option<(String, String)> = tx
                 .query_row(
@@ -783,7 +784,10 @@ impl AgentRunner {
             record.recovery_reason = Some("unresolved_receipt_evidence".into());
         }
         let Some(plan) = record.plan.clone() else {
-            record.recovery_reason = Some("missing_durable_plan".into());
+            // Uncertainty about actual children outranks the missing plan.
+            record
+                .recovery_reason
+                .get_or_insert_with(|| "missing_durable_plan".into());
             return Ok(());
         };
         let serialized = serde_json::to_string(&plan).map_err(internal)?;
@@ -2115,38 +2119,78 @@ mod tests {
         original.start(&token, &job).unwrap();
         wait_for_worker(&original);
         let committed = original.unpublished(&job.job_id).unwrap().topic_ids;
-        assert_eq!(committed.len(), 1, "fixture requires a real committed child");
+        assert_eq!(
+            committed.len(),
+            1,
+            "fixture requires a real committed child"
+        );
         assert_actual_child_receipts(dir.path(), &engine, &token, &job, &committed);
-        original.db.lock().unwrap().execute_batch("DROP TRIGGER review_partial").unwrap();
+        original
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER review_partial")
+            .unwrap();
         let mut durable = original.durable_record(&job.job_id).unwrap();
-        assert!(durable.topic_ids.is_empty(), "agent checkpoint must not contain the child");
+        assert!(
+            durable.topic_ids.is_empty(),
+            "agent checkpoint must not contain the child"
+        );
         durable.plan = None;
-        original.db.lock().unwrap().execute(
-            "UPDATE agent_jobs SET record=?1 WHERE id=?2",
-            rusqlite::params![serde_json::to_string(&durable).unwrap(), job.job_id],
-        ).unwrap();
+        original
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE agent_jobs SET record=?1 WHERE id=?2",
+                rusqlite::params![serde_json::to_string(&durable).unwrap(), job.job_id],
+            )
+            .unwrap();
         let core = Connection::open(dir.path().join("v2.sqlite3")).unwrap();
-        let encoded: String = core.query_row("SELECT json FROM core_state WHERE id=1", [], |r| r.get(0)).unwrap();
+        let encoded: String = core
+            .query_row("SELECT json FROM core_state WHERE id=1", [], |r| r.get(0))
+            .unwrap();
         let mut state: Value = serde_json::from_str(&encoded).unwrap();
         let rid = format!("agent:{}:one", digest(&job.job_id));
-        let receipt = state["receipts"].as_array_mut().unwrap().iter_mut()
-            .find(|receipt| receipt["request_id"] == rid).unwrap();
+        let receipt = state["receipts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|receipt| receipt["request_id"] == rid)
+            .unwrap();
         receipt.as_object_mut().unwrap().remove("operation_scope");
-        core.execute("UPDATE core_state SET json=?1 WHERE id=1", [state.to_string()]).unwrap();
+        core.execute(
+            "UPDATE core_state SET json=?1 WHERE id=1",
+            [state.to_string()],
+        )
+        .unwrap();
         drop(core);
         drop(original); // Discard the only in-memory child evidence.
         let reopened_engine = Engine::open(dir.path()).unwrap();
-        let reopened = AgentRunner::open(dir.path(), reopened_engine.clone(), process.clone()).unwrap();
-        reopened.recover(&token, &job, "review-unresolved-attempt").unwrap();
+        let reopened =
+            AgentRunner::open(dir.path(), reopened_engine.clone(), process.clone()).unwrap();
+        reopened
+            .recover(&token, &job, "review-unresolved-attempt")
+            .unwrap();
         wait_for_worker(&reopened);
         let observed = reopened.get_scoped(&token, &job).unwrap();
         assert_eq!(observed.status, "unknown");
         assert_eq!(observed.recovery.eligibility, "needs_attention");
-        assert!(observed.topic_ids.is_empty(), "unscoped receipt must not become a trusted mapping");
+        assert!(
+            observed.topic_ids.is_empty(),
+            "unscoped receipt must not become a trusted mapping"
+        );
         assert_actual_child_receipts(dir.path(), &reopened_engine, &token, &job, &committed);
-        assert_eq!(process.calls.load(Ordering::SeqCst), 1, "recovery must not regenerate a plan");
-        assert_eq!(observed.recovery.reason.as_deref(), Some("unresolved_receipt_evidence"),
-            "missing plan must not mask uncertainty about an actual committed child");
+        assert_eq!(
+            process.calls.load(Ordering::SeqCst),
+            1,
+            "recovery must not regenerate a plan"
+        );
+        assert_eq!(
+            observed.recovery.reason.as_deref(),
+            Some("unresolved_receipt_evidence"),
+            "missing plan must not mask uncertainty about an actual committed child"
+        );
     }
 
     #[test]
@@ -2164,18 +2208,29 @@ mod tests {
         old.start(&token, &job).unwrap();
         wait_for_worker(&old);
         let fallback = old.unpublished(&job.job_id).unwrap();
-        let old_error = fallback.error.clone().expect("publication fault must produce an old error");
+        let old_error = fallback
+            .error
+            .clone()
+            .expect("publication fault must produce an old error");
         assert_eq!(fallback.topic_ids.len(), 1);
         assert!(old.durable_record(&job.job_id).unwrap().error.is_none());
-        old.db.lock().unwrap().execute_batch("DROP TRIGGER review_partial").unwrap();
+        old.db
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER review_partial")
+            .unwrap();
         let (arrived, release) = pause_event(&old, "recovery_before_ownership", 1);
         let late_runner = old.clone();
         let late_token = token.clone();
         let late_job = job.clone();
-        let late = std::thread::spawn(move || late_runner.recover(&late_token, &late_job, "review-late-admission"));
+        let late = std::thread::spawn(move || {
+            late_runner.recover(&late_token, &late_job, "review-late-admission")
+        });
         arrived.recv_timeout(Duration::from_secs(5)).unwrap();
         let newer = AgentRunner::open(dir.path(), engine.clone(), process.clone()).unwrap();
-        newer.recover(&token, &job, "review-new-generation").unwrap();
+        newer
+            .recover(&token, &job, "review-new-generation")
+            .unwrap();
         wait_for_worker(&newer);
         let before = newer.durable_record(&job.job_id).unwrap();
         assert_eq!(before.status, "completed");
@@ -2191,11 +2246,20 @@ mod tests {
         assert_actual_child_receipts(dir.path(), &engine, &token, &job, &before.topic_ids);
         assert_eq!(process.calls.load(Ordering::SeqCst), 1);
         assert_eq!(after.generation, before.generation);
-        assert_eq!(after.prior_errors, before.prior_errors,
-            "stale prelock fallback error must not enter newer durable private history");
-        let encoded: String = newer.db.lock().unwrap().query_row(
-            "SELECT record FROM agent_recovery_attempts WHERE id=?1", ["review-late-admission"], |r| r.get(0),
-        ).unwrap();
+        assert_eq!(
+            after.prior_errors, before.prior_errors,
+            "stale prelock fallback error must not enter newer durable private history"
+        );
+        let encoded: String = newer
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT record FROM agent_recovery_attempts WHERE id=?1",
+                ["review-late-admission"],
+                |r| r.get(0),
+            )
+            .unwrap();
         let attempt: JobRecord = serde_json::from_str(&encoded).unwrap();
         assert_eq!(attempt.prior_errors, before.prior_errors);
         assert!(attempt.error.is_none());
