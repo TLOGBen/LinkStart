@@ -1,11 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::{
-    fs,
-    io::{Read, Write},
-    net::TcpStream,
-    path::Path as FsPath,
-};
+use std::{fs, net::TcpStream, path::Path as FsPath};
 
 use crate::cli::{DaemonRecord, StartArgs};
 use crate::util::{json_line, output, PROTOCOL, VERSION};
@@ -31,10 +26,9 @@ pub(crate) fn start_daemon(a: &StartArgs) -> Result<Value> {
     if let Some(bytes) = crate::discovery::read(&a.state.state_dir)? {
         let record: DaemonRecord =
             serde_json::from_slice(&bytes).context("invalid daemon discovery record")?;
-        if process_alive(record.pid) {
-            if record.version != VERSION || record.protocol_major != PROTOCOL {
-                bail!("daemon_version_or_protocol_conflict: explicit drain/restart required")
-            }
+        if let crate::runtime_identity::Inspection::Reusable(_) =
+            crate::runtime_identity::inspect(&record)?
+        {
             return Ok(
                 json!({"state":"reused","pid":record.pid,"address":record.address,"version":VERSION,"protocolMajor":PROTOCOL}),
             );
@@ -78,7 +72,7 @@ pub(crate) fn start_daemon(a: &StartArgs) -> Result<Value> {
                     && record.version == VERSION
                     && record.protocol_major == PROTOCOL
             }) {
-                if process_alive(record.pid) && health_ready(&address) {
+                if crate::runtime_identity::require(&record).is_ok() {
                     return Ok(
                         json!({"state":"started","pid":child.id(),"address":address,"version":VERSION,"protocolMajor":PROTOCOL}),
                     );
@@ -95,20 +89,6 @@ pub(crate) fn start_daemon(a: &StartArgs) -> Result<Value> {
         "startup_outcome_unknown: pid={} address={} state_dir={} detail={error}; inspect before retry",
         child.id(), address, a.state.state_dir.display()
     ))
-}
-pub(crate) fn health_ready(address: &str) -> bool {
-    let Ok(mut stream) = TcpStream::connect(address) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
-    let _ = stream.write_all(
-        format!("GET /v1/health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
-            .as_bytes(),
-    );
-    let mut response = String::new();
-    stream.read_to_string(&mut response).is_ok()
-        && response.starts_with("HTTP/1.1 200")
-        && response.contains("\"status\":\"ready\"")
 }
 #[cfg(windows)]
 mod win_process {
@@ -308,26 +288,24 @@ pub(crate) fn stop_daemon(state_dir: &FsPath) -> Result<bool> {
     };
     let record: DaemonRecord =
         serde_json::from_slice(&bytes).context("invalid daemon discovery record")?;
-    if record.protocol_major != PROTOCOL {
-        bail!("protocol_mismatch: explicit compatible runtime required")
-    }
-    let address: std::net::SocketAddr = record
-        .address
-        .parse()
-        .context("invalid daemon discovery address")?;
-    if !address.ip().is_loopback() {
-        bail!("discovery does not name a live loopback daemon")
-    }
-    if process_alive(record.pid) {
+    let mut peer = match crate::runtime_identity::inspect(&record)? {
+        crate::runtime_identity::Inspection::Stale => {
+            crate::discovery::remove_if_matches(state_dir, &bytes)?;
+            return Ok(true);
+        }
+        crate::runtime_identity::Inspection::Reusable(address) => address,
+    };
+    let address = peer.address;
+    {
         // Read the existing owner token only. Initializing Engine here could
         // rotate authority while trying to stop a different live instance.
         let credential = fs::read_to_string(linkstart::runtime_core::owner_token_path(state_dir))
             .context("cannot read existing runtime owner credential")?;
-        let call = |tool: &str, args: Value| -> Result<Value> {
+        let mut call = |tool: &str, args: Value| -> Result<Value> {
             let body = serde_json::to_vec(
                 &json!({"request_id":uuid::Uuid::new_v4().to_string(),"tool":tool,"args":args}),
             )?;
-            let (status, value) = crate::tool_client::post(address, credential.trim(), &body)
+            let (status, value) = crate::tool_client::post(&mut peer, credential.trim(), &body)
                 .context("runtime shutdown transport failed; effects may already exist; inspect before retry")?;
             if !(200..300).contains(&status) {
                 bail!("runtime shutdown returned HTTP {status}; daemon was not replaced; inspect before retry")
@@ -344,12 +322,17 @@ pub(crate) fn stop_daemon(state_dir: &FsPath) -> Result<bool> {
             bail!("runtime shutdown pending or unconfirmed; effects may already exist; daemon was not replaced; inspect before retry")
         }
     }
+    // Both sensitive responses are complete. Release our idle keep-alive peer
+    // before witnessing exit so it cannot prolong the server's graceful drain.
+    drop(peer);
     // The runtime schedules its stop signal after 150 ms and bounds remaining
     // SSE transport drain at two seconds. Leave room for both before witnessing
     // process/listener exit; this does not extend or bypass owned cleanup.
-    for _ in 0..250 {
+    let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < exit_deadline {
         if !process_alive(record.pid)
-            && TcpStream::connect_timeout(&address, std::time::Duration::from_millis(100)).is_err()
+            && TcpStream::connect_timeout(&address, std::time::Duration::from_millis(2200))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
         {
             // A concurrent start may have published a different discovery record.
             crate::discovery::remove_if_matches(state_dir, &bytes)?;
