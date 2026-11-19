@@ -22,6 +22,11 @@ struct HttpState {
     engine: Engine,
     host: String,
     gate: Arc<Mutex<NativeState>>,
+    // Mirrors NativeState.draining so health never waits behind the gate.
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    // Endpoint -> current owned session. Its own lock lets observe skip the gate;
+    // lock order is always gate before sessions.
+    sessions: Arc<Mutex<HashMap<String, String>>>,
     terminals: TerminalManager,
     history: HistoryStore,
     intent_dir: std::path::PathBuf,
@@ -34,7 +39,6 @@ struct HttpState {
 }
 #[derive(Default)]
 struct NativeState {
-    sessions: HashMap<String, String>,
     receipts: HashMap<String, (String, Value)>,
     uncertain: std::collections::HashSet<String>,
     epoch: u64,
@@ -129,6 +133,8 @@ fn router_inner(
         engine,
         host: host.into(),
         gate: Arc::new(Mutex::new(NativeState::default())),
+        draining: Default::default(),
+        sessions: Default::default(),
         terminals,
         history,
         intent_dir,
@@ -175,7 +181,7 @@ async fn style() -> impl axum::response::IntoResponse {
 }
 async fn health(State(s): State<HttpState>) -> Json<Value> {
     Json(
-        json!({"status":if s.gate.lock().map(|n|n.draining).unwrap_or(true){"draining"}else{"ready"},"protocol":"v2"}),
+        json!({"status":if s.draining.load(std::sync::atomic::Ordering::SeqCst){"draining"}else{"ready"},"protocol":"v2"}),
     )
 }
 type Reply = (StatusCode, Json<Value>);
@@ -233,6 +239,64 @@ async fn tools(
     ) {
         return shutdown_tools(state.clone(), token.to_string(), request).await;
     }
+    // Observing one terminal must not wait behind another agent's slow native call.
+    if request.tool == "terminal.observe" {
+        let token = token.to_string();
+        return match tokio::task::spawn_blocking(move || observe_unlocked(&state, &token, &request))
+            .await
+        {
+            Ok(result) => reply(result),
+            Err(_) => failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal",
+                "observe failed",
+            ),
+        };
+    }
+    let token = token.to_string();
+    match tokio::task::spawn_blocking(move || gated(&state, &token, &request)).await {
+        Ok(reply) => reply,
+        Err(_) => failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal",
+            "dispatch failed",
+        ),
+    }
+}
+fn observe_unlocked(
+    s: &HttpState,
+    token: &str,
+    r: &ToolRequest,
+) -> Result<Value, crate::runtime_core::ApiError> {
+    let eid = field(&r.args, "endpoint_id")?;
+    s.engine.execute(
+        token,
+        &ToolRequest {
+            request_id: format!("auth:{}", uuid::Uuid::new_v4()),
+            tool: "endpoint.authorize".into(),
+            space_id: r.space_id.clone(),
+            args: json!({"endpoint_id":eid,"operation":"observe"}),
+        },
+    )?;
+    let sid = owned_sessions(s)?.get(eid).cloned().ok_or_else(|| {
+        error(
+            "Interrupted",
+            "terminal is not owned by this runtime; explicit new session required",
+        )
+    })?;
+    Ok(json!(s
+        .terminals
+        .observe(&sid, r.args["cursor"].as_u64().unwrap_or(0))
+        .map_err(|e| error("NativeError", e))?))
+}
+fn owned_sessions(
+    s: &HttpState,
+) -> Result<std::sync::MutexGuard<'_, HashMap<String, String>>, crate::runtime_core::ApiError> {
+    s.sessions
+        .lock()
+        .map_err(|_| error("Internal", "session map poisoned"))
+}
+fn gated(state: &HttpState, token: &str, request: &ToolRequest) -> Reply {
     let Ok(mut guard) = state.gate.lock() else {
         return failure(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -261,7 +325,7 @@ async fn tools(
             "runtime is draining; new mutations disabled",
         );
     }
-    let result = dispatch(&state, &mut guard, token, &request);
+    let result = dispatch(state, &mut guard, token, request);
     if result.is_ok() && !read && !request.tool.starts_with("runtime.") {
         guard.epoch += 1;
     }
@@ -312,6 +376,9 @@ async fn shutdown_tools(state: HttpState, actor: String, request: ToolRequest) -
             .owned
             .begin_shutdown(guard.ticket.as_ref().unwrap().2)?;
         guard.draining = true;
+        state
+            .draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     })();
     if let Err(e) = admission {
@@ -598,11 +665,12 @@ fn dispatch(
         if r.tool == "endpoints.list" {
             if let Some(items) = value["items"].as_array_mut() {
                 let sessions = s.terminals.list();
+                let owned = owned_sessions(s)?.clone();
                 for ep in items {
                     if ep["kind"] == "terminal" {
                         let active = ep["id"]
                             .as_str()
-                            .and_then(|eid| n.sessions.get(eid))
+                            .and_then(|eid| owned.get(eid))
                             .and_then(|sid| sessions.iter().find(|v| &v.id == sid));
                         ep["session"] = json!(active);
                         ep["status"] =
@@ -663,7 +731,7 @@ fn dispatch(
             .terminals
             .create_recorded(&eid, &s.history, command, argv, cwd)
             .map_err(|e| error("NativeError", e))?;
-        n.sessions.insert(eid, session.id.clone());
+        owned_sessions(s)?.insert(eid, session.id.clone());
         let value = json!({"endpoint":ep,"session":session});
         n.receipts.insert(key, (String::new(), value.clone()));
         return Ok(value);
@@ -710,10 +778,9 @@ fn dispatch(
         }
         let expected = field(&r.args, "expected_session_id")?;
         let history = s.history.list(eid).map_err(|e| error("HistoryError", e))?;
-        let latest = n
-            .sessions
-            .get(eid)
-            .map(String::as_str)
+        let current = owned_sessions(s)?.get(eid).cloned();
+        let latest = current
+            .as_deref()
             .or_else(|| history.last().map(|h| h.session.id.as_str()))
             .ok_or_else(|| error("NotFound", "no prior recorded session"))?;
         if latest != expected {
@@ -754,12 +821,12 @@ fn dispatch(
             .terminals
             .create_recorded(eid, &s.history, command, args, cwd)
             .map_err(|e| error("NativeError", e))?;
-        n.sessions.insert(eid.into(), session.id.clone());
+        owned_sessions(s)?.insert(eid.into(), session.id.clone());
         let value = json!({"endpoint":authorization["endpoint"],"session":session,"previous_session_id":expected,"process_resume":"unsupported"});
         n.receipts.insert(key, (fingerprint, value.clone()));
         return Ok(value);
     }
-    let sid = n.sessions.get(eid).ok_or_else(|| {
+    let sid = &owned_sessions(s)?.get(eid).cloned().ok_or_else(|| {
         error(
             "Interrupted",
             "terminal is not owned by this runtime; explicit new session required",

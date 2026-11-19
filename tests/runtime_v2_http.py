@@ -312,6 +312,44 @@ class RuntimeHttp(unittest.TestCase):
         call('terminal.release',dict(endpoint_id=eid,**lease),space_id=sid)
         call('terminal.force',{'endpoint_id':eid},space_id=sid)
 
+    def test_slow_terminal_operation_does_not_stall_other_agents(self):
+        # Agent A's terminal ignores Ctrl-C, so each graceful stop waits its full deadline.
+        stubborn="import signal,time\nsignal.signal(signal.SIGINT,signal.SIG_IGN)\nprint('STUBBORN_READY',flush=True)\ntime.sleep(60)\n"
+        token,sid,slow=self.recorded_terminal('slow',stubborn)
+        _,_,fast=self.recorded_terminal('fast',"print('FAST_READY',flush=True)\nimport time\ntime.sleep(60)\n")
+        slow_eid=slow['endpoint']['id']; fast_eid=fast['endpoint']['id']
+        def observe(eid,space):
+            return self.post(dict(request_id=str(time.time_ns()),tool='terminal.observe',space_id=space,args={'endpoint_id':eid,'cursor':0}),token)
+        slow_space=[s for s in self.post(dict(request_id='ls',tool='spaces.list',args={}),token)[1]['items'] if s['name']=='slow'][0]['id']
+        fast_space=[s for s in self.post(dict(request_id='lf',tool='spaces.list',args={}),token)[1]['items'] if s['name']=='fast'][0]['id']
+        for eid,space,marker in [(slow_eid,slow_space,'STUBBORN_READY'),(fast_eid,fast_space,'FAST_READY')]:
+            for _ in range(100):
+                status,view=observe(eid,space)
+                if status==200 and marker in view['text']:break
+                time.sleep(.05)
+            self.assertIn(marker,view['text'])
+        stopping=threading.Event()
+        def stop_loop():
+            while not stopping.is_set():
+                self.post(dict(request_id=str(time.time_ns()),tool='terminal.stop',space_id=slow_space,args={'endpoint_id':slow_eid}),token)
+        worker=threading.Thread(target=stop_loop);worker.start()
+        latencies=[];health=[]
+        try:
+            time.sleep(.1)
+            for _ in range(15):
+                started=time.monotonic();status,_=observe(fast_eid,fast_space);latencies.append(time.monotonic()-started)
+                self.assertEqual(status,200)
+                started=time.monotonic()
+                with urllib.request.urlopen(self.base+'/v2/health',timeout=5) as r:json.load(r)
+                health.append(time.monotonic()-started)
+        finally:
+            stopping.set();worker.join(timeout=10)
+        latencies.sort();health.sort()
+        self.assertLess(latencies[int(len(latencies)*.9)],.12,latencies)
+        self.assertLess(health[int(len(health)*.9)],.12,health)
+        for eid,space in [(slow_eid,slow_space),(fast_eid,fast_space)]:
+            self.post(dict(request_id=str(time.time_ns()),tool='terminal.force',space_id=space,args={'endpoint_id':eid}),token)
+
     def test_terminal_write_delivers_whitespace_only_keys(self):
         script="print('KEYS_READY',flush=True)\nfor n in (1,2):\n    print('LINE%d=%r'%(n,input()),flush=True)\n"
         token,sid,created=self.recorded_terminal('keys',script)

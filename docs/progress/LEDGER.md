@@ -16,15 +16,14 @@
 ## 下一步
 
 1. **等使用者處理**：合併 PR 進 main 被 Claude 的自動模式擋下，需要使用者合併或開放權限。合併順序：#12 → #13 → #14 → `feature/agent-direct-connect`。
-2. A2 收尾：修 K1（全域鎖）。修完再跑一次兩個 CLI 同時操作的測試。
-3. 下一片是 A3：撤權之後，正在連線中的串流也要立刻停止。
+2. 下一片是 A3：撤權之後，正在連線中的串流也要立刻停止。
 
 ## 驗收項目
 
 | # | 項目 | 狀態 | 證據（SHA／平台／紀錄） |
 |---|---|---|---|
 | A1 | 任意 TUI CLI 可在 Runtime PTY 中啟動、操作、讀回輸出 | 部分證實：單一 CLI、API 入口 | `f49b44f`／Windows／`prove-it/records/024624b-claude-pty-pilot.md`（sha256 `bf0a877d…`），修正後在新資料夾完成信任詢問加問答 |
-| A2 | 兩個以上 CLI 並存於同一 TaskSpace，瀏覽器與 CLI 都能操作，可交接 | 前導片證實（Windows）；K1 待修 | daemon `a1571fb`＋agent 端 `--address`／Windows／`prove-it/records/a1571fb-a2-two-cli-handoff.md`：Codex（Sol 6.2，沙箱內）認領並送審 → Claude（haiku）核准 → 人在瀏覽器上按測試通過，`done r4`；權限邊界 4 類全部被拒 |
+| A2 | 兩個以上 CLI 並存於同一 TaskSpace，瀏覽器與 CLI 都能操作，可交接 | 前導片證實（Windows）；K1 已修（observe 和 health 不再被別人的慢操作卡住） | daemon `a1571fb`＋agent 端 `--address`／Windows／`prove-it/records/a1571fb-a2-two-cli-handoff.md`：Codex（Sol 6.2，沙箱內）認領並送審 → Claude（haiku）核准 → 人在瀏覽器上按測試通過，`done r4`；權限邊界 4 類全部被拒 |
 | A3 | 撤權與角色檢查 | 未開始 | |
 | A4 | 人類啟動設定（核准執行檔、參數、工作區） | 契約已審，未實作 | |
 | A5 | 重啟恢復；結果未知的操作不報成功 | 局部證據 | |
@@ -39,11 +38,13 @@
 | #12 | feature/cli-runtime-shutdown | `e2e3b3b` | 可合併（CI 三平台綠） | Windows／Linux：`cargo test --locked --no-fail-fast` 全過；public HTTP 各 20/20；fmt 和 CI 的 Python 測試全過。獨立 review 找到 5 項：3 項已修，2 項轉為 K1、K2 |
 | #13 | feature/runtime-incarnation | 待 merge `a1571fb` | 可合併（在 #12 之後） | 在 `6ca145b`（含 `245ebdb`）上，Windows／Linux 全套通過；原本的 8 秒門檻問題已由 native ACL 修正解決 |
 | #14 | feature/agent-saved-plan-recovery | `abe9294` | 可合併（在 #12 之後） | F1／F2 都先確認測試失敗（RED），修正後通過（GREEN）；Windows／Linux 全套通過 |
-| （新） | feature/agent-direct-connect | 見 git | 疊在 #12 上 | `linkstart tool --address`，讓沙箱裡的 agent 不必讀私有狀態目錄。先 RED 後 GREEN；Windows／Linux public HTTP 各 21/21 通過 |
+| （新） | feature/agent-direct-connect | 見 git | 疊在 #12 上 | `linkstart tool --address`，讓沙箱裡的 agent 不必讀私有狀態目錄；另外修了 K1。兩項都先 RED 後 GREEN；Windows／Linux 全部 Rust 測試和 public HTTP 各 22/22 通過 |
 
 ## 已知問題（未修，已排入切片）
 
-- **K1**：`/v2/tools` 的全域 std Mutex 在 tokio 工作執行緒上包住了會阻塞的原生終端操作（`terminal.create` 最多可等 5 秒）。只要有一個操作卡住，其他 agent 的所有呼叫和 `/v2/health` 都會跟著卡住。位置：`src/runtime_http.rs:236-264`。排在 A2。
+- **K1（部分已修）**：
+  - `terminal.observe` 和 `/v2/health` 已經移到鎖外。需要持鎖的請求改放在 `spawn_blocking` 執行，不再佔住 tokio 的工作執行緒。
+  - 還剩下的部分：會改變狀態的終端操作（write、acquire、stop、create）仍然依序經過同一把鎖。所以某個 agent 的 stop 最多要等 500 毫秒，create 最多 5 秒，這段時間其他 agent 的寫入會被延後，但不會失敗。等真的多 agent 負載出現問題時，再把原生呼叫移到鎖外。
 - **K2**：`NativeState.receipts` 會隨著每次寫入或續約無限增長。排在 A7（長時間執行）。
 
 ## 紀錄
