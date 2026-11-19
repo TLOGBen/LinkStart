@@ -46,6 +46,10 @@ pub(crate) struct ToolArgs {
     pub(crate) state_dir: PathBuf,
     #[arg(long)]
     pub(crate) credential_file: PathBuf,
+    /// Loopback Runtime address (host:port) for callers that cannot read the
+    /// private state dir, such as sandboxed agents; skips discovery.
+    #[arg(long)]
+    pub(crate) address: Option<std::net::SocketAddr>,
 }
 #[derive(Args)]
 pub(crate) struct JsonFlag {

@@ -227,6 +227,24 @@ class RuntimeHttp(unittest.TestCase):
         status,listing=self.post({'request_id':'cli-readback','tool':'spaces.list','args':{}},tokenfile.read_text())
         self.assertEqual(listing['items'][0]['id'],created['space']['id'])
 
+    def test_cli_tool_direct_address_needs_no_private_state(self):
+        # A sandboxed agent holds only an address and its own credential file.
+        owner=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()
+        agent_dir=pathlib.Path(self.tmp.name)/'agent-only'
+        agent_dir.mkdir()
+        credential=agent_dir/'agent.cred'
+        credential.write_text(owner)
+        missing=str(agent_dir/'no-such-state')
+        request=json.dumps({'request_id':'direct-list','tool':'spaces.list','args':{}})
+        result=subprocess.run([str(BIN),'tool','--address','127.0.0.1:%d'%self.port,'--state-dir',missing,'--credential-file',str(credential)],input=request,text=True,capture_output=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('items',json.loads(result.stdout))
+        self.assertFalse(pathlib.Path(missing).exists())
+        refused=subprocess.run([str(BIN),'tool','--address','192.0.2.1:%d'%self.port,'--credential-file',str(credential)],input=request,text=True,capture_output=True,timeout=10)
+        self.assertNotEqual(refused.returncode,0)
+        self.assertIn('loopback',refused.stderr)
+        self.assertNotIn(owner,refused.stdout+refused.stderr)
+
     def test_console_serves_real_module_without_secrets(self):
         with urllib.request.urlopen(self.base+'/console') as response:
             html=response.read().decode()

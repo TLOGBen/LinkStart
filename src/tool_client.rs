@@ -6,12 +6,21 @@ use std::{
     time::Duration,
 };
 pub(crate) fn run(a: crate::cli::ToolArgs) -> Result<()> {
-    let bytes = crate::discovery::read(&a.state_dir)?.context("daemon discovery record missing")?;
-    let record: crate::cli::DaemonRecord = serde_json::from_slice(&bytes)?;
-    let address: SocketAddr = record.address.parse()?;
-    if !address.ip().is_loopback() || !crate::daemon::process_alive(record.pid) {
-        bail!("discovery does not name a live loopback daemon")
-    }
+    let address: SocketAddr = if let Some(address) = a.address {
+        if !address.ip().is_loopback() {
+            bail!("--address must be a loopback address")
+        }
+        address
+    } else {
+        let bytes =
+            crate::discovery::read(&a.state_dir)?.context("daemon discovery record missing")?;
+        let record: crate::cli::DaemonRecord = serde_json::from_slice(&bytes)?;
+        let address: SocketAddr = record.address.parse()?;
+        if !address.ip().is_loopback() || !crate::daemon::process_alive(record.pid) {
+            bail!("discovery does not name a live loopback daemon")
+        }
+        address
+    };
     let credential = std::fs::read_to_string(a.credential_file)?;
     let credential = credential.trim();
     if credential.is_empty() || credential.contains(['\r', '\n']) {

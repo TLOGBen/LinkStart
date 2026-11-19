@@ -15,14 +15,16 @@
 
 ## 下一步
 
-依序合併 #12 → #13 → #14 到 main，然後開始做 A2 前導片：兩個不同的真實 CLI 在同一個 TaskSpace 裡，從瀏覽器和 CLI 兩個入口操作，並完成一次交接。做 A2 時一併處理 K1（全域鎖）。
+1. **等使用者處理**：合併 PR 進 main 被 Claude 的自動模式擋下，需要使用者合併或開放權限。合併順序：#12 → #13 → #14 → `feature/agent-direct-connect`。
+2. A2 收尾：修 K1（全域鎖）。修完再跑一次兩個 CLI 同時操作的測試。
+3. 下一片是 A3：撤權之後，正在連線中的串流也要立刻停止。
 
 ## 驗收項目
 
 | # | 項目 | 狀態 | 證據（SHA／平台／紀錄） |
 |---|---|---|---|
 | A1 | 任意 TUI CLI 可在 Runtime PTY 中啟動、操作、讀回輸出 | 部分證實：單一 CLI、API 入口 | `f49b44f`／Windows／`prove-it/records/024624b-claude-pty-pilot.md`（sha256 `bf0a877d…`），修正後在新資料夾完成信任詢問加問答 |
-| A2 | 兩個以上 CLI 並存於同一 TaskSpace，瀏覽器與 CLI 都能操作，可交接 | 未開始 | |
+| A2 | 兩個以上 CLI 並存於同一 TaskSpace，瀏覽器與 CLI 都能操作，可交接 | 前導片證實（Windows）；K1 待修 | daemon `a1571fb`＋agent 端 `--address`／Windows／`prove-it/records/a1571fb-a2-two-cli-handoff.md`：Codex（Sol 6.2，沙箱內）認領並送審 → Claude（haiku）核准 → 人在瀏覽器上按測試通過，`done r4`；權限邊界 4 類全部被拒 |
 | A3 | 撤權與角色檢查 | 未開始 | |
 | A4 | 人類啟動設定（核准執行檔、參數、工作區） | 契約已審，未實作 | |
 | A5 | 重啟恢復；結果未知的操作不報成功 | 局部證據 | |
@@ -34,9 +36,10 @@
 
 | PR | 分支 | head | 狀態 | 驗證 |
 |---|---|---|---|---|
-| #12 | feature/cli-runtime-shutdown | `a1571fb` | 可合併 | Windows／Linux：`cargo test --locked --no-fail-fast` 全過；public HTTP 各 20/20；fmt 和 CI 的 Python 測試全過。獨立 review 找到 5 項：3 項已修，2 項轉為 K1、K2 |
+| #12 | feature/cli-runtime-shutdown | `e2e3b3b` | 可合併（CI 三平台綠） | Windows／Linux：`cargo test --locked --no-fail-fast` 全過；public HTTP 各 20/20；fmt 和 CI 的 Python 測試全過。獨立 review 找到 5 項：3 項已修，2 項轉為 K1、K2 |
 | #13 | feature/runtime-incarnation | 待 merge `a1571fb` | 可合併（在 #12 之後） | 在 `6ca145b`（含 `245ebdb`）上，Windows／Linux 全套通過；原本的 8 秒門檻問題已由 native ACL 修正解決 |
 | #14 | feature/agent-saved-plan-recovery | `abe9294` | 可合併（在 #12 之後） | F1／F2 都先確認測試失敗（RED），修正後通過（GREEN）；Windows／Linux 全套通過 |
+| （新） | feature/agent-direct-connect | 見 git | 疊在 #12 上 | `linkstart tool --address`，讓沙箱裡的 agent 不必讀私有狀態目錄。先 RED 後 GREEN；Windows／Linux public HTTP 各 21/21 通過 |
 
 ## 已知問題（未修，已排入切片）
 
