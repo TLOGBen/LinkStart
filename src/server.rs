@@ -18,7 +18,6 @@ use tower_http::limit::RequestBodyLimitLayer;
 use uuid::Uuid;
 
 use crate::cli::{DaemonRecord, StartArgs};
-use crate::daemon::process_alive;
 use crate::store::Store;
 use crate::util::{canonical, hash, now, output, token, MAX_BODY, PROTOCOL, VERSION};
 
@@ -26,6 +25,7 @@ use crate::util::{canonical, hash, now, output, token, MAX_BODY, PROTOCOL, VERSI
 pub(crate) struct AppState {
     store: Store,
     host: String,
+    instance_id: String,
 }
 
 #[derive(Deserialize)]
@@ -163,10 +163,7 @@ pub(crate) async fn serve(a: StartArgs) -> Result<()> {
         if let Some(bytes) = owner.read()? {
             let record: DaemonRecord =
                 serde_json::from_slice(&bytes).context("invalid daemon discovery record")?;
-            if process_alive(record.pid) {
-                if record.version != VERSION || record.protocol_major != PROTOCOL {
-                    bail!("daemon_version_or_protocol_conflict: explicit drain/restart required")
-                }
+            if let crate::runtime_identity::Inspection::Reusable(_) = crate::runtime_identity::inspect(&record)? {
                 output(
                     a.state.json,
                     json!({"reused":true,"version":VERSION,"protocolMajor":PROTOCOL}),
@@ -180,12 +177,12 @@ pub(crate) async fn serve(a: StartArgs) -> Result<()> {
         // previous locator. The listener exists before publication succeeds.
         let listener = std::net::TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
-        let host = addr.to_string();
+        let host = listener.local_addr()?.to_string();
         let store = Store::open(&a.state.state_dir)?;
-        let state = AppState { store, host };
+        let state = AppState { store, host, instance_id: Uuid::new_v4().to_string() };
         let (v2, shutdown) = linkstart::runtime_http::router(&a.state.state_dir, &state.host)?;
         owner.publish(&serde_json::to_vec(
-            &json!({"address":state.host,"pid":std::process::id(),"version":VERSION,"protocolMajor":PROTOCOL}),
+            &json!({"address":state.host,"pid":std::process::id(),"version":VERSION,"protocolMajor":PROTOCOL,"instanceId":state.instance_id}),
         )?)?;
         Ok(Some((state, v2, shutdown, listener)))
     })
@@ -249,8 +246,10 @@ pub(crate) async fn serve(a: StartArgs) -> Result<()> {
     }
     Ok(())
 }
-pub(crate) async fn health(State(_s): State<AppState>) -> Json<Value> {
-    Json(json!({"version":VERSION,"protocolMajor":PROTOCOL,"status":"ready"}))
+pub(crate) async fn health(State(s): State<AppState>) -> Json<Value> {
+    Json(
+        json!({"version":VERSION,"protocolMajor":PROTOCOL,"status":"ready","pid":std::process::id(),"address":s.host,"instanceId":s.instance_id}),
+    )
 }
 pub(crate) async fn cors(
     State(s): State<AppState>,
