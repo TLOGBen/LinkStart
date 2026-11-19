@@ -11,6 +11,12 @@ use tempfile::TempDir;
 fn bin() -> String {
     env!("CARGO_BIN_EXE_linkstart").to_string()
 }
+// port() releases its probe port, so a parallel test's listener can receive this
+// test's daemon traffic. Tests in this file run one at a time.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 fn port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -90,6 +96,7 @@ fn health(port: u16) -> bool {
 
 #[test]
 fn lifecycle_json_is_one_truthful_control_result() {
+    let _serial = serial();
     let dir = TempDir::new().unwrap();
     let _cleanup = DaemonCleanup(dir.path().to_path_buf());
     let p = port();
@@ -145,6 +152,7 @@ fn lifecycle_json_is_one_truthful_control_result() {
 
 #[test]
 fn start_reports_json_failure_when_port_is_occupied() {
+    let _serial = serial();
     let dir = TempDir::new().unwrap();
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
     let p = occupied.local_addr().unwrap().port();
@@ -254,6 +262,7 @@ fn scripted_shutdown(reply: &str) -> (TcpListener, std::sync::mpsc::Receiver<Vec
 
 #[test]
 fn pending_or_uncertain_shutdown_never_kills_recorded_process_or_restarts() {
+    let _serial = serial();
     for response in [
         r#"{"status":"pending","history_error":"fixture barrier blocked"}"#,
         r#"{"status":"stopping","history":"pending"}"#,
@@ -301,6 +310,7 @@ fn pending_or_uncertain_shutdown_never_kills_recorded_process_or_restarts() {
 
 #[test]
 fn invalid_discovery_or_unavailable_transport_never_kills_or_initializes_owner() {
+    let _serial = serial();
     for (address, credential) in [
         ("192.0.2.1:45831".to_string(), Some("fixture-owner")),
         (format!("127.0.0.1:{}", port()), Some("fixture-owner")),

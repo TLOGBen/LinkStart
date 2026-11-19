@@ -573,6 +573,7 @@ dependencies = [
  "axum",
  "clap",
  "futures-util",
+ "libc",
  "portable-pty",
  "rand",
  "rusqlite",

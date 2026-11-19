@@ -114,15 +114,18 @@ impl TerminalManager {
                 history.status(&s.view);
             }
             if s.view.status == "exited" {
+                // The leader may exit first; its group can still hold descendants.
+                #[cfg(not(windows))]
+                if force {
+                    kill_owned_group(s.view.process_id)?;
+                }
                 return Ok(s.view.clone());
             }
             if force {
                 #[cfg(windows)]
                 s.job.terminate()?;
                 #[cfg(not(windows))]
-                {
-                    return Err("owned process-tree force is Unsupported on this platform".into());
-                }
+                kill_owned_group(s.view.process_id)?;
             } else {
                 let _ = s
                     .input
@@ -386,6 +389,11 @@ impl TerminalManager {
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         }
+        // Children inherit "ignore Ctrl-C" from whoever launched the daemon (IDEs,
+        // agents, services). Restore normal processing so owned terminals can be
+        // interrupted, including the graceful stop's Ctrl-C.
+        #[cfg(windows)]
+        owned_job::restore_ctrl_c_inheritance();
         let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         // No caller-specified executable runs until its trusted launcher belongs
         // to the job; every later descendant inherits that job atomically.
@@ -513,6 +521,22 @@ impl TerminalManager {
     }
 }
 
+// portable-pty makes each Unix child a session and process-group leader (setsid),
+// so the group id equals the child pid and holds every descendant that stayed in it.
+#[cfg(not(windows))]
+fn kill_owned_group(pid: Option<u32>) -> Result<(), String> {
+    let pid = pid.ok_or("native child lacks process id")? as libc::pid_t;
+    if unsafe { libc::killpg(pid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(format!("owned process-group force failed: {e}"))
+    }
+}
+
 #[cfg(windows)]
 pub(crate) mod owned_job {
     use std::{ffi::c_void, io, mem, ptr};
@@ -561,6 +585,13 @@ pub(crate) mod owned_job {
         fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
         fn TerminateJobObject(job: Handle, code: u32) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
+        fn SetConsoleCtrlHandler(handler: *mut c_void, add: i32) -> i32;
+    }
+    pub fn restore_ctrl_c_inheritance() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            SetConsoleCtrlHandler(ptr::null_mut(), 0);
+        });
     }
     pub struct Job(usize);
     impl Job {
@@ -808,7 +839,6 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
     #[test]
-    #[cfg(windows)]
     fn owned_tree_stop_reports_truth_and_force_cleans_descendant() {
         let manager = TerminalManager::new();
         // A child with an actual descendant that ignores interactive Ctrl-C.
@@ -820,7 +850,10 @@ mod tests {
         let args = if cfg!(windows) {
             vec!["-NoProfile","-Command","$p=Start-Process -WindowStyle Hidden -PassThru powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep 120'; Write-Output ('DESCENDANT='+$p.Id); Start-Sleep 120"]
         } else {
-            vec!["-c", "sleep 120 & echo DESCENDANT=$!; wait"]
+            vec![
+                "-c",
+                "trap '' INT HUP; sleep 120 & echo DESCENDANT=$!; wait",
+            ]
         };
         let s = manager
             .create(
@@ -871,7 +904,13 @@ mod tests {
             "owned descendant must exit"
         );
         #[cfg(not(windows))]
-        let _ = descendant;
+        {
+            let until = Instant::now() + Duration::from_secs(3);
+            while std::path::Path::new(&format!("/proc/{descendant}")).exists() {
+                assert!(Instant::now() < until, "owned descendant must exit");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         assert!(manager.shutdown(Duration::from_millis(100)).is_empty());
     }
     #[test]
@@ -916,8 +955,6 @@ mod tests {
                         "Start-Sleep 3".into(),
                     ]
                 } else {
-                    // One owned root, no descendant: Unix tree-force remains
-                    // unsupported. Exercise real PTY Ctrl-C cleanup instead.
                     vec!["-c".into(), "exec sleep 30".into()]
                 },
                 None,
@@ -933,7 +970,6 @@ mod tests {
         );
         assert!(result.unwrap_err().contains("not delivered"));
         assert!(started.elapsed() < Duration::from_secs(1));
-        #[cfg(windows)]
         assert_eq!(
             manager
                 .force_owned(&s.id, Duration::from_secs(3))
@@ -941,20 +977,6 @@ mod tests {
                 .status,
             "exited"
         );
-        #[cfg(not(windows))]
-        {
-            let cleanup_started = Instant::now();
-            let unsupported = manager
-                .force_owned(&s.id, Duration::from_secs(3))
-                .unwrap_err();
-            assert!(unsupported.contains("Unsupported"));
-            let stopped = manager.stop_owned(&s.id, Duration::from_secs(3)).unwrap();
-            assert_eq!(
-                stopped.status, "exited",
-                "real owned root must exit after PTY Ctrl-C"
-            );
-            assert!(cleanup_started.elapsed() < Duration::from_secs(4));
-            assert_eq!(manager.observe(&s.id, 0).unwrap().status, "exited");
-        }
+        assert_eq!(manager.observe(&s.id, 0).unwrap().status, "exited");
     }
 }
