@@ -462,6 +462,16 @@ class RuntimeHttp(unittest.TestCase):
         held_then_revoked(lambda:(time.sleep(2.5),(200,'expired'))[1],401)
         call('terminal.force',{'endpoint_id':eid})
 
+    def test_terminal_request_id_is_bounded(self):
+        # K2: every receipt keeps its request_id, so its size must be bounded.
+        owner,sid,created=self.recorded_terminal('bounded-id','import time; time.sleep(5)')
+        eid=created['endpoint']['id']
+        for rid in ['x'*257,'nul\0id']:
+            status,value=self.post(dict(request_id=rid,tool='terminal.force',space_id=sid,args={'endpoint_id':eid}),owner)
+            self.assertEqual((status,value['error']['code']),(400,'Invalid'),value)
+        status,value=self.post(dict(request_id='x'*256,tool='terminal.force',space_id=sid,args={'endpoint_id':eid}),owner)
+        self.assertEqual(status,200,value)
+
     def test_terminal_write_delivers_whitespace_only_keys(self):
         script="print('KEYS_READY',flush=True)\nfor n in (1,2):\n    print('LINE%d=%r'%(n,input()),flush=True)\n"
         token,sid,created=self.recorded_terminal('keys',script)

@@ -15,7 +15,7 @@
 
 ## 下一步
 
-A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已知問題」：K8（#24）、K10（#25）已修正，接下來是 K2。
+A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已知問題」：K8（#24）、K10（#25）、K2（#27）已修正；其餘照 `已知問題` 一項項處理，K11、K13、K4、K5–K7 由並行 session 各自修。
 
 ## 驗收項目
 
@@ -45,11 +45,12 @@ A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已�
 | #23 | docs/goal-complete | 已合併 `8407af1` | 帳本：A1–A8 全部達成 |
 | #24 | fix/k8-address-auth | 已合併 | K8：`--address` 先驗證 Runtime 身分再送憑證；HUNT-2026-005 測試修正 |
 | #25 | fix/k10-approval-recheck | 已合併 | K10：啟動核准不會比核准人的信任活得久（終端 restart 與 owned launch plan）；agent manager 不能改人類的角色與憑證 |
+| #26 | chore/lint | 已合併 `32a16bc` | 啟用 baransu lint，加上 LinkStart 自己的 5 條檢查（`.claude/lint/sets/local/linkstart.toml`） |
+| #27 | fix/k2-receipts | 已合併 | K2：終端請求的收據有上限，過期留墓碑，重送永遠不會再執行一次 |
 
 ## 已知問題
 
 - **K1（部分已修）**：`terminal.observe` 和 `/v2/health` 已經移到鎖外。會改變狀態的終端操作（write、acquire、stop、create）仍然依序經過同一把鎖：某個 agent 的 stop 最多 500 毫秒、create 最多 5 秒，這段時間其他 agent 的寫入會被延後，但不會失敗。
-- **K2**：`NativeState.receipts` 會隨每次寫入或續約無限增長。長時間運作時記憶體會慢慢變大；A7 的 65 分鐘閒置沒有寫入，所以沒有測到這點。
 - **K4**（#13 review）：`runtime_identity::response` 遇到 `Connection: close` 會丟掉已經完整收到的最終回應（`runtime_identity.rs`）。
 - **K5**（#14 review）：加鎖前的空窗期如果寫入了較新的 in-memory fallback，恢復流程只合併加鎖前讀到的舊版本，最新的私有錯誤紀錄會遺失（`runtime_agent.rs`）。
 - **K6**（假說 storage-init）：`protect_if_present` 在「刪除中」時依賴約 1 秒內完成；可以改成刪除中就跳過，移除這個時間前提。其他資料庫的 `protect` 用的也是「先檢查存在再設 ACL」的寫法。
@@ -75,7 +76,12 @@ A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已�
   - workspace write 核准（`approve_workspace`）記下的核准人不會再被重新檢查；要靠 install 時的安裝者檢查擋。
   - agent manager 仍可撤銷 launch plan，最多讓 space 內的 plan 全部失效（只會減少權限）。
   - owned launch 在 `approve()` 檢查安裝者之後、最後一次確認之前，有幾毫秒的空窗；撤銷本來就不會停掉已在跑的程序。
-- 已修：K3（#18）、K9（#18）；A8 審查的 M1、M2 和「關閉中無法撤權」（#22）；K8（#24：`--address` 送憑證前，Runtime 先用 HMAC 證明它知道這個憑證，證明綁定它自己的位址）；K10（#25：每位人類成員有一個信任世代，撤銷憑證或拿掉 `human_admin` 時加 1；終端核准與 launch plan 記下核准當下的世代，啟動時不相等就拒絕，所以重新發憑證或恢復角色都不會讓舊核准復活；agent manager 不能改人類的角色與憑證，也不能安裝 launch plan；沒有安裝者紀錄的舊 plan 必須重新安裝）。
+- 已修：K3（#18）、K9（#18）；A8 審查的 M1、M2 和「關閉中無法撤權」（#22）；K8（#24：`--address` 送憑證前，Runtime 先用 HMAC 證明它知道這個憑證，證明綁定它自己的位址）；K10（#25：每位人類成員有一個信任世代，撤銷憑證或拿掉 `human_admin` 時加 1；終端核准與 launch plan 記下核准當下的世代，啟動時不相等就拒絕，所以重新發憑證或恢復角色都不會讓舊核准復活；agent manager 不能改人類的角色與憑證，也不能安裝 launch plan；沒有安裝者紀錄的舊 plan 必須重新安裝）；K2（#27：每個身分保留最新 2,000 筆、1 小時內的收據；收據只存請求的 SHA-256，不存內容；過期的變成墓碑，重送回 UnknownEffect，不會再執行一次；墓碑總數上限 20 萬，最舊的先忘。一個請求從開始到完成只佔一格，別的身分也擠不掉你的「結果未知」紀錄）。
+- **K22**（#27 審查，low）：
+  - `native-intents/` 底下 create、restart 的意圖標記檔從不清除，磁碟上會無限增長，屬於 K2 同類。
+  - 墓碑池是所有身分共用的 20 萬筆；別的身分連續送超過 20 萬次請求，可以把你已過期的墓碑擠掉，那之後重送同一個 ID 會被當成新請求。
+  - 只在同一個身分有新請求時才清它的過期收據；停用的身分最多留著 2,000 筆（總量由成員數決定）。
+  - 參數錯誤（缺 generation、lease 不對）發生在動作之前，但同一個 ID 重送仍回 UnknownEffect（舊行為，不是這次引入）。
 
 ## 紀錄
 

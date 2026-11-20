@@ -37,10 +37,100 @@ struct HttpState {
     sources: SourceJobs,
     watches: WatchManager,
 }
+/// What a request_id did, so a resend never acts twice: `Some(reply)` once it
+/// succeeded (a resend gets the same reply), `None` while its effect is unknown
+/// (a resend answers UnknownEffect). Bounded (K2): each identity keeps its newest
+/// `RECEIPT_CAP_PER_IDENTITY` receipts for `RECEIPT_TTL`; an older one becomes a
+/// tombstone that keeps only the request's digest and answers UnknownEffect.
+/// Only a request whose tombstone is among the oldest beyond `TOMBSTONE_CAP`
+/// (shared by all identities) is forgotten, and a resend of it would run again.
+#[derive(Default)]
+struct Receipts {
+    live: HashMap<String, (String, Option<Value>, std::time::Instant)>,
+    queues: HashMap<String, std::collections::VecDeque<(std::time::Instant, String)>>,
+    tombstones: HashMap<String, String>,
+    tombstone_order: std::collections::VecDeque<String>,
+}
+const RECEIPT_TTL: Duration = Duration::from_secs(3600);
+const RECEIPT_CAP_PER_IDENTITY: usize = 2_000;
+const TOMBSTONE_CAP: usize = 200_000;
+/// A request is remembered by its digest, never its (possibly large) body.
+fn request_digest(request: &str) -> String {
+    format!("{:x}", Sha256::digest(request.as_bytes()))
+}
+impl Receipts {
+    /// `Ok(Some(reply))` replays, `Ok(None)` means never seen.
+    fn lookup(
+        &self,
+        key: &str,
+        digest: &str,
+    ) -> Result<Option<Value>, crate::runtime_core::ApiError> {
+        let known = self
+            .live
+            .get(key)
+            .map(|(d, reply, _)| (d, reply.as_ref()))
+            .or_else(|| self.tombstones.get(key).map(|d| (d, None)));
+        match known {
+            None => Ok(None),
+            Some((old, _)) if old != digest => {
+                Err(error("RequestConflict", "request id content differs"))
+            }
+            Some((_, Some(reply))) => Ok(Some(reply.clone())),
+            Some((_, None)) => Err(error(
+                "UnknownEffect",
+                "the earlier call with this request_id may have acted, or its receipt expired; inspect before issuing a new request_id",
+            )),
+        }
+    }
+    /// Marks the request as in flight: until `finish`, a resend is UnknownEffect.
+    fn begin(&mut self, key: &str, digest: &str, now: std::time::Instant) {
+        let bucket = key.split(':').next().unwrap_or_default().to_string();
+        self.live.insert(key.into(), (digest.into(), None, now));
+        let queue = self.queues.entry(bucket.clone()).or_default();
+        queue.push_back((now, key.into()));
+        self.prune(&bucket, now);
+    }
+    fn finish(&mut self, key: &str, reply: Value) {
+        if let Some(entry) = self.live.get_mut(key) {
+            entry.1 = Some(reply);
+        }
+    }
+    /// A completed request that had no in-flight mark (create, restart).
+    fn record(&mut self, key: &str, digest: &str, reply: Value) {
+        self.begin(key, digest, std::time::Instant::now());
+        self.finish(key, reply);
+    }
+    fn prune(&mut self, bucket: &str, now: std::time::Instant) {
+        let Some(queue) = self.queues.get_mut(bucket) else {
+            return;
+        };
+        while let Some((at, key)) = queue.front() {
+            let old = now.saturating_duration_since(*at) > RECEIPT_TTL;
+            if !old && queue.len() <= RECEIPT_CAP_PER_IDENTITY {
+                break;
+            }
+            if self
+                .live
+                .get(key)
+                .is_some_and(|(_, _, stored)| stored == at)
+            {
+                let (digest, _, _) = self.live.remove(key).expect("checked above");
+                if self.tombstones.insert(key.clone(), digest).is_none() {
+                    self.tombstone_order.push_back(key.clone());
+                }
+                while self.tombstone_order.len() > TOMBSTONE_CAP {
+                    if let Some(oldest) = self.tombstone_order.pop_front() {
+                        self.tombstones.remove(&oldest);
+                    }
+                }
+            }
+            queue.pop_front();
+        }
+    }
+}
 #[derive(Default)]
 struct NativeState {
-    receipts: HashMap<String, (String, Value)>,
-    uncertain: std::collections::HashSet<String>,
+    receipts: Receipts,
     epoch: u64,
     ticket: Option<(String, u64, u64, std::time::Instant)>,
     draining: bool,
@@ -818,8 +908,9 @@ fn dispatch(
         }
         return Ok(value);
     }
-    if r.request_id.trim().is_empty() {
-        return Err(error("Invalid", "request_id required"));
+    // Bounded like the owned bridge's: the request_id is kept in every receipt (K2).
+    if r.request_id.trim().is_empty() || r.request_id.len() > 256 || r.request_id.contains('\0') {
+        return Err(error("Invalid", "bounded request_id required"));
     }
     if r.tool == "terminal.create" {
         let command = field(&r.args, "command")?.to_string();
@@ -854,8 +945,8 @@ fn dispatch(
             .ok_or_else(|| error("Internal", "endpoint id missing"))?
             .to_string();
         let key = format!("create:{eid}");
-        if let Some((_, value)) = n.receipts.get(&key) {
-            return Ok(value.clone());
+        if let Some(value) = n.receipts.lookup(&key, "")? {
+            return Ok(value);
         }
         // Reject an endpoint that predated this create attempt (including crash recovery).
         // A runtime marker is persisted before any native side effect below.
@@ -868,7 +959,7 @@ fn dispatch(
             .map_err(|e| error("NativeError", e))?;
         owned_sessions(s)?.insert(eid, session.id.clone());
         let value = json!({"endpoint":ep,"session":session});
-        n.receipts.insert(key, (String::new(), value.clone()));
+        n.receipts.record(&key, "", value.clone());
         return Ok(value);
     }
     let eid = field(&r.args, "endpoint_id")?;
@@ -893,12 +984,10 @@ fn dispatch(
         .ok_or_else(|| error("Internal", "missing identity"))?;
     let fingerprint = serde_json::to_string(r).map_err(|e| error("Invalid", e))?;
     let key = format!("{}:{}", identity, r.request_id);
+    let digest = request_digest(&fingerprint);
     if r.tool != "terminal.observe" {
-        if let Some((old, value)) = n.receipts.get(&key) {
-            if old != &fingerprint {
-                return Err(error("RequestConflict", "request id content differs"));
-            }
-            return Ok(value.clone());
+        if let Some(value) = n.receipts.lookup(&key, &digest)? {
+            return Ok(value);
         }
     }
     if r.tool == "terminal.restart" {
@@ -985,7 +1074,7 @@ fn dispatch(
             .map_err(|e| error("NativeError", e))?;
         owned_sessions(s)?.insert(eid.into(), session.id.clone());
         let value = json!({"endpoint":authorization["endpoint"],"session":session,"previous_session_id":expected,"process_resume":"unsupported"});
-        n.receipts.insert(key, (fingerprint, value.clone()));
+        n.receipts.record(&key, &digest, value.clone());
         return Ok(value);
     }
     let sid = &owned_sessions(s)?.get(eid).cloned().ok_or_else(|| {
@@ -994,11 +1083,9 @@ fn dispatch(
             "terminal is not owned by this runtime; explicit new session required",
         )
     })?;
-    if n.uncertain.contains(&key) {
-        return Err(error("UnknownEffect","previous native call did not finish successfully; inspect before issuing a new request"));
-    }
+    // An in-flight or failed call is already answered UnknownEffect by lookup().
     if r.tool != "terminal.observe" {
-        n.uncertain.insert(key.clone());
+        n.receipts.begin(&key, &digest, std::time::Instant::now());
     }
     let generation = || {
         r.args["generation"]
@@ -1069,8 +1156,91 @@ fn dispatch(
         _ => unreachable!(),
     };
     if r.tool != "terminal.observe" {
-        n.uncertain.remove(&key);
-        n.receipts.insert(key, (fingerprint, value.clone()));
+        n.receipts.finish(&key, value.clone());
     }
     Ok(value)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+    fn code(r: Result<Option<Value>, crate::runtime_core::ApiError>) -> String {
+        match r {
+            Ok(Some(_)) => "replay".into(),
+            Ok(None) => "new".into(),
+            Err(e) => e.code,
+        }
+    }
+    #[test]
+    fn resend_replays_and_unfinished_or_failed_call_is_unknown() {
+        let mut receipts = Receipts::default();
+        let now = Instant::now();
+        assert_eq!(code(receipts.lookup("a:1", "d")), "new");
+        receipts.begin("a:1", "d", now);
+        // In flight, or failed after possibly acting: never run again.
+        assert_eq!(code(receipts.lookup("a:1", "d")), "UnknownEffect");
+        receipts.finish("a:1", json!({"ok":true}));
+        assert_eq!(
+            receipts.lookup("a:1", "d").unwrap(),
+            Some(json!({"ok":true}))
+        );
+        // Same ID, different request.
+        assert_eq!(code(receipts.lookup("a:1", "other")), "RequestConflict");
+    }
+    #[test]
+    fn expired_receipt_becomes_tombstone_and_is_never_rerun() {
+        let mut receipts = Receipts::default();
+        let start = Instant::now();
+        receipts.begin("a:stop", "d", start);
+        receipts.finish("a:stop", json!({"stopped":true}));
+        receipts.begin("a:next", "e", start + RECEIPT_TTL + Duration::from_secs(1));
+        assert!(!receipts.live.contains_key("a:stop"));
+        // The reply is gone, but a resend still cannot act a second time.
+        assert_eq!(code(receipts.lookup("a:stop", "d")), "UnknownEffect");
+        assert_eq!(code(receipts.lookup("a:stop", "x")), "RequestConflict");
+    }
+    #[test]
+    fn one_identity_cannot_evict_another_and_each_stays_bounded() {
+        let mut receipts = Receipts::default();
+        let now = Instant::now();
+        receipts.begin("victim:write", "d", now); // failed: effect unknown
+        for i in 0..RECEIPT_CAP_PER_IDENTITY + 50 {
+            let key = format!("noisy:{i}");
+            receipts.begin(&key, "d", now);
+            receipts.finish(&key, json!(i));
+        }
+        assert_eq!(code(receipts.lookup("victim:write", "d")), "UnknownEffect");
+        assert!(receipts.live.contains_key("victim:write"));
+        assert_eq!(receipts.queues["noisy"].len(), RECEIPT_CAP_PER_IDENTITY);
+        // A successful call takes one slot, not two.
+        assert_eq!(
+            receipts
+                .live
+                .keys()
+                .filter(|k| k.starts_with("noisy:"))
+                .count(),
+            RECEIPT_CAP_PER_IDENTITY
+        );
+        // The evicted ones are tombstones, still refusing a rerun.
+        assert_eq!(code(receipts.lookup("noisy:0", "d")), "UnknownEffect");
+    }
+    #[test]
+    fn tombstones_are_bounded_oldest_first() {
+        let mut receipts = Receipts::default();
+        let now = Instant::now();
+        for i in 0..TOMBSTONE_CAP + RECEIPT_CAP_PER_IDENTITY + 5 {
+            receipts.begin(&format!("a:{i}"), "d", now);
+        }
+        assert_eq!(receipts.tombstones.len(), TOMBSTONE_CAP);
+        assert_eq!(receipts.tombstone_order.len(), TOMBSTONE_CAP);
+        assert_eq!(code(receipts.lookup("a:0", "d")), "new");
+        assert_eq!(code(receipts.lookup("a:5", "d")), "UnknownEffect");
+    }
+    #[test]
+    fn request_digest_is_small_and_stable() {
+        let big = "x".repeat(100_000);
+        assert_eq!(request_digest(&big).len(), 64);
+        assert_eq!(request_digest(&big), request_digest(&big));
+        assert_ne!(request_digest(&big), request_digest("y"));
+    }
 }
