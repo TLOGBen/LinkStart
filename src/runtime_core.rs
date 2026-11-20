@@ -708,6 +708,39 @@ impl Engine {
             .map(|i| hash(credential) == hash(&i.secret))
             .unwrap_or(false)
     }
+    /// Whether `identity` (a member id or "owner") may still perform `operation`
+    /// on `endpoint_id` under the committed state; used to fence held leases.
+    pub fn identity_permits(
+        &self,
+        identity: &str,
+        endpoint_id: &str,
+        operation: &str,
+    ) -> Result<bool, ApiError> {
+        if identity == "owner" {
+            return Ok(true);
+        }
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| err("Internal", "runtime lock poisoned"))?;
+        let encoded: String = inner
+            .db
+            .query_row("SELECT json FROM core_state WHERE id=1", [], |r| r.get(0))
+            .map_err(internal)?;
+        let s: State = serde_json::from_str(&encoded).map_err(internal)?;
+        let Some(member) = s.members.iter().find(|m| m["id"] == identity) else {
+            return Ok(false);
+        };
+        let Some(endpoint) = s.endpoints.iter().find(|e| e["id"] == endpoint_id) else {
+            return Ok(false);
+        };
+        Ok(credential_active(member, (self.clock)())
+            && member["space_id"] == endpoint["space_id"]
+            && (admin(&member["roles"])
+                || endpoint["grants"][identity]
+                    .as_array()
+                    .is_some_and(|ops| ops.iter().any(|op| op == operation))))
+    }
     pub(crate) fn private_storage_directory(&self) -> anyhow::Result<PathBuf> {
         let inner = self
             .inner
@@ -1512,6 +1545,19 @@ fn dispatch(
             let mut ep = json!({"id":id(),"space_id":sid,"name":name,"kind":kind,"config":r.args.get("config").cloned().unwrap_or(json!({})),"created_at":now(),"grants":grants});
             if kind == "github" {
                 ep["source_authority"] = json!({"approved_by":author,"space_id":sid,"approved_at":now()});
+            }
+            // A terminal that names a program is a launch: executable, arguments
+            // and workspace are chosen by a human, never by an agent.
+            if kind == "terminal" && !ep["config"]["command"].is_null() {
+                let human = owner
+                    || member.is_some_and(|m| m["kind"] == "human" && has(&m["roles"], "human_admin"));
+                if !human {
+                    return Err(err(
+                        "Denied",
+                        "launching a program requires a human administrator's approval; relaunch an approved terminal with terminal.restart",
+                    ));
+                }
+                ep["launch_approval"] = json!({"approved_by":author,"approved_at":now()});
             }
             s.endpoints.push(ep.clone());
             Ok(ep)

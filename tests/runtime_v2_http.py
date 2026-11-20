@@ -372,6 +372,39 @@ class RuntimeHttp(unittest.TestCase):
         self.assertEqual(status,403,value)
         self.post(dict(request_id='obs-force',tool='terminal.force',space_id=sid,args={'endpoint_id':eid}),token)
 
+    def test_revocation_ends_held_control_and_next_operation(self):
+        token,sid,created=self.recorded_terminal('revoke',"print('REV_READY',flush=True)\nwhile True:\n    print('GOT=%r'%input(),flush=True)\n")
+        eid=created['endpoint']['id']
+        def call(tool,args,credential=token):return self.post(dict(request_id=str(time.time_ns()),tool=tool,space_id=sid,args=args),credential)
+        _,invite=call('members.invite',{'roles':['manager']})
+        _,member=call('members.register',{'name':'agent'},invite['invite_token'])
+        mid,cred=member['id'],member['credential']
+        def held_then_revoked(revoke,denied):
+            status,lease=call('terminal.acquire',{'endpoint_id':eid},cred)
+            self.assertEqual(status,200,lease)
+            self.assertEqual(call('terminal.write',dict(endpoint_id=eid,input='x\r',**lease),cred)[0],200)
+            status,value=revoke()
+            self.assertEqual(status,200,value)
+            status,value=call('terminal.write',dict(endpoint_id=eid,input='y\r',**lease),cred)
+            self.assertEqual(status,denied,value)
+            # The revoked holder's lease must not keep a human or another agent out.
+            status,mine=call('terminal.acquire',{'endpoint_id':eid})
+            self.assertEqual(status,200,mine)
+            self.assertEqual(call('terminal.release',dict(endpoint_id=eid,**mine))[0],200)
+        held_then_revoked(lambda:call('members.set_roles',{'member_id':mid,'roles':['implementer']}),403)
+        call('endpoints.grant',{'endpoint_id':eid,'member_id':mid,'operations':['send','control']})
+        held_then_revoked(lambda:call('endpoints.grant',{'endpoint_id':eid,'member_id':mid,'operations':[]}),403)
+        call('endpoints.grant',{'endpoint_id':eid,'member_id':mid,'operations':['send','control']})
+        held_then_revoked(lambda:call('members.revoke_credential',{'member_id':mid,'expected_epoch':member.get('credential_epoch',0)}),401)
+        # Time-based expiry has no revoking call: the next acquire must fence it.
+        _,invite=call('members.invite',{'roles':['manager']})
+        _,member=call('members.register',{'name':'expiring'},invite['invite_token'])
+        status,rotated=call('members.rotate_credential',{'member_id':member['id'],'expected_epoch':member.get('credential_epoch',0),'ttl_seconds':2})
+        self.assertEqual(status,200,rotated)
+        cred=rotated['credential']
+        held_then_revoked(lambda:(time.sleep(2.5),(200,'expired'))[1],401)
+        call('terminal.force',{'endpoint_id':eid})
+
     def test_terminal_write_delivers_whitespace_only_keys(self):
         script="print('KEYS_READY',flush=True)\nfor n in (1,2):\n    print('LINE%d=%r'%(n,input()),flush=True)\n"
         token,sid,created=self.recorded_terminal('keys',script)
@@ -574,5 +607,31 @@ class RuntimeHttp(unittest.TestCase):
         status,value=call('endpoints.register',{'name':'forged source','kind':'github','config':{'repository':'TLOGBen/LinkStart','allow_write_back':True,'source_authority':True}},member['credential'])
         self.assertEqual(status,403,value)
         self.assertEqual(value['error']['code'],'Denied')
+
+    def test_agents_launch_only_human_approved_terminals(self):
+        token=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()
+        _,space=self.post(dict(request_id='launch-space',tool='spaces.create',args={'name':'launch'}),token)
+        sid=space['space']['id']; human=space['administrator']['credential']
+        def call(tool,args,credential,rid=None):return self.post(dict(request_id=rid or str(time.time_ns()),tool=tool,space_id=sid,args=args),credential)
+        _,invite=call('members.invite',{'roles':['session_maintainer','manager']},token)
+        _,agent=call('members.register',{'name':'agent'},invite['invite_token'])
+        launch=dict(shell_once('echo APPROVED_LAUNCH'),name='approved')
+        # An agent, even a manager, cannot choose an executable, arguments or workspace.
+        status,value=call('terminal.create',launch,agent['credential'])
+        self.assertEqual(status,403,value)
+        status,value=call('endpoints.register',{'name':'smuggled','kind':'terminal','config':{'command':launch['command'],'args':launch['args'],'cwd':None}},agent['credential'])
+        self.assertEqual(status,403,value)
+        # A human administrator approves it by creating it; the agent may then relaunch exactly that.
+        status,created=call('terminal.create',launch,human)
+        self.assertEqual(status,200,created)
+        eid=created['endpoint']['id']; old=created['session']['id']
+        self.assertEqual(created['endpoint']['launch_approval']['approved_by'],space['administrator']['id'])
+        for _ in range(100):
+            _,listing=call('endpoints.list',{},human)
+            if next(e for e in listing['items'] if e['id']==eid)['status']=='exited':break
+            time.sleep(.05)
+        status,restarted=call('terminal.restart',{'endpoint_id':eid,'expected_session_id':old},agent['credential'])
+        self.assertEqual(status,200,restarted)
+        self.assertNotEqual(restarted['session']['id'],old)
 
 if __name__=='__main__':unittest.main()
