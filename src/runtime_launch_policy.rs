@@ -228,9 +228,7 @@ impl LaunchPolicyStore {
         );
         crate::runtime_core::protect(dir)?;
         let path = dir.join("v2-launch-policy.sqlite");
-        if path.exists() {
-            crate::runtime_core::protect(&path)?;
-        }
+        crate::runtime_core::protect_if_present(&path)?;
         let mut db = Connection::open(&path)?;
         db.busy_timeout(Duration::from_secs(5))?;
         // DELETE journal stays inside the protected parent, avoiding persistent WAL secrets.

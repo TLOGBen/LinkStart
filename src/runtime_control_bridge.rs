@@ -167,9 +167,7 @@ impl OwnedControlBridge {
         );
         crate::runtime_core::protect(dir)?;
         let path = dir.join("v2-owned-control.sqlite");
-        if path.exists() {
-            crate::runtime_core::protect(&path)?;
-        }
+        crate::runtime_core::protect_if_present(&path)?;
         let mut db = Connection::open(&path)?;
         db.busy_timeout(Duration::from_secs(5))?;
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")?;
