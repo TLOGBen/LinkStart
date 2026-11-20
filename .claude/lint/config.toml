@@ -1,0 +1,18 @@
+[settings]
+converter = "toml"
+sgconfig = "sgconfig.yml"
+
+[[extends]]
+set = "sets/baransu/git.toml"
+
+[[extends]]
+set = "sets/baransu/files.toml"
+
+[[extends]]
+set = "sets/baransu/runtime.toml"
+
+[[extends]]
+set = "sets/baransu/env.toml"
+
+[[extends]]
+set = "sets/local/linkstart.toml"

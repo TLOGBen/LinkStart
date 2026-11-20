@@ -1,0 +1,45 @@
+# LinkStart's own checks: each one is a mistake made, or a rule the owner set,
+# while driving this repo to its goal.
+
+# 2026-11-20: `gh pr merge 25 --match-head-commit 2ce703d4$(...)` built a
+# malformed SHA and the merge was refused. Pass the full SHA from git itself.
+[check.merge-full-head-sha]
+on = ["pre:bash"]
+severity = "error"
+forbid = '--match-head-commit[ =]+(["\x27]?[0-9a-f]{1,39}["\x27]?(\s|$)|\S*[0-9a-f]\$\()'
+message = "--match-head-commit 要給完整 40 碼 SHA：寫 --match-head-commit \"$(git rev-parse HEAD)\"，不要手打或拼接"
+
+# Owner's rule: an intermittent failure goes through /baransu:hunt or
+# /baransu:hypothesis; a wait is added only with its root cause named.
+[check.test-wait-needs-root-cause]
+on = ["around:edit"]
+severity = "warn"
+file = ["tests/**", "src/**/*.rs"]
+forbid = '\b(time\.sleep|thread::sleep|std::thread::sleep|tokio::time::sleep)\('
+message = "加了等待：時好時壞的問題先用 /baransu:hunt 或 /baransu:hypothesis 找出根因，等待旁邊寫明根因（例如 HUNT-YYYY-NNN）"
+
+# CLAUDE / ledger rule: raw evidence stays on this machine; the ledger records
+# only paths and hashes.
+[check.local-evidence-not-committed]
+on = ["pre:commit", "pre:push"]
+severity = "error"
+scope = "diff"
+folder = [".claude/hunt-report", ".claude/prove-it", ".claude/hypothesis", ".claude/think", ".codex"]
+forbid = '.'
+message = "本機證據（hunt-report、prove-it、hypothesis、think、.codex）不進 repo；帳本只記路徑和雜湊，把這些檔從 staging 移出"
+
+# Owner's authorization covers GitHub writes to this repository only.
+[check.github-writes-this-repo-only]
+on = ["pre:bash"]
+severity = "error"
+remind = true
+forbid = '\bgh\b[^\n|;&]*\s(-R|--repo)[ =]+(?!TLOGBen/LinkStart(\s|$|["\x27]))\S+'
+message = "GitHub 只能寫 TLOGBen/LinkStart；其他 repo 先問使用者"
+
+# Credentials never reach the conversation: tool output is kept in the transcript.
+[check.no-credential-to-output]
+on = ["pre:bash"]
+severity = "error"
+remind = true
+forbid = '\b(cat|type|Get-Content|gc|head|tail|less|more)\b[^\n|;&]*\.(token|cred)\b'
+message = "不要把憑證印進對話：讓腳本或 --credential-file 自己讀檔，輸出只留結果"

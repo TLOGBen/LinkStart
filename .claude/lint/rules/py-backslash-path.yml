@@ -1,0 +1,8 @@
+# Source: owner's rule python-no-backslash-paths.
+id: py-backslash-path
+language: python
+severity: error
+message: Python 字串裡的 Windows 反斜線路徑（\U 會 SyntaxError、\t \n 會默默變字元）；改用正斜線、r'' 或 pathlib.Path
+rule:
+  kind: string
+  regex: '^[bBfFuU]{0,2}(''|"){1,3}[A-Za-z]:\\[^\\]'
