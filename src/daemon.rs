@@ -26,12 +26,16 @@ pub(crate) fn start_daemon(a: &StartArgs) -> Result<Value> {
     if let Some(bytes) = crate::discovery::read(&a.state.state_dir)? {
         let record: DaemonRecord =
             serde_json::from_slice(&bytes).context("invalid daemon discovery record")?;
-        if let crate::runtime_identity::Inspection::Reusable(_) =
-            crate::runtime_identity::inspect(&record)?
-        {
-            return Ok(
-                json!({"state":"reused","pid":record.pid,"address":record.address,"version":VERSION,"protocolMajor":PROTOCOL}),
-            );
+        match crate::runtime_identity::inspect(&record)? {
+            crate::runtime_identity::Inspection::Reusable(_) => {
+                return Ok(
+                    json!({"state":"reused","pid":record.pid,"address":record.address,"version":VERSION,"protocolMajor":PROTOCOL}),
+                );
+            }
+            crate::runtime_identity::Inspection::Draining(_) => bail!(
+                "runtime_draining: the recorded Runtime is shutting down; wait for it to exit or run daemon stop"
+            ),
+            crate::runtime_identity::Inspection::Stale => {}
         }
     }
     fs::create_dir_all(&a.state.state_dir)?;
@@ -293,7 +297,8 @@ pub(crate) fn stop_daemon(state_dir: &FsPath) -> Result<bool> {
             crate::discovery::remove_if_matches(state_dir, &bytes)?;
             return Ok(true);
         }
-        crate::runtime_identity::Inspection::Reusable(address) => address,
+        crate::runtime_identity::Inspection::Reusable(address)
+        | crate::runtime_identity::Inspection::Draining(address) => address,
     };
     let address = peer.address;
     {

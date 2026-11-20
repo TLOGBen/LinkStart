@@ -50,6 +50,18 @@ pub fn router(
     dir: &Path,
     host: &str,
 ) -> anyhow::Result<(Router, tokio::sync::watch::Receiver<bool>)> {
+    router_inner(dir, host, None).map(|(r, s, _)| (r, s))
+}
+/// Like [`router`], plus the flag that turns true once shutdown is admitted, so
+/// other health endpoints of the same daemon never report a draining runtime ready.
+pub fn router_with_draining(
+    dir: &Path,
+    host: &str,
+) -> anyhow::Result<(
+    Router,
+    tokio::sync::watch::Receiver<bool>,
+    Arc<std::sync::atomic::AtomicBool>,
+)> {
     router_inner(dir, host, None)
 }
 /// Trusted in-process injection used by embedders; no HTTP plan installation.
@@ -58,13 +70,17 @@ pub fn router_with_bridge(
     host: &str,
     bridge: Arc<OwnedControlBridge>,
 ) -> anyhow::Result<(Router, tokio::sync::watch::Receiver<bool>)> {
-    router_inner(dir, host, Some(bridge))
+    router_inner(dir, host, Some(bridge)).map(|(r, s, _)| (r, s))
 }
 fn router_inner(
     dir: &Path,
     host: &str,
     bridge: Option<Arc<OwnedControlBridge>>,
-) -> anyhow::Result<(Router, tokio::sync::watch::Receiver<bool>)> {
+) -> anyhow::Result<(
+    Router,
+    tokio::sync::watch::Receiver<bool>,
+    Arc<std::sync::atomic::AtomicBool>,
+)> {
     let engine = Engine::open(dir)?;
     let owned = match bridge {
         Some(bridge) => bridge,
@@ -128,12 +144,13 @@ fn router_inner(
     std::fs::create_dir_all(&intent_dir)?;
     let (stop, receiver) = tokio::sync::watch::channel(false);
     let history = HistoryStore::open(dir, Retention::default()).map_err(anyhow::Error::msg)?;
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = HttpState {
         owned,
         engine,
         host: host.into(),
         gate: Arc::new(Mutex::new(NativeState::default())),
-        draining: Default::default(),
+        draining: draining.clone(),
         sessions: Default::default(),
         terminals,
         history,
@@ -156,6 +173,7 @@ fn router_inner(
             .layer(tower_http::limit::RequestBodyLimitLayer::new(256 * 1024))
             .with_state(state),
         receiver,
+        draining,
     ))
 }
 fn asset(kind: &'static str, body: &'static str) -> impl axum::response::IntoResponse {
@@ -224,13 +242,10 @@ async fn tools(
     {
         let actor = token.to_string();
         let bridge = state.owned.clone();
+        let read = read_only(&request.tool);
         return match tokio::task::spawn_blocking(move || bridge.execute(&actor, &request)).await {
             Ok(result) => reply(result),
-            Err(_) => failure(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal",
-                "owned dispatch failed",
-            ),
+            Err(_) => panicked(read, "owned dispatch failed"),
         };
     }
     if matches!(
@@ -254,13 +269,34 @@ async fn tools(
         };
     }
     let token = token.to_string();
+    let read = read_only(&request.tool);
     match tokio::task::spawn_blocking(move || gated(&state, &token, &request)).await {
         Ok(reply) => reply,
-        Err(_) => failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal",
-            "dispatch failed",
-        ),
+        Err(_) => panicked(read, "dispatch failed"),
+    }
+}
+fn read_only(tool: &str) -> bool {
+    tool.ends_with(".list")
+        || tool.ends_with(".read")
+        || tool.ends_with(".get")
+        || tool == "history.checkpoint"
+        || tool == "terminal.observe"
+        || tool == "endpoint.authorize"
+        || tool == "identity.current"
+}
+/// A panic part-way through a mutation may already have changed state or a
+/// native process; the caller must inspect, never assume it failed.
+fn panicked(read: bool, what: &str) -> Reply {
+    if read {
+        failure(StatusCode::INTERNAL_SERVER_ERROR, "Internal", what)
+    } else {
+        failure(
+            StatusCode::CONFLICT,
+            "UnknownEffect",
+            &format!(
+                "{what}: the operation may have taken effect; inspect before issuing a new request"
+            ),
+        )
     }
 }
 fn observe_unlocked(
@@ -314,13 +350,7 @@ fn gated(state: &HttpState, token: &str, request: &ToolRequest) -> Reply {
             "dispatch lock poisoned",
         );
     };
-    let read = request.tool.ends_with(".list")
-        || request.tool.ends_with(".read")
-        || request.tool.ends_with(".get")
-        || request.tool == "history.checkpoint"
-        || request.tool == "terminal.observe"
-        || request.tool == "endpoint.authorize"
-        || request.tool == "identity.current";
+    let read = read_only(&request.tool);
     if guard.draining
         && !read
         && !request.tool.starts_with("runtime.")

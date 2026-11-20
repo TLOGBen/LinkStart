@@ -12,6 +12,9 @@ use std::{
 
 pub(crate) enum Inspection {
     Reusable(VerifiedPeer),
+    /// The recorded incarnation, but shutdown was admitted: it may still be
+    /// stopped or read, never reused as a running Runtime.
+    Draining(VerifiedPeer),
     Stale,
 }
 
@@ -146,7 +149,8 @@ pub(crate) fn inspect(record: &DaemonRecord) -> Result<Inspection> {
     }
     let health: serde_json::Value =
         serde_json::from_slice(&body).context("runtime_identity_unknown: malformed health JSON")?;
-    if health["status"] != "ready"
+    let draining = health["status"] == "draining";
+    if (health["status"] != "ready" && !draining)
         || health["pid"].as_u64() != Some(record.pid as u64)
         || health["address"].as_str() != Some(record.address.as_str())
         || health["version"].as_str() != Some(record.version.as_str())
@@ -155,12 +159,19 @@ pub(crate) fn inspect(record: &DaemonRecord) -> Result<Inspection> {
     {
         bail!("runtime_identity_conflict: health does not match recorded Runtime incarnation")
     }
-    Ok(Inspection::Reusable(VerifiedPeer { address, stream }))
+    let peer = VerifiedPeer { address, stream };
+    Ok(if draining {
+        Inspection::Draining(peer)
+    } else {
+        Inspection::Reusable(peer)
+    })
 }
 
+/// The verified recorded incarnation, running or draining (a draining Runtime
+/// still answers reads and refuses new mutations itself).
 pub(crate) fn require(record: &DaemonRecord) -> Result<VerifiedPeer> {
     match inspect(record)? {
-        Inspection::Reusable(address) => Ok(address),
+        Inspection::Reusable(address) | Inspection::Draining(address) => Ok(address),
         Inspection::Stale => bail!("runtime_identity_unknown: recorded Runtime has exited"),
     }
 }

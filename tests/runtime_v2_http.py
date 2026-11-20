@@ -117,6 +117,13 @@ class RuntimeHttp(unittest.TestCase):
                 self.assertEqual((pathlib.Path(self.state_dir)/'daemon.json').read_bytes(),record)
                 self.assertEqual((pathlib.Path(self.state_dir)/'v2-owner.token').read_text(),token)
                 print(json.dumps({'evidence':'cli-pending','action':action,'recorded_pid':old,'recorded_pid_alive':True,'discovery_unchanged':True,'exit_code':result.returncode,'result':json.loads(result.stdout)}),flush=True)
+            # Shutdown was admitted, so every health endpoint says so and start never reuses it.
+            self.assertEqual(self.get('/v1/health')[1]['status'],'draining')
+            self.assertEqual(self.get('/v2/health')[1]['status'],'draining')
+            result=self.cli_control('start')
+            self.assertNotEqual(result.returncode,0,result.stdout)
+            self.assertIn('runtime_draining',result.stdout+result.stderr)
+            self.assertEqual((pathlib.Path(self.state_dir)/'daemon.json').read_bytes(),record)
         finally:
             # Restore only this test-owned checkpoint fault, even after RED.
             if checkpoint.is_dir():checkpoint.rmdir()
