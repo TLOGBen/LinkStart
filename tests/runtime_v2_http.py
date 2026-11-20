@@ -774,4 +774,59 @@ class RuntimeHttp(unittest.TestCase):
         status,value=restart(eid,old)
         self.assertEqual(status,200,value)
 
+    def test_a_current_human_can_approve_an_existing_terminal_again(self):
+        # K15: re-approve in place, so the terminal and its history are kept.
+        token=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()
+        _,space=self.post(dict(request_id='k15-space',tool='spaces.create',args={'name':'k15'}),token)
+        sid=space['space']['id']; admin=space['administrator']
+        def call(tool,args,credential):return self.post(dict(request_id=str(time.time_ns()),tool=tool,space_id=sid,args=args),credential)
+        _,invite=call('members.invite',{'roles':['session_maintainer','manager']},token)
+        _,agent=call('members.register',{'name':'agent'},invite['invite_token'])
+        status,created=call('terminal.create',dict(shell_once('echo K15'),name='k15'),admin['credential'])
+        self.assertEqual(status,200,created)
+        eid,old=created['endpoint']['id'],created['session']['id']
+        for _ in range(100):
+            _,listing=call('endpoints.list',{},token)
+            if next(e for e in listing['items'] if e['id']==eid)['status']=='exited':break
+            time.sleep(.05)
+        config=created['endpoint']['config']
+        call('members.revoke_credential',{'member_id':admin['id'],'expected_epoch':0},token)
+        def restart():return call('terminal.restart',{'endpoint_id':eid,'expected_session_id':old},agent['credential'])
+        status,value=restart()
+        self.assertEqual(status,403,value)
+        self.assertIn('endpoints.approve_launch',value['error']['message'])
+        def approve(credential,expected):
+            args={'endpoint_id':eid}
+            if expected is not None:args['expected_config']=expected
+            return call('endpoints.approve_launch',args,credential)
+        # An agent, even a manager, cannot approve a launch.
+        status,value=approve(agent['credential'],config)
+        self.assertEqual((status,value['error']['code']),(403,'Denied'),value)
+        self.assertEqual(restart()[0],403)
+        # A human approves the program they read, never an ID alone.
+        status,value=approve(token,None)
+        self.assertEqual((status,value['error']['code']),(400,'Invalid'),value)
+        status,value=approve(token,dict(config,args=config['args']+['--extra']))
+        self.assertEqual((status,value['error']['code']),(409,'Conflict'),value)
+        self.assertEqual(restart()[0],403)
+        # The same person with a new credential is trusted at a new generation:
+        # their old approval stays dead, a fresh one counts.
+        status,rotated=call('members.rotate_credential',{'member_id':admin['id'],'expected_epoch':1},token)
+        self.assertEqual(status,200,rotated)
+        self.assertEqual(restart()[0],403)
+        status,value=approve(rotated['credential'],config)
+        self.assertEqual(status,200,value)
+        self.assertEqual(value['config'],config)
+        self.assertEqual(value['launch_approval']['approved_by'],admin['id'])
+        self.assertEqual(value['launch_approval']['approver_generation'],1)
+        self.assertEqual(value['launch_approval']['previous_approval']['approver_generation'],0)
+        status,value=restart()
+        self.assertEqual(status,200,value)
+        self.assertEqual(value['previous_session_id'],old)
+        # A terminal that names no program has no launch to approve.
+        status,bare=call('endpoints.register',{'name':'bare','kind':'terminal','config':{}},token)
+        self.assertEqual(status,200,bare)
+        status,value=call('endpoints.approve_launch',{'endpoint_id':bare['id'],'expected_config':{}},token)
+        self.assertEqual((status,value['error']['code']),(400,'Invalid'),value)
+
 if __name__=='__main__':unittest.main()

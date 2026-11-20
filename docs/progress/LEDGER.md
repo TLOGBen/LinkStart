@@ -15,7 +15,7 @@
 
 ## 下一步
 
-A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已知問題」：K8（#24）、K10（#25）、K2（#27）已修正；其餘照 `已知問題` 一項項處理，K11、K13、K4、K5–K7 由並行 session 各自修。
+A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已知問題」：K8（#24）、K10（#25）、K2（#27）、K15（#28）已修正；其餘照 `已知問題` 一項項處理，K11、K13、K4、K5–K7 由並行 session 各自修。
 
 ## 驗收項目
 
@@ -46,7 +46,8 @@ A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已�
 | #24 | fix/k8-address-auth | 已合併 | K8：`--address` 先驗證 Runtime 身分再送憑證；HUNT-2026-005 測試修正 |
 | #25 | fix/k10-approval-recheck | 已合併 | K10：啟動核准不會比核准人的信任活得久（終端 restart 與 owned launch plan）；agent manager 不能改人類的角色與憑證 |
 | #26 | chore/lint | 已合併 `32a16bc` | 啟用 baransu lint，加上 LinkStart 自己的 5 條檢查（`.claude/lint/sets/local/linkstart.toml`） |
-| #27 | fix/k2-receipts | 已合併 | K2：終端請求的收據有上限，過期留墓碑，重送永遠不會再執行一次 |
+| #27 | fix/k2-receipts | 已合併 `270adb3` | K2：終端請求的收據有上限，過期留墓碑，重送永遠不會再執行一次 |
+| #28 | fix/k15-approve-launch | 已合併 | K15：`endpoints.approve_launch` 讓現任人類替既有終端補核准，history 不中斷 |
 
 ## 已知問題
 
@@ -58,9 +59,9 @@ A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已�
 - **K11**（#18 review）：`daemon stop` 遇到一直不退出的終端時只會回 pending，需要改用 `linkstart tool` 送 `runtime.force_shutdown`，錯誤訊息沒有提示這條路。（Engine 鎖中毒的部分已在 #22 修正。）
 - **K13**（A8 review）：環境變數過濾只套用在 PTY 終端；owned Codex host（`runtime_codex_host.rs`）和 `gh`（`runtime_source.rs`）仍繼承全部環境變數。
 - **K14**（A8 review）：用同一個 request_id 重送 `members.rotate_credential` 時，會再跑一次撤權擋門，誤結束 agent 用新憑證剛取得的租約。只會讓 agent 重新 acquire，不是安全問題。
-- **K15**（A8 review）：#17 之前建立的 terminal endpoint 沒有 `launch_approval`，連 owner 都無法 restart，也沒有補核准的工具；只能建新的 endpoint，history 就接不上舊的。
 - **K16**（A8 review）：撤權擋門和 shutdown 會對每個 session 的 mutex 做 `lock().unwrap()`，只要有一個 session 鎖被毒死就會連鎖 panic。session 鎖內的程式碼目前寫得很保守，觸發機率低。
 - **K12**（觀察）：`tests/owned_supervisor.rs` 的 `running()` 5 秒期限在人為高負載下（同時跑 4 份壓力測試）會 17/25 失敗，空閒時 25/25 通過。和 HUNT-2026-003 同一類；正常負載下若出現再開案。
+  - 2026-11-20，另外 4 個 session 同時編譯、跑測試時，Windows 上又有兩個同類的「N 秒內要完成」測試各失敗一次：`runtime_watch::tests::stop_preserves_inflight_accounting_until_bounded_source_job_finishes`（15 秒）和 `tests/runtime_control_bridge.rs` 的 `f5_get_first_completed_preserves_typed_observation`（`running()` 5 秒）。單獨重跑各 5/5 通過；兩者都不在 #28 改到的範圍。
 - **K17**（A8 第二輪 L1）：`gated` panic 之後清掉中毒標記，但沒有遞增 impact epoch。如果 owner 已經拿到 shutdown ticket，而 panic 的 `terminal.create` 已經 spawn 了程序，舊 ticket 仍然有效，確認時看到的影響清單會少這個程序；不過 cleanup 仍會把它結束。建議在 `clear_poison` 之後鎖一次 gate、做 `epoch += 1`。
 - **K18**（A8 第二輪 L2）：shutdown admission 的 closure 直接取 gate，在裡面 panic 時不會 `clear_poison`，gate 會一直中毒，v1／v2 health 的回報也不一致。程式碼很短，觸發機率極低。A5 寫的「dispatch 鎖中毒後會恢復」不涵蓋這條路徑。
 - **K19**（#24 審查，low）：`--address` 的 Runtime 證明有幾個殘餘限制。
@@ -76,7 +77,7 @@ A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已�
   - workspace write 核准（`approve_workspace`）記下的核准人不會再被重新檢查；要靠 install 時的安裝者檢查擋。
   - agent manager 仍可撤銷 launch plan，最多讓 space 內的 plan 全部失效（只會減少權限）。
   - owned launch 在 `approve()` 檢查安裝者之後、最後一次確認之前，有幾毫秒的空窗；撤銷本來就不會停掉已在跑的程序。
-- 已修：K3（#18）、K9（#18）；A8 審查的 M1、M2 和「關閉中無法撤權」（#22）；K8（#24：`--address` 送憑證前，Runtime 先用 HMAC 證明它知道這個憑證，證明綁定它自己的位址）；K10（#25：每位人類成員有一個信任世代，撤銷憑證或拿掉 `human_admin` 時加 1；終端核准與 launch plan 記下核准當下的世代，啟動時不相等就拒絕，所以重新發憑證或恢復角色都不會讓舊核准復活；agent manager 不能改人類的角色與憑證，也不能安裝 launch plan；沒有安裝者紀錄的舊 plan 必須重新安裝）；K2（#27：每個身分保留最新 2,000 筆、1 小時內的收據；收據只存請求的 SHA-256，不存內容；過期的變成墓碑，重送回 UnknownEffect，不會再執行一次；墓碑總數上限 20 萬，最舊的先忘。一個請求從開始到完成只佔一格，別的身分也擠不掉你的「結果未知」紀錄）。
+- 已修：K3（#18）、K9（#18）；A8 審查的 M1、M2 和「關閉中無法撤權」（#22）；K8（#24：`--address` 送憑證前，Runtime 先用 HMAC 證明它知道這個憑證，證明綁定它自己的位址）；K10（#25：每位人類成員有一個信任世代，撤銷憑證或拿掉 `human_admin` 時加 1；終端核准與 launch plan 記下核准當下的世代，啟動時不相等就拒絕，所以重新發憑證或恢復角色都不會讓舊核准復活；agent manager 不能改人類的角色與憑證，也不能安裝 launch plan；沒有安裝者紀錄的舊 plan 必須重新安裝）；K2（#27：每個身分保留最新 2,000 筆、1 小時內的收據；收據只存請求的 SHA-256，不存內容；過期的變成墓碑，重送回 UnknownEffect，不會再執行一次；墓碑總數上限 20 萬，最舊的先忘。一個請求從開始到完成只佔一格，別的身分也擠不掉你的「結果未知」紀錄）；K15（#28：新工具 `endpoints.approve_launch`，只有 owner 或人類管理員能用，替指定程式的既有終端補上核准並記下當下的信任世代；呼叫時必須帶上和終端完全相同的 `expected_config`，人類核准的是自己看過的程式，不是一個 ID；上一筆核准留在 `previous_approval`。舊終端，或核准人已失去信任的終端，都能就地重新核准，history 接得上）。
 - **K22**（#27 審查，low）：
   - `native-intents/` 底下 create、restart 的意圖標記檔從不清除，磁碟上會無限增長，屬於 K2 同類。
   - 墓碑池是所有身分共用的 20 萬筆；別的身分連續送超過 20 萬次請求，可以把你已過期的墓碑擠掉，那之後重送同一個 ID 會被當成新請求。

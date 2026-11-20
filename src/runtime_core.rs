@@ -486,6 +486,7 @@ fn validate_args(r: &ToolRequest) -> Result<(), ApiError> {
         "settings.set" => &["settings"],
         "endpoints.register" => &["name", "kind", "config"],
         "endpoints.grant" => &["endpoint_id", "member_id", "operations"],
+        "endpoints.approve_launch" => &["endpoint_id", "expected_config"],
         "endpoint.authorize" => &["endpoint_id", "operation"],
         _ => return Err(err("Unsupported", format!("unsupported tool {}", r.tool))),
     };
@@ -593,7 +594,8 @@ fn permission(owner: bool, member: Option<&Value>, r: &ToolRequest) -> Result<()
         | "members.rotate_credential"
         | "members.revoke_credential"
         | "settings.set"
-        | "endpoints.grant" => manage,
+        | "endpoints.grant"
+        | "endpoints.approve_launch" => manage,
         "topics.create" => manage || posting(roles),
         "task.act" => match r.args["action"].as_str().unwrap_or("") {
             "comment" => manage || posting(roles),
@@ -1678,6 +1680,40 @@ fn dispatch(
             s.endpoints.push(ep.clone());
             Ok(ep)
         }
+        // K15: a terminal made before approvals were recorded, or one whose
+        // approver has since lost trust, can be approved again by a current
+        // human without re-creating it, so its history continues.
+        "endpoints.approve_launch" => {
+            let human = owner
+                || member.is_some_and(|m| m["kind"] == "human" && has(&m["roles"], "human_admin"));
+            if !human {
+                return Err(err(
+                    "Denied",
+                    "approving a launch requires a human administrator",
+                ));
+            }
+            let eid = text(&r.args, "endpoint_id")?;
+            let generation = member.map_or(0, trust_generation);
+            let ep = s
+                .endpoints
+                .iter_mut()
+                .find(|e| e["id"] == eid && e["space_id"] == sid)
+                .ok_or_else(|| err("NotFound", "endpoint not found"))?;
+            if ep["kind"] != "terminal" || ep["config"]["command"].is_null() {
+                return Err(err("Invalid", "only a terminal that names a program has a launch to approve"));
+            }
+            // The human approves the program they read, not an ID: the request
+            // carries the exact config, so nobody gets a launch approved blind.
+            let expected = r.args.get("expected_config").filter(|c| c.is_object()).ok_or_else(|| {
+                err("Invalid", "expected_config (the endpoint's command, args and cwd) required")
+            })?;
+            if *expected != ep["config"] {
+                return Err(err("Conflict", "expected_config differs from what this terminal launches; read it again with endpoints.list"));
+            }
+            let previous = ep["launch_approval"].clone();
+            ep["launch_approval"] = json!({"approved_by":author,"approved_at":now(),"approver_generation":generation,"previous_approval":previous});
+            Ok(ep.clone())
+        }
         "endpoints.grant" => {
             let eid = text(&r.args, "endpoint_id")?;
             let mid = text(&r.args, "member_id")?;
@@ -2420,6 +2456,101 @@ mod tests {
             "member projection leaked hidden endpoint name"
         );
         assert!(encoded.contains(visible["id"].as_str().unwrap()));
+    }
+    #[test]
+    fn legacy_terminal_without_launch_approval_can_be_approved_in_place() {
+        // K15: a terminal stored before launch approvals existed.
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::open(dir.path()).unwrap();
+        let owner = std::fs::read_to_string(owner_token_path(dir.path())).unwrap();
+        let sp = e
+            .execute(
+                &owner,
+                &req("s", "spaces.create", None, json!({"name":"k15"})),
+            )
+            .unwrap();
+        let sid = sp["space"]["id"].as_str().unwrap();
+        let admin = sp["administrator"]["credential"].as_str().unwrap();
+        let ep = e
+            .execute(
+                admin,
+                &req(
+                    "ep",
+                    "endpoints.register",
+                    Some(sid),
+                    json!({"name":"old shell","kind":"terminal","config":{"command":"cmd.exe","args":[],"cwd":null}}),
+                ),
+            )
+            .unwrap();
+        let eid = ep["id"].as_str().unwrap();
+        drop(e);
+        let db = Connection::open(dir.path().join("v2.sqlite3")).unwrap();
+        let encoded: String = db
+            .query_row("SELECT json FROM core_state WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let mut legacy: Value = serde_json::from_str(&encoded).unwrap();
+        legacy["endpoints"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("launch_approval");
+        db.execute(
+            "UPDATE core_state SET json=?1 WHERE id=1",
+            [legacy.to_string()],
+        )
+        .unwrap();
+        drop(db);
+        let e = Engine::open(dir.path()).unwrap();
+        let invite = e
+            .execute(
+                admin,
+                &req(
+                    "i",
+                    "members.invite",
+                    Some(sid),
+                    json!({"roles":["manager"]}),
+                ),
+            )
+            .unwrap();
+        let agent = e
+            .execute(
+                invite["invite_token"].as_str().unwrap(),
+                &req("r", "members.register", Some(sid), json!({"name":"agent"})),
+            )
+            .unwrap();
+        let agent = agent["credential"].as_str().unwrap();
+        let denied = e
+            .execute(
+                agent,
+                &req(
+                    "a1",
+                    "endpoints.approve_launch",
+                    Some(sid),
+                    json!({"endpoint_id":eid,"expected_config":ep["config"]}),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(denied.code, "Denied");
+        let approved = e
+            .execute(
+                admin,
+                &req(
+                    "a2",
+                    "endpoints.approve_launch",
+                    Some(sid),
+                    json!({"endpoint_id":eid,"expected_config":ep["config"]}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(approved["id"], eid);
+        assert_eq!(
+            approved["config"], ep["config"],
+            "approval never changes the program"
+        );
+        assert!(approved["launch_approval"]["approved_by"].is_string());
+        assert_eq!(approved["launch_approval"]["approver_generation"], 0);
+        assert!(approved["launch_approval"]["previous_approval"].is_null());
     }
     #[test]
     fn legacy_github_without_server_approval_cannot_dispatch_even_as_manager() {

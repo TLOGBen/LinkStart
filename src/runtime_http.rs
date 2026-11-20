@@ -1031,7 +1031,7 @@ fn dispatch(
         else {
             return Err(error(
                 "Denied",
-                "terminal launch lacks a human administrator's approval",
+                "terminal launch lacks a human administrator's approval; a human administrator can approve it with endpoints.approve_launch",
             ));
         };
         let space = authorization["endpoint"]["space_id"]
@@ -1051,7 +1051,7 @@ fn dispatch(
         {
             return Err(error(
                 "Denied",
-                "the administrator who approved this launch is no longer trusted; a current human administrator must create it again",
+                "the administrator who approved this launch is no longer trusted; a current human administrator can approve it again with endpoints.approve_launch",
             ));
         }
         let command = field(config, "command")?.to_string();
