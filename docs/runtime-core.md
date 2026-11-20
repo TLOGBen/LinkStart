@@ -38,6 +38,7 @@ All space commands require a current membership (or explicit local owner). Globa
 | `settings.get`, `settings.set` | get `{}`; set `{settings}` -> saved runtime defaults |
 | `endpoints.register` | `{name,kind,config?}` -> metadata only; never spawns a process |
 | `endpoints.list`, `endpoints.grant` | visible list; grant `{endpoint_id,member_id,operations}` (empty removes explicit grants) |
+| `endpoints.approve_launch` | `{endpoint_id,expected_config}` -> owner or human administrator only; approves an existing terminal's program again (for a terminal made before approvals were recorded, or whose approver lost trust). `expected_config` must equal the endpoint's `config` exactly, so the human approves the program they read; the earlier approval is kept as `previous_approval`. |
 | `endpoint.authorize` | `{endpoint_id,operation}` -> `{identity_id,owner,endpoint,operation}`; no grant changes |
 
 Roles: `human_admin`, `session_maintainer`, `manager`, `implementer`, `reviewer`, `consultant`, `tester`, `observer`, `task_decomposer`. Management roles have full space authority; session maintainers register endpoints but cannot approve GitHub repository access. Other endpoint operations require independent explicit grants: `observe`, `send`, `control`, `manage`. Member grant projections retain both role and explicit sources, filtered by endpoints visible to the reader.
