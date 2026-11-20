@@ -15,7 +15,7 @@
 
 ## 下一步
 
-1. A8 第一輪審查判定 FAIL（M1、M2 兩項 med），修正在 #22。合併後在最終 SHA 上重新審查，並再跑一次 A7。
+A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已知問題」：K8（`--address` 身分驗證）優先，其次 K10、K2。
 
 ## 驗收項目
 
@@ -26,9 +26,9 @@
 | A3 | 撤權與角色檢查 | 證實（兩個平台） | #16 `2dae7e3`：收回 grant、降級角色、撤銷憑證、rotate 之後，被撤權者的下一次寫入被拒（403／401），手上的控制租約在撤權的同一刻結束；憑證「到期」沒有對應的撤權呼叫，租約是在下一個人 acquire 時才結束，對要接手的人來說結果相同，可以馬上取得控制；observe 每次讀取前後各授權一次 |
 | A4 | 人類啟動設定（核准執行檔、參數、工作區） | 證實（兩個平台；真 daemon 在 Windows） | #17 `14039e7`：只有 owner／人類管理員能指定執行檔，agent 只能 `terminal.restart` 核准過的設定；PTY 終端的子程序不繼承宿主 session 變數（實測 `CLAUDE*` 0 個），使用者自己的設定和無頭登入用的 `CLAUDE_CODE_OAUTH_TOKEN` 保留（後者在 #22 修正）。owned Codex host 和 `gh` 不在過濾範圍內（K13）；管理介面有 Esc／方向鍵／Tab／Enter／Ctrl-C 單鍵 |
 | A5 | 重啟恢復；結果未知的操作不報成功 | 證實（Windows 當機實測；兩個平台測試） | #18：`taskkill /F` 之後，子程序樹一起結束；任務仍是 `in_progress`、assignee 不變；history 讀得到當機前的回答；同一個 request_id 重送 claim，結果相同；重送 create 回 `UnknownEffect`；agent 重啟核准的終端後可以回答。會改變狀態的操作 panic 時回 `UnknownEffect`；dispatch 鎖（#18）和 Engine 鎖（#22）中毒後都會恢復，Runtime 仍然可以使用、可以停止。這兩條 panic 路徑中，只有 Engine 這條有直接的測試（`panic_mid_transaction_leaves_engine_usable_and_owner_recognized`），dispatch 這條只經過程式碼審查。關閉中的 Runtime 回 `draining`，`start` 不會重用它。儲存初始化另有假說證明（`.claude/hypothesis/storage-init/`） |
-| A6 | GitHub 持續處理循環 | 證實（Windows，TLOGBen/LinkStart） | A3＋A4 整合 build：watch 每 30 秒同步一次，新 issue #21 在 15.2 秒內變成任務 → 認領 → 送審 → 核准 → 測試通過 `done` → `sources.writeback` 留言回 issue，用 `gh` 讀回確認 → issue 關閉。#19、#20 是腳本錯誤時開的測試 issue，都已關閉 |
-| A7 | 真實閒置至少 65 分鐘後，同一 Session 仍可回應 | 進行中 | A4 第一版的 build（`96c59c9`）：60 秒冒煙測試通過；正式的 65 分鐘還在跑 |
-| A8 | 同一個 SHA 上的最終整合審查 | 未開始 | |
+| A6 | GitHub 持續處理循環 | 證實（Windows，TLOGBen/LinkStart） | A3＋A4 整合 build：watch 每 30 秒同步一次，新 issue #21 在 15.2 秒內變成任務 → 認領 → 送審 → 核准 → 測試通過 `done` → `sources.writeback` 留言回 issue，用 `gh` 讀回確認。Runtime 只會留言，issue 是驗收腳本用 `gh` 關的。#19、#20 是腳本錯誤時開的測試 issue，都已關閉 |
+| A7 | 真實閒置至少 65 分鐘後，同一 Session 仍可回應 | 證實 `a1e5588` | Windows，Claude Code（haiku）在 Runtime 擁有的 PTY 中，閒置 3,930 秒（65.5 分鐘）後同一 Session 仍為 `live` 並回答問題，daemon 未重啟。三次正式執行：A4 第一版 `96c59c9`（閒置 3,930 秒，之後 6.1 秒回答）、`482a930`（3,930 秒，4.0 秒）、最終 `a1e5588`（3,930 秒，閒置前 6.1 秒、閒置後 4.1 秒回答）。一次執行因電腦意外關機中斷，作廢重跑 |
+| A8 | 同一個 SHA 上的最終整合審查 | 證實 `a1e5588` | 獨立 reviewer 審 `5601c38..a1e5588`（#16、#17、#18、#22）。第一輪（`482a930`）判 FAIL：M1 Engine 鎖中毒後 Runtime 停不掉，M2 刪掉使用者的 OAuth token，兩項都在 #22 修正。第二輪（`a1e5588`）判 PASS：沒有 high／med，剩下的 low 記為 K17、K18。同一個 SHA：Windows 與 Linux 全套測試（HTTP 各 25/25）、CI 三平台綠 |
 
 ## PR 狀態
 
@@ -41,7 +41,7 @@
 | #16 | feature/a3-revocation | 已合併 `2dae7e3` | RED → GREEN；獨立 review 找到 1 項 med（憑證到期沒有結束租約），已修（`93de904`）；兩個平台全套測試、CI 三平台綠 |
 | #17 | feature/a4-launch-setup | 已合併 `14039e7` | RED → GREEN；review 找到 1 項 med（前綴規則誤刪使用者設定），已改成明確清單；合進 main 之後兩個平台重跑；CI 三平台綠 |
 | #18 | feature/a5-restart-recovery | 已合併 `482a930` | K3／K9；review 找到 1 項 med（panic 把鎖毒死，連 stop 都停不掉），已修（`16b03a1`）；HUNT-2026-004 測試修正；CI 三平台綠 |
-| #22 | feature/a8-fixes | 待合併 | A8 審查的 M1（Engine 鎖中毒後無法停止）與 M2（刪掉使用者的 OAuth token）；關閉中仍可撤銷憑證 |
+| #22 | feature/a8-fixes | 已合併 `a1e5588` | A8 審查的 M1（Engine 鎖中毒後無法停止）與 M2（刪掉使用者的 OAuth token）；關閉中仍可撤銷憑證 |
 
 ## 已知問題
 
@@ -59,6 +59,8 @@
 - **K15**（A8 review）：#17 之前建立的 terminal endpoint 沒有 `launch_approval`，連 owner 都無法 restart，也沒有補核准的工具；只能建新的 endpoint，history 就接不上舊的。
 - **K16**（A8 review）：撤權擋門和 shutdown 會對每個 session 的 mutex 做 `lock().unwrap()`，只要有一個 session 鎖被毒死就會連鎖 panic。session 鎖內的程式碼目前寫得很保守，觸發機率低。
 - **K12**（觀察）：`tests/owned_supervisor.rs` 的 `running()` 5 秒期限在人為高負載下（同時跑 4 份壓力測試）會 17/25 失敗，空閒時 25/25 通過。和 HUNT-2026-003 同一類；正常負載下若出現再開案。
+- **K17**（A8 第二輪 L1）：`gated` panic 之後清掉中毒標記，但沒有遞增 impact epoch。如果 owner 已經拿到 shutdown ticket，而 panic 的 `terminal.create` 已經 spawn 了程序，舊 ticket 仍然有效，確認時看到的影響清單會少這個程序；不過 cleanup 仍會把它結束。建議在 `clear_poison` 之後鎖一次 gate、做 `epoch += 1`。
+- **K18**（A8 第二輪 L2）：shutdown admission 的 closure 直接取 gate，在裡面 panic 時不會 `clear_poison`，gate 會一直中毒，v1／v2 health 的回報也不一致。程式碼很短，觸發機率極低。A5 寫的「dispatch 鎖中毒後會恢復」不涵蓋這條路徑。
 - 已修：K3（#18）、K9（#18）；A8 審查的 M1、M2 和「關閉中無法撤權」（#22）。
 
 ## 紀錄
@@ -67,6 +69,7 @@
 - 2026-11-19：#12 新增的修正：Linux 對整個程序群組強制結束；Windows ACL 改用原生 API（啟動從 6–9 秒降到約 0.4 秒）；SQLite 暫存檔在初始化時的競態；Ctrl-C 忽略旗標被子程序繼承；lifecycle 測試因 port 重用而互相干擾；macOS CI 映像被淘汰。
 - 2026-11-19：A2 前導片（兩個真實 CLI 交接）走通；新增 `--address`；修了 K1 的觀看與健康檢查部分。合併 #12、#13、#14、#15。
 - 2026-11-19：`/baransu:hypothesis` storage-init；`/baransu:hunt` HUNT-2026-003（`owned_codex_host` fixture 的 500ms 逾時）。
-- 2026-11-19：本機留下 3 個 `linkstart.exe`（PID 48212、39048、36576），自動模式不允許直接結束，仍在執行。
+- 2026-11-19：本機留下 3 個 `linkstart.exe`（PID 48212、39048、36576），自動模式不允許直接結束；2026-11-20 電腦重開機後已不存在。
 - 2026-11-20：Claude 上一輪在合併完 #15 後停下來問使用者要不要繼續，使用者不在，空轉了 14 小時。之後改為一路做到目標完成。
 - 2026-11-20：A3（#16）、A4（#17）合併；A5（#18）完成審查修正；A6 在 TLOGBen/LinkStart 上走完一次完整迴圈；A7 的 65 分鐘閒置開始跑。`/baransu:hunt` HUNT-2026-004：`runtime_agent` 的鎖在 drop 後仍被別的執行緒 fork 出的子程序短暫握住（約 1ms），已修正測試。
+- 2026-11-20：A8 第二輪審查在 `a1e5588` 通過（#22 合併）。電腦意外關機中斷了 `a1e5588` 的 A7，重跑後閒置 3,930 秒、同一 Session 4.1 秒回答。A1–A8 全部達成。
