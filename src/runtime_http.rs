@@ -128,6 +128,29 @@ impl Receipts {
         }
     }
 }
+/// Takes the dispatch gate, recovering it if a call panicked while holding it
+/// (K17, K18). The state is conservative: a terminal call marks its receipt in
+/// flight before any native effect, and terminal create/restart persist an
+/// intent marker first, so a retry answers UnknownEffect either way. But the
+/// effect, such as a process it spawned, may have changed the shutdown impact,
+/// so the impact epoch advances and an earlier shutdown ticket goes stale.
+/// A shutdown ticket admits only the impact it was prepared for, for a minute.
+fn ticket_current(n: &NativeState, ticket: &str) -> bool {
+    n.ticket.as_ref().is_some_and(|(t, epoch, _, issued)| {
+        t == ticket && *epoch == n.epoch && issued.elapsed() <= Duration::from_secs(60)
+    })
+}
+fn lock_gate(gate: &Mutex<NativeState>) -> std::sync::MutexGuard<'_, NativeState> {
+    match gate.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            gate.clear_poison();
+            let mut guard = poisoned.into_inner();
+            guard.epoch += 1;
+            guard
+        }
+    }
+}
 #[derive(Default)]
 struct NativeState {
     receipts: Receipts,
@@ -401,8 +424,9 @@ async fn tools(
             // The interrupted call marked itself uncertain before any native effect
             // and records receipts only after success, so the gate's state stays
             // conservative: a same-ID retry answers UnknownEffect. Keep the runtime
-            // usable (and stoppable) instead of failing every later call.
-            gate.clear_poison();
+            // usable (and stoppable) instead of failing every later call; recover
+            // now so health stops reporting draining and the epoch advances.
+            let _ = tokio::task::spawn_blocking(move || drop(lock_gate(&gate))).await;
             panicked(read, "dispatch failed")
         }
     }
@@ -470,18 +494,15 @@ fn observe_unlocked(
 fn owned_sessions(
     s: &HttpState,
 ) -> Result<std::sync::MutexGuard<'_, HashMap<String, String>>, crate::runtime_core::ApiError> {
-    s.sessions
+    // Only inserts and lookups happen under this lock, so a panic leaves it
+    // consistent; recovering keeps terminals and the revocation fence working
+    // instead of failing every later call (K16).
+    Ok(s.sessions
         .lock()
-        .map_err(|_| error("Internal", "session map poisoned"))
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 fn gated(state: &HttpState, token: &str, request: &ToolRequest) -> Reply {
-    let Ok(mut guard) = state.gate.lock() else {
-        return failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal",
-            "dispatch lock poisoned",
-        );
-    };
+    let mut guard = lock_gate(&state.gate);
     let read = read_only(&request.tool);
     if guard.draining
         && !read
@@ -575,15 +596,15 @@ async fn shutdown_tools(state: HttpState, actor: String, request: ToolRequest) -
             "runtime owner credential required",
         );
     }
-    let admission = (|| {
-        let ticket = field(&request.args, "ticket")?;
-        let mut guard = state
-            .gate
-            .lock()
-            .map_err(|_| error("Internal", "dispatch lock poisoned"))?;
-        if guard.ticket.as_ref().is_none_or(|(t, epoch, _, issued)| {
-            t != ticket || *epoch != guard.epoch || issued.elapsed() > Duration::from_secs(60)
-        }) {
+    // The gate is a blocking lock: take it on a blocking thread, never on the
+    // async runtime, which would stall every other request while it waits.
+    let admitting = state.clone();
+    let args = request.args.clone();
+    let admission = tokio::task::spawn_blocking(move || {
+        let state = admitting;
+        let ticket = field(&args, "ticket")?;
+        let mut guard = lock_gate(&state.gate);
+        if !ticket_current(&guard, ticket) {
             return Err(error(
                 "StaleImpact",
                 "impact changed or ticket expired; prepare shutdown again",
@@ -597,7 +618,16 @@ async fn shutdown_tools(state: HttpState, actor: String, request: ToolRequest) -
             .draining
             .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
-    })();
+    })
+    .await
+    .unwrap_or_else(|_| {
+        // A panic here may already have begun the shutdown; the next caller
+        // recovers the gate (lock_gate) with a new epoch, so prepare again.
+        Err(error(
+            "UnknownEffect",
+            "shutdown admission failed; inspect runtime health, then prepare shutdown again",
+        ))
+    });
     if let Err(e) = admission {
         return reply(Err(e));
     }
@@ -1242,5 +1272,35 @@ mod tests {
         assert_eq!(request_digest(&big).len(), 64);
         assert_eq!(request_digest(&big), request_digest(&big));
         assert_ne!(request_digest(&big), request_digest("y"));
+    }
+    #[test]
+    fn poisoned_gate_recovers_and_stales_earlier_shutdown_tickets() {
+        // K17, K18: a call that panicked while holding the gate.
+        let gate = Arc::new(Mutex::new(NativeState::default()));
+        {
+            let mut n = gate.lock().unwrap();
+            n.epoch = 5;
+            n.ticket = Some(("t".into(), 5, 0, Instant::now()));
+            assert!(ticket_current(&n, "t"));
+        }
+        let holder = gate.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = holder.lock().unwrap();
+            panic!("panic while holding the gate");
+        })
+        .join();
+        assert!(gate.is_poisoned());
+        {
+            let n = lock_gate(&gate);
+            assert_eq!(n.epoch, 6);
+            // The panicked call may have changed the impact: the earlier ticket
+            // no longer admits a shutdown.
+            assert!(!ticket_current(&n, "t"));
+        }
+        assert!(
+            !gate.is_poisoned(),
+            "recovered once, for every later caller"
+        );
+        assert_eq!(lock_gate(&gate).epoch, 6);
     }
 }
