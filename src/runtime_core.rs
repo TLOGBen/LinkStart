@@ -49,6 +49,37 @@ fn now() -> u64 {
 fn hash(s: &str) -> String {
     format!("{:x}", Sha256::digest(s.as_bytes()))
 }
+// A caller that reaches the Runtime by a bare address cannot read discovery, so
+// before sending its credential it asks the Runtime to prove it already knows
+// it. The proof is keyed by the stored credential hash, so the Runtime never
+// needs the plaintext, and bound to the Runtime's own address, so a process on
+// another port cannot relay the real Runtime's answer.
+/// Names a credential without revealing it, so the Runtime can pick the key.
+pub fn credential_key_id(credential: &str) -> String {
+    key_id(&hash(credential))
+}
+fn key_id(credential_hash: &str) -> String {
+    hash(&format!("linkstart-key-id\0{credential_hash}"))[..32].to_string()
+}
+/// What a Runtime at `host` that knows `credential` answers for `nonce`.
+pub fn runtime_proof(credential: &str, host: &str, nonce: &str) -> String {
+    proof(&hash(credential), host, nonce)
+}
+fn proof(credential_hash: &str, host: &str, nonce: &str) -> String {
+    let key = credential_hash.as_bytes();
+    let message = format!("linkstart-runtime-proof\0{host}\0{nonce}");
+    let mut pad = [0u8; 64];
+    pad[..key.len()].copy_from_slice(key);
+    let inner = Sha256::new()
+        .chain_update(pad.map(|b| b ^ 0x36))
+        .chain_update(message.as_bytes())
+        .finalize();
+    let outer = Sha256::new()
+        .chain_update(pad.map(|b| b ^ 0x5c))
+        .chain_update(inner)
+        .finalize();
+    format!("{outer:x}")
+}
 #[derive(Default, Serialize, Deserialize)]
 struct State {
     spaces: Vec<Value>,
@@ -745,6 +776,41 @@ impl Engine {
                 || endpoint["grants"][identity]
                     .as_array()
                     .is_some_and(|ops| ops.iter().any(|op| op == operation))))
+    }
+    /// The proof for the usable credential named by `key_id`, or None when this
+    /// Runtime knows no such credential (owner, active member, unused invite).
+    pub fn prove_credential(
+        &self,
+        key_id_hex: &str,
+        host: &str,
+        nonce: &str,
+    ) -> Result<Option<String>, ApiError> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let encoded: String = inner
+            .db
+            .query_row("SELECT json FROM core_state WHERE id=1", [], |r| r.get(0))
+            .map_err(internal)?;
+        let s: State = serde_json::from_str(&encoded).map_err(internal)?;
+        let time = (self.clock)();
+        let mut known = std::iter::once(hash(&inner.secret))
+            .chain(
+                s.members
+                    .iter()
+                    .filter(|m| credential_active(m, time))
+                    .filter_map(|m| m["credential_hash"].as_str().map(str::to_string)),
+            )
+            .chain(
+                s.invites
+                    .iter()
+                    .filter(|i| i["used"] != true)
+                    .filter_map(|i| i["token_hash"].as_str().map(str::to_string)),
+            );
+        Ok(known
+            .find(|h| key_id(h) == key_id_hex)
+            .map(|h| proof(&h, host, nonce)))
     }
     pub(crate) fn private_storage_directory(&self) -> anyhow::Result<PathBuf> {
         let inner = self
@@ -1948,6 +2014,15 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn runtime_proof_is_standard_hmac_sha256() {
+        // Expected values computed with Python's hmac and hashlib.
+        assert_eq!(
+            runtime_proof("abc", "127.0.0.1:1", &"00".repeat(32)),
+            "ca0c9803a5bab4e05af040d9cbb84d5e9c8a7ffe55c8f15403aa232b71d7f317"
+        );
+        assert_eq!(credential_key_id("abc"), "fbab5fe759a0edda3d9cfbf8fb7c3d68");
+    }
     #[test]
     fn panic_mid_transaction_leaves_engine_usable_and_owner_recognized() {
         let dir = tempfile::tempdir().unwrap();

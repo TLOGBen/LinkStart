@@ -247,10 +247,67 @@ class RuntimeHttp(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn('items',json.loads(result.stdout))
         self.assertFalse(pathlib.Path(missing).exists())
+        # Invite tokens and member credentials prove the Runtime the same way.
+        _,space=self.post(dict(request_id='direct-space',tool='spaces.create',args={'name':'direct'}),owner)
+        sid=space['space']['id']
+        _,invite=self.post(dict(request_id='direct-invite',tool='members.invite',space_id=sid,args={'roles':['observer']}),owner)
+        credential.write_text(invite['invite_token'])
+        registered=subprocess.run([str(BIN),'tool','--address','127.0.0.1:%d'%self.port,'--credential-file',str(credential)],input=json.dumps({'request_id':'direct-reg','tool':'members.register','space_id':sid,'args':{'name':'sandboxed'}}),text=True,capture_output=True,timeout=10)
+        self.assertEqual(registered.returncode,0,registered.stderr)
+        credential.write_text(json.loads(registered.stdout)['credential'])
+        current=subprocess.run([str(BIN),'tool','--address','127.0.0.1:%d'%self.port,'--credential-file',str(credential)],input=json.dumps({'request_id':'direct-me','tool':'identity.current','space_id':sid,'args':{}}),text=True,capture_output=True,timeout=10)
+        self.assertEqual(current.returncode,0,current.stderr)
         refused=subprocess.run([str(BIN),'tool','--address','192.0.2.1:%d'%self.port,'--credential-file',str(credential)],input=request,text=True,capture_output=True,timeout=10)
         self.assertNotEqual(refused.returncode,0)
         self.assertIn('loopback',refused.stderr)
         self.assertNotIn(owner,refused.stdout+refused.stderr)
+
+    def test_direct_address_never_sends_credential_to_unproven_runtime(self):
+        # K8: another local process holding the address, or relaying to the real
+        # Runtime, must not receive the credential.
+        owner=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()
+        credential=pathlib.Path(self.tmp.name)/'impostor.cred'
+        credential.write_text(owner)
+        request=json.dumps({'request_id':'impostor-list','tool':'spaces.list','args':{}})
+        real_host=b'127.0.0.1:%d'%self.port
+        def serve(mode):
+            # fake: answers by itself; relay: forwards bytes unchanged; rewrite:
+            # forwards with Host rewritten, so the real Runtime does answer.
+            listener=socket.socket();listener.bind(('127.0.0.1',0));listener.listen(4);listener.settimeout(10)
+            own_host=b'127.0.0.1:%d'%listener.getsockname()[1]
+            sent,answered=[],[]
+            def run():
+                try:
+                    while True:
+                        conn,_=listener.accept()
+                        upstream=socket.create_connection(('127.0.0.1',self.port)) if mode!='fake' else None
+                        def pump(src,dst,log,outbound):
+                            try:
+                                while (chunk:=src.recv(65536)):
+                                    log.append(chunk)
+                                    if outbound and mode=='rewrite':chunk=chunk.replace(b'Host: '+own_host,b'Host: '+real_host)
+                                    if dst:dst.sendall(chunk)
+                                    else:src.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}')
+                            except OSError:pass
+                        if upstream:
+                            threading.Thread(target=pump,args=(upstream,conn,answered,False),daemon=True).start()
+                        threading.Thread(target=pump,args=(conn,upstream,sent,True),daemon=True).start()
+                except OSError:pass
+            threading.Thread(target=run,daemon=True).start()
+            return listener,sent,answered
+        for mode in ('fake','relay','rewrite'):
+            listener,sent,answered=serve(mode)
+            try:
+                result=subprocess.run([str(BIN),'tool','--address','127.0.0.1:%d'%listener.getsockname()[1],'--credential-file',str(credential)],input=request,text=True,capture_output=True,timeout=15)
+            finally:listener.close()
+            self.assertNotEqual(result.returncode,0,(mode,result.stdout))
+            self.assertIn('runtime_identity_unverified',result.stderr,mode)
+            self.assertTrue(sent,mode)
+            self.assertNotIn(owner.encode(),b''.join(sent),mode)
+            self.assertNotIn(owner,result.stdout+result.stderr)
+            if mode=='rewrite':
+                # The real Runtime proved itself, but for its own address, not this one.
+                self.assertIn(b'"proof"',b''.join(answered))
 
     def test_console_serves_real_module_without_secrets(self):
         with urllib.request.urlopen(self.base+'/console') as response:

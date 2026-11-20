@@ -166,6 +166,7 @@ fn router_inner(
         Router::new()
             .route("/v2/health", get(health))
             .route("/v2/tools", post(tools))
+            .route("/v2/prove", post(prove))
             .route("/console", get(console))
             .route("/console/", get(console))
             .route("/console/live.js", get(script))
@@ -201,6 +202,39 @@ async fn health(State(s): State<HttpState>) -> Json<Value> {
     Json(
         json!({"status":if s.draining.load(std::sync::atomic::Ordering::SeqCst)||s.gate.is_poisoned(){"draining"}else{"ready"},"protocol":"v2"}),
     )
+}
+/// K8: proves to a bare-address caller, before it sends its credential, that
+/// this Runtime already knows that credential. Needs no credential itself.
+async fn prove(State(s): State<HttpState>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
+    if headers.get("host").and_then(|h| h.to_str().ok()) != Some(s.host.as_str()) {
+        return failure(StatusCode::FORBIDDEN, "Denied", "unexpected Host");
+    }
+    if let Some(origin) = headers.get("origin") {
+        if origin.to_str().ok() != Some(format!("http://{}", s.host).as_str()) {
+            return failure(StatusCode::FORBIDDEN, "Denied", "unexpected Origin");
+        }
+    }
+    let hex = |v: &Value, len: usize| {
+        v.as_str()
+            .filter(|t| t.len() == len && t.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_string)
+    };
+    let (Some(key_id), Some(nonce)) = (hex(&body["key_id"], 32), hex(&body["nonce"], 64)) else {
+        return failure(
+            StatusCode::BAD_REQUEST,
+            "Invalid",
+            "key_id and nonce required",
+        );
+    };
+    let engine = s.engine.clone();
+    let host = s.host.clone();
+    match tokio::task::spawn_blocking(move || engine.prove_credential(&key_id, &host, &nonce)).await
+    {
+        Ok(Ok(Some(proof))) => (StatusCode::OK, Json(json!({"proof": proof}))),
+        Ok(Ok(None)) => failure(StatusCode::NOT_FOUND, "NotFound", "unknown credential"),
+        Ok(Err(e)) => reply(Err(e)),
+        Err(_) => panicked(true, "prove failed"),
+    }
 }
 type Reply = (StatusCode, Json<Value>);
 fn failure(status: StatusCode, code: &str, message: &str) -> Reply {
