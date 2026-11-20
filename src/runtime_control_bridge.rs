@@ -206,7 +206,7 @@ impl OwnedControlBridge {
         Ok(db)
     }
     fn reserve(&self) -> Result<Reservation<'_>, ApiError> {
-        let mut a = self.admission.lock().map_err(storage)?;
+        let mut a = self.admission.lock().unwrap_or_else(|e| e.into_inner());
         if a.draining {
             return Err(error("Draining", "runtime is draining"));
         }
@@ -226,7 +226,7 @@ impl OwnedControlBridge {
     /// Linearization point: closes admission before requesting worker cleanup.
     pub fn begin_shutdown(&self, expected_epoch: u64) -> Result<OwnedInventory, ApiError> {
         {
-            let mut a = self.admission.lock().map_err(storage)?;
+            let mut a = self.admission.lock().unwrap_or_else(|e| e.into_inner());
             if a.epoch != expected_epoch {
                 return Err(error(
                     "StaleImpact",

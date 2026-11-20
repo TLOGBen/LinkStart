@@ -62,8 +62,15 @@ struct Inner {
 }
 impl Drop for Inner {
     fn drop(&mut self) {
-        for session in self.sessions.get_mut().unwrap().values() {
-            let mut s = session.lock().unwrap();
+        for session in self
+            .sessions
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+        {
+            let mut s = session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             #[cfg(windows)]
             let _ = s.job.terminate();
             #[cfg(not(windows))]
@@ -90,7 +97,9 @@ impl TerminalManager {
         generation: u64,
     ) -> Result<ControlLease, String> {
         let session = self.session(id)?;
-        let mut s = session.lock().unwrap();
+        let mut s = session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.refresh();
         s.check(identity, lease, generation)?;
         s.control = Some((
@@ -112,7 +121,9 @@ impl TerminalManager {
     fn stop(&self, id: &str, deadline: Duration, force: bool) -> Result<SessionView, String> {
         let session = self.session(id)?;
         {
-            let mut s = session.lock().unwrap();
+            let mut s = session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.refresh();
             s.control = None;
             s.view.generation += 1;
@@ -140,7 +151,9 @@ impl TerminalManager {
         }
         let until = Instant::now() + deadline;
         loop {
-            let mut s = session.lock().unwrap();
+            let mut s = session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.refresh();
             if s.view.status == "exited" {
                 return Ok(s.view.clone());
@@ -184,7 +197,7 @@ impl TerminalManager {
         self.inner
             .sessions
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(id)
             .cloned()
             .ok_or_else(|| "terminal not found".into())
@@ -194,14 +207,14 @@ impl TerminalManager {
             .inner
             .sessions
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .cloned()
             .collect();
         sessions
             .iter()
             .map(|s| {
-                let mut s = s.lock().unwrap();
+                let mut s = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 s.refresh();
                 s.view.clone()
             })
@@ -209,7 +222,9 @@ impl TerminalManager {
     }
     pub fn acquire(&self, id: &str, identity: &str) -> Result<ControlLease, String> {
         let session = self.session(id)?;
-        let mut s = session.lock().unwrap();
+        let mut s = session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.refresh();
         if s.view.status != "live" {
             return Err("terminal exited".into());
@@ -238,7 +253,9 @@ impl TerminalManager {
     /// Identity currently holding an unexpired control lease, if any.
     pub fn holder(&self, id: &str) -> Option<String> {
         let session = self.session(id).ok()?;
-        let s = session.lock().unwrap();
+        let s = session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.control
             .as_ref()
             .filter(|(_, _, expiry)| *expiry > Instant::now())
@@ -250,7 +267,9 @@ impl TerminalManager {
         let Ok(session) = self.session(id) else {
             return;
         };
-        let mut s = session.lock().unwrap();
+        let mut s = session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if s.control.as_ref().is_some_and(|(i, _, _)| i == identity) {
             s.control = None;
             s.view.generation += 1;
@@ -261,7 +280,9 @@ impl TerminalManager {
     }
     pub fn release(&self, id: &str, identity: &str, lease: &str) -> Result<(), String> {
         let session = self.session(id)?;
-        let mut s = session.lock().unwrap();
+        let mut s = session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.check(identity, lease, s.view.generation)?;
         s.control = None;
         s.view.generation += 1;
@@ -282,7 +303,9 @@ impl TerminalManager {
             return Err("raw input exceeds 16384 byte limit; not delivered".into());
         }
         let session = self.session(id)?;
-        let mut s = session.lock().unwrap();
+        let mut s = session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.refresh();
         s.check(identity, lease, generation)?;
         // A partial write is Unknown to caller; never retry it here.
@@ -310,7 +333,9 @@ impl TerminalManager {
             return Err("terminal size must be positive".into());
         }
         let session = self.session(id)?;
-        let mut s = session.lock().unwrap();
+        let mut s = session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.refresh();
         s.check(identity, lease, generation)?;
         s.master
@@ -327,11 +352,15 @@ impl TerminalManager {
     pub fn observe(&self, id: &str, cursor: u64) -> Result<OutputView, String> {
         let session = self.session(id)?;
         let (output, status) = {
-            let mut s = session.lock().unwrap();
+            let mut s = session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.refresh();
             (s.output.clone(), s.view.status.clone())
         };
-        let b = output.lock().unwrap();
+        let b = output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let start = b.end - b.bytes.len() as u64;
         if cursor > b.end {
             return Err("output cursor is ahead of session".into());
@@ -501,7 +530,10 @@ impl TerminalManager {
                             startup_query.pop_front();
                         }
                         if startup_query.iter().copied().eq(b"\x1b[6n".iter().copied()) {
-                            let _ = reader_writer.lock().unwrap().write_all(b"\x1b[1;1R");
+                            let _ = reader_writer
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .write_all(b"\x1b[1;1R");
                             cursor_answered = true;
                             #[cfg(windows)]
                             let _ = startup_ready.send(());
@@ -512,7 +544,9 @@ impl TerminalManager {
                 if let Some(sink) = &history {
                     sink.output(&buf[..n]);
                 }
-                let mut b = output.lock().unwrap();
+                let mut b = output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 b.end += n as u64;
                 b.bytes.extend(&buf[..n]);
                 let excess = b.bytes.len().saturating_sub(capacity);
@@ -529,12 +563,14 @@ impl TerminalManager {
         #[cfg(windows)]
         writer
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .write_all(format!("{gate}\r\n").as_bytes())
             .map_err(|e| e.to_string())?;
         std::thread::spawn(move || {
             while let Ok(request) = input_rx.recv() {
-                let mut writer = writer.lock().unwrap();
+                let mut writer = writer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let result = writer
                     .write_all(&request.bytes)
                     .and_then(|_| writer.flush())
@@ -547,7 +583,7 @@ impl TerminalManager {
         self.inner
             .sessions
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(view.id.clone(), session);
         Ok(view)
     }
@@ -816,6 +852,47 @@ fn host_agent_marker(key: &str, hosted: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn one_poisoned_session_lock_does_not_cascade() {
+        // K16: revocation fences and shutdown walk every session; one session
+        // whose lock a panic poisoned must not take them down with it.
+        let manager = TerminalManager::new();
+        let (command, args) = if cfg!(windows) {
+            ("cmd.exe", vec!["/Q".into()])
+        } else {
+            ("/bin/sh", vec!["-c".into(), "sleep 30".into()])
+        };
+        let poisoned = manager.create(command.into(), args.clone(), None).unwrap();
+        let healthy = manager.create(command.into(), args, None).unwrap();
+        let session = manager.session(&poisoned.id).unwrap();
+        let _ = std::thread::spawn(move || {
+            let _guard = session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("panic while holding a session lock");
+        })
+        .join();
+        assert!(manager.session(&poisoned.id).unwrap().is_poisoned());
+        // What a revocation fence does for every session, the poisoned one first.
+        for id in [&poisoned.id, &healthy.id] {
+            assert!(manager.holder(id).is_none());
+            manager.revoke_control(id, "someone");
+            manager.acquire(id, "agent").unwrap();
+            assert_eq!(manager.holder(id).as_deref(), Some("agent"));
+            manager.revoke_control(id, "agent");
+            assert!(manager.holder(id).is_none());
+        }
+        assert_eq!(
+            manager
+                .force_owned(&poisoned.id, Duration::from_secs(5))
+                .unwrap()
+                .status,
+            "exited"
+        );
+        // Shutdown walks every session, the poisoned one included.
+        assert!(manager.shutdown(Duration::from_secs(5)).is_empty());
+        assert!(manager.list().iter().all(|view| view.status == "exited"));
+    }
     #[test]
     fn headless_user_oauth_token_survives_unless_daemon_is_hosted() {
         // A user's own headless login must reach the CLI they launch.
