@@ -1,0 +1,66 @@
+# baransu 合集：Git：身分、機敏檔、推送與 hook
+from = "baransu-preset"
+
+# Source: /ship INV-8, commits speak for this repo, applied to every commit.
+[check.git-facts]
+severity = "error"
+strict = "error"
+builtin = "git-facts"
+message = "照這個 repo 的習慣：用它近期 commit 的作者身分、格式與語言，co-author 與 push / PR 方式也照過去"
+
+# Source: /ship INV-7, the secret-file stop, applied to every commit.
+[check.secret-files]
+severity = "error"
+strict = "error"
+builtin = "secret-files"
+message = "疑似機敏檔要進 commit；確認內容，加進 .gitignore 或移出 staging"
+
+# Before a commit or push: fetch, and flag commits on the upstream this branch does not have yet. 嚴格 level raises this to error.
+[check.up-to-date]
+severity = "warn"
+strict = "error"
+builtin = "up-to-date"
+message = "先把遠端的新 commit 整合進來（pull --no-rebase 或照 repo 的習慣），再 commit／push"
+
+# Before a commit or push: was anything built or tested since the last edit? 嚴格 level raises this to error.
+[check.built-before-commit]
+severity = "warn"
+strict = "error"
+builtin = "built-before-commit"
+message = "改檔之後還沒 build 或測試過；盡量先跑過再 commit"
+
+# Source: /ship never force-pushes; a force push rewrites what others may have pulled.
+# A refspec led by + (git push origin +main) forces that one ref, so it counts too.
+[check.no-force-push]
+severity = "error"
+strict = "error"
+on = ["pre:bash"]
+forbid = '\bgit\b[^\n|;&]*\bpush\b[^\n|;&]*(\s--force(\s|$)|\s-f(\s|$)|\s\+\S)'
+message = "不要 force push；真的要改寫遠端歷史，先問使用者，再用 --force-with-lease"
+
+# Hooks and signing are the repo's own checks; skipping them hides the failure instead of fixing it.
+# git commit -n is --no-verify's short form; a -n inside the quoted message is not, so the match stops at a quote.
+# \x27 is a single quote: a TOML literal string cannot hold one.
+[check.no-skip-hooks]
+severity = "error"
+strict = "error"
+on = ["pre:bash"]
+forbid = '\bgit\b[^\n]*(--no-verify|--no-gpg-sign|-c\s+commit\.gpgsign=false)|\bgit\b[^\n|;&"\x27]*\bcommit\b[^\n|;&"\x27]*\s-n(\s|$)'
+message = "不要跳過 git hook 或簽章；hook 失敗就查原因修好"
+
+# Source: /ship Step 2b item 5 greps for these before committing.
+[check.conflict-markers]
+severity = "error"
+strict = "error"
+on = ["pre:commit", "pre:push", "pre:skill:ship", "pre:skill:review"]
+scope = "diff"
+ignores = [".claude/**"]
+forbid = '^(<<<<<<<|\|{7}|>>>>>>>)( |$)'
+message = "殘留合併衝突標記；逐塊讀兩邊（含 diff3 的 base 段）解掉再存"
+
+# Worktrees whose branch is already merged should not linger after the work is done.
+[check.worktree-cleanup]
+severity = "warn"
+strict = "warn"
+builtin = "worktree-cleanup"
+message = "這些 worktree 的分支已經合併，可以用 git worktree remove 清掉"

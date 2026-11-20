@@ -1,0 +1,81 @@
+# baransu 合集：Claude Code Runtime：重新回應、刪除前預覽、指令寫法
+from = "baransu-preset"
+
+# 重新: a reply written in another language than the user's is said again in the user's language, the way /huh restates.
+# Set language = "zh-TW" to pin it; unset, Claude Code's own `language` setting, else the user's latest message.
+[check.user-language]
+severity = "retry"
+strict = "retry"
+action = "重新"
+builtin = "user-language"
+message = "輸出給使用者的文字用使用者的慣用語言"
+
+# 重新: the first file change of a turn (an edit, or a command that writes a file) came before any words to the user,
+# so the model says in a sentence or two how it will make the change, then goes on. A read-only command is no change.
+# check holds the call once; error holds every file change until the model has said it.
+[check.explain-before-edit]
+severity = "retry"
+strict = "retry"
+action = "重新"
+builtin = "explain-before-edit"
+message = "改檔前先用一兩句話說要怎麼動手：改哪些檔、怎麼改"
+
+# 重新: a turn that did work and wants to end without saying where things stand is held at its stop once, and reports in the same turn, the way /what-now does.
+[check.report-before-stop]
+severity = "retry"
+strict = "retry"
+action = "重新"
+builtin = "report-before-stop"
+message = "做了事就交代現況：有什麼等使用者決定、做到哪、哪些沒驗證"
+
+# Every mistake the user has to correct is a candidate check: when the user's message reads as a correction, the model is asked, after fixing, whether the mistake can become a lint.
+[check.correction-to-lint]
+severity = "warn"
+strict = "warn"
+builtin = "correction-to-lint"
+message = "同一個錯不該讓使用者糾正第二次"
+
+# Before a command deletes, moves or discards, the model sees exactly what it will touch.
+# check: the first run is held back with the list; the same command in a later response goes through. error holds it every time.
+[check.destructive-preview]
+severity = "check"
+strict = "check"
+builtin = "destructive-preview"
+message = "會動到的東西都列在上面，確認是要動的"
+
+# Before /ship or /review: was the change built, tested, linted and reviewed after the last edit?
+[check.session-record]
+severity = "warn"
+strict = "warn"
+builtin = "session-record"
+message = "最後一次改檔之後還沒有建置、測試或 review 的紀錄；先跑過再收尾"
+
+# Source: owner's rule destructive-step-alone — delete or move in its own call, after the new file is confirmed.
+# A lone `cd <dir> && <delete or move>` is still one step and passes. \x27 is a single quote: a TOML literal string cannot hold one.
+[check.destructive-not-alone]
+severity = "warn"
+strict = "warn"
+on = ["pre:bash"]
+forbid = '^(?!\s*cd\s+("[^"]*"|\x27[^\x27]*\x27|\S+)\s*&&\s*(rm|rmdir|mv|Remove-Item|Move-Item|del)\b[^&;|\n]*(?![\s\S]))[\s\S]*(&&|;|\|\||\n)\s*(rm|rmdir|mv|Remove-Item|Move-Item|del)\b'
+message = "刪除、搬移要單獨一次呼叫，放在確認新檔案存在、內容正確之後；前一步失敗時，同一串的刪除照樣會跑"
+
+# Source: owner's CLAUDE.md — locate files with Everything (es), never scan a whole drive or the home directory.
+# \x27 is a single quote: a TOML literal string cannot hold one.
+[check.drive-scan]
+severity = "warn"
+strict = "warn"
+on = ["pre:bash"]
+forbid = '(?i)(\bfind\s+(/|/mnt/c|/c|~|C:/?)(\s|$))|(\b(Get-ChildItem|gci|dir|ls)\b[^|\n]*-Recurse[^|\n]*\s(\x27?[A-Za-z]:\\?\x27?|~|\$HOME|\$env:USERPROFILE)(\s|$))'
+message = "找檔案用 es -n 50 -cp 65001 <名稱>（Everything）；掃整顆磁碟或家目錄又慢又會逾時"
+
+# Source: owner's rules escape-heavy-content-use-write and python-no-backslash-paths.
+# A heredoc body holding a backslash escape (\n, \t, \", \\) or a Windows path: the script inside adds a layer of
+# escaping, and a mistake there fails or silently changes the text (8.43.0: a Python replace script written through
+# a heredoc lost its \n and stopped). At error the command is held before it runs, so the model writes the file first.
+# \x27 is a single quote: a TOML literal string cannot hold one.
+[check.heredoc-backslash-path]
+severity = "error"
+strict = "error"
+on = ["pre:bash"]
+forbid = '<<-?\s*[\x27"]?\w+[\x27"]?[\s\S]*(\\[ntr"\x27\\]|[A-Za-z]:\\[A-Za-z])'
+message = "heredoc 裡有反斜線跳脫或 Windows 路徑，多一層跳脫容易寫錯；先用 Write 把腳本或內容寫成檔案再執行，路徑用正斜線"

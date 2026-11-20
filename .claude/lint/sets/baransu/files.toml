@@ -1,0 +1,76 @@
+# baransu 合集：通用檔案編輯：換行、編碼、格式能解析、殘留
+from = "baransu-preset"
+scripts = ["eol-flip.py", "py-utf8-out.py"]
+
+# Source: 2026-11-03, a migration script rewrote 30 check files on Windows: Python's write_text turned LF into
+# CRLF, so files whose content was unchanged still showed as modified; in a repo that keeps CRLF or has no eol
+# conversion, every line of such a file would be committed as changed. The script compares raw bytes with what
+# git itself would check out (`git cat-file --filters`), so core.autocrlf and .gitattributes are respected and
+# a flip git hides from `git diff` is still seen.
+[check.eol-flip]
+severity = "warn"
+strict = "warn"
+on = ["post:edit", "pre:commit", "pre:push"]
+scope = "diff"
+run = ["python", ".claude/lint/scripts/eol-flip.py", "{file}"]
+message = "這個檔的換行整個變了：照原檔的換行寫回（Python 用 open(..., newline='') 或讀寫 bytes），不要讓沒改的行也算改動"
+
+# Source: 2026-11-03, eol-flip.py printed its Chinese finding through a cp950 console and came out garbled; the
+# text was built in a list and printed later, so no single line shows it. Owner rule: Python that prints 中文
+# sets UTF-8 first. Read per file by a script (an ast walk), since a regex on one line cannot see it.
+[check.py-utf8-out]
+severity = "warn"
+strict = "warn"
+on = ["post:edit", "pre:commit", "pre:push"]
+scope = "diff"
+ext = ["py"]
+run = ["python", ".claude/lint/scripts/py-utf8-out.py", "{file}"]
+message = "這支 Python 會印出中文：在 main 開頭加 sys.stdout.reconfigure(encoding=\"utf-8\")，Windows 的 cp950 才不會報錯或變亂碼"
+
+# Source: /ship requires every structured file it touched to still parse.
+[check.json-parses]
+severity = "error"
+strict = "error"
+on = ["post:edit"]
+ext = ["json"]
+ignores = ["tsconfig*.json", "jsconfig*.json", ".vscode/**", "devcontainer.json", ".devcontainer/**"]
+run = ["jq", "empty", "{file}"]
+message = "改完的 JSON 解析失敗；修好語法（帶註解的 JSONC 請加進 ignores）"
+
+# Source: /ship requires every structured file it touched to still parse.
+[check.toml-parses]
+severity = "error"
+strict = "error"
+on = ["post:edit"]
+ext = ["toml"]
+run = ["yq", "-p", "toml", ".", "{file}"]
+message = "改完的 TOML 解析失敗；修好語法"
+
+# Source: /ship requires every structured file it touched to still parse.
+[check.yaml-parses]
+severity = "error"
+strict = "error"
+on = ["post:edit"]
+ext = ["yml", "yaml"]
+ignores = ["**/templates/**"]
+run = ["yq", ".", "{file}"]
+message = "改完的 YAML 解析失敗；修好縮排或語法（Helm 這類模板請加進 ignores）"
+
+# Source: /ship INV-7 stops on secret files; this catches the key inside any file.
+# warn by default: test keys and docs that quote a key header are common; the 嚴格 level raises it to error.
+[check.private-key-material]
+severity = "warn"
+strict = "error"
+on = ["post:edit", "pre:commit", "pre:push"]
+scope = "diff"
+forbid = '-----BEGIN ([A-Z]+ )?PRIVATE KEY-----'
+message = "檔案內含私鑰；改用 secret manager 或 op:// 參照，不要讓金鑰進 repo"
+
+# Source: /hunt closes only when every 🎯HUNT-tagged instrument is removed.
+[check.hunt-instrument-left]
+severity = "error"
+strict = "error"
+on = ["pre:commit", "pre:push", "pre:skill:ship", "pre:skill:review"]
+ignores = [".claude/**", ".codex/**"]
+forbid = '🎯HUNT-\d{4}-\d{3}'
+message = "/hunt 的探針沒拆；根因確認後一次移除所有 🎯HUNT 工具"
