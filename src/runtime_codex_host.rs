@@ -642,6 +642,9 @@ impl OwnedCodexRegistry {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        for key in crate::runtime_terminal::inherited_host_agent_markers() {
+            command.env_remove(key);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;

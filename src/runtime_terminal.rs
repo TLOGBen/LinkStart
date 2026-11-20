@@ -411,12 +411,8 @@ impl TerminalManager {
             c.args(args);
             c
         };
-        let hosted = std::env::var_os("CLAUDECODE").is_some()
-            || std::env::var_os("CLAUDE_CODE_ENTRYPOINT").is_some();
-        for (key, _) in std::env::vars_os() {
-            if key.to_str().is_some_and(|k| host_agent_marker(k, hosted)) {
-                cmd.env_remove(key);
-            }
+        for key in inherited_host_agent_markers() {
+            cmd.env_remove(key);
         }
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
@@ -759,6 +755,17 @@ impl Drop for Session {
     }
 }
 
+/// The daemon's own variables that every child it spawns (owned terminals, the
+/// owned Codex host, `gh`) must have removed; see `host_agent_marker`.
+pub(crate) fn inherited_host_agent_markers() -> Vec<std::ffi::OsString> {
+    let hosted = std::env::var_os("CLAUDECODE").is_some()
+        || std::env::var_os("CLAUDE_CODE_ENTRYPOINT").is_some();
+    std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| key.to_str().is_some_and(|k| host_agent_marker(k, hosted)))
+        .collect()
+}
+
 /// Variables an agent host injects to mark (and authenticate) its own session.
 /// When the daemon is started from inside such a session, an owned CLI must not
 /// inherit them: it would believe it is that session's child, and host tokens
@@ -819,6 +826,19 @@ mod tests {
         assert!(host_agent_marker("CLAUDE_CODE_OAUTH_SCOPES", false));
         assert!(!host_agent_marker("CLAUDE_CODE_SKIP_BEDROCK_AUTH", true));
         assert!(!host_agent_marker("CLAUDE_CODE_CLIENT_CERT", true));
+        // What gh and Codex need from the daemon's environment stays (K13).
+        for key in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_CONFIG_DIR",
+            "HOME",
+            "USERPROFILE",
+            "PATH",
+            "CODEX_HOME",
+            "OPENAI_API_KEY",
+        ] {
+            assert!(!host_agent_marker(key, true), "{key}");
+        }
     }
     #[test]
     fn child_does_not_inherit_host_agent_session_markers() {

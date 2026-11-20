@@ -325,6 +325,9 @@ impl SourceAdapter {
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_NO_UPDATE_NOTIFIER", "1")
             .env("GH_HOST", "github.com");
+        for key in crate::runtime_terminal::inherited_host_agent_markers() {
+            command.env_remove(key);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -622,6 +625,31 @@ pub(crate) fn normalize_repository(repository: &str) -> Result<String, String> {
         return Err("repository must be explicit owner/name on github.com".into());
     }
     Ok(repository.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+    #[test]
+    fn gh_does_not_inherit_host_agent_session_markers() {
+        // Names no other test reads; user configuration must survive. The child
+        // reports only which probe names it sees, never any value.
+        std::env::set_var("CLAUDE_CODE_SESSION_K13_GH_PROBE", "host-marker");
+        std::env::set_var("CLAUDE_AGENT_SDK_K13_GH_PROBE", "host-marker");
+        std::env::set_var("LINKSTART_K13_GH_KEEP_PROBE", "kept");
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = SourceConfig::new(dir.path().join("source.sqlite"));
+        config.gh_program = if cfg!(windows) { "python" } else { "python3" }.into();
+        config.gh_prefix_args = vec![
+            "-c".into(),
+            "import json,os;print(json.dumps(sorted(k for k in os.environ if 'K13_GH' in k.upper())))"
+                .into(),
+        ];
+        let adapter = SourceAdapter::new(config).unwrap();
+        let out = adapter.run_gh(&["api", "probe"], None).unwrap();
+        let seen: Vec<String> = serde_json::from_slice(&out).unwrap();
+        assert_eq!(seen, vec!["LINKSTART_K13_GH_KEEP_PROBE".to_string()]);
+    }
 }
 
 #[cfg(all(test, windows))]
