@@ -13,6 +13,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// One host budget covers both the fake provider's cold start (initialize) and
+/// how long a lost turn waits before it is Unknown. Under load the cold start
+/// alone exceeded 1 s (hypothesis load-deadlines, P1), so the budget covers
+/// it, and waiting for the lost turn is derived from the budget.
+const LOST_TURN_BUDGET: Duration = Duration::from_secs(8);
+
 #[test]
 fn actor_commands_cross_member_grants_and_exact_legacy_boundary() {
     for grant in ["observe", "send", "control", "manage"] {
@@ -424,7 +430,7 @@ fn repair_exact_reconcile_updates_unknown_snapshot_without_resending() {
     let s = f.supervisor();
     let mut config = f.config(false);
     config.args[1] = "lost".into();
-    config.timeout = Duration::from_secs(1);
+    config.timeout = LOST_TURN_BUDGET;
     let script = std::fs::read_to_string(&config.args[0]).unwrap().replace(
         "elif method=='turn/start':",
         "elif method=='turn/start':\n  open('turn-start-count.txt','a').write('sent\\n')",
@@ -440,7 +446,12 @@ fn repair_exact_reconcile_updates_unknown_snapshot_without_resending() {
     f.running(&s);
     s.start_turn(&f.token, &f.scope, "lost-op".into(), "work".into())
         .unwrap();
-    f.wait_operation(&s, "lost-op", OperationPhase::Unknown);
+    f.wait_operation_within(
+        &s,
+        "lost-op",
+        OperationPhase::Unknown,
+        LOST_TURN_BUDGET * 2 + Duration::from_secs(5),
+    );
     assert_eq!(
         s.reconcile(&f.token, &f.scope, "lost-op".into(), Duration::from_secs(2))
             .unwrap(),
@@ -478,7 +489,7 @@ fn repair_terminal_reconcile_preserves_failed_and_interrupted_provider_outcomes(
         config.args[1] = "lost".into();
         // This global host budget includes initialize. Lost turn responses use
         // a normal process-start budget; 150ms startup expiry has its own test.
-        config.timeout = Duration::from_secs(1);
+        config.timeout = LOST_TURN_BUDGET;
         let script = std::fs::read_to_string(&config.args[0])
             .unwrap()
             .replace("'status':'completed'", &format!("'status':'{status}'"))
@@ -497,7 +508,12 @@ fn repair_terminal_reconcile_preserves_failed_and_interrupted_provider_outcomes(
         f.running(&s);
         s.start_turn(&f.token, &f.scope, "lost-op".into(), "work".into())
             .unwrap();
-        f.wait_operation(&s, "lost-op", OperationPhase::Unknown);
+        f.wait_operation_within(
+            &s,
+            "lost-op",
+            OperationPhase::Unknown,
+            LOST_TURN_BUDGET * 2 + Duration::from_secs(5),
+        );
         let observed = s
             .reconcile_observation(&f.token, &f.scope, "lost-op".into(), Duration::from_secs(2))
             .unwrap();
@@ -715,7 +731,16 @@ impl Fixture {
         );
     }
     fn wait_operation(&self, s: &OwnedSessionSupervisor, id: &str, phase: OperationPhase) {
-        let deadline = Instant::now() + Duration::from_secs(4);
+        self.wait_operation_within(s, id, phase, Duration::from_secs(4));
+    }
+    fn wait_operation_within(
+        &self,
+        s: &OwnedSessionSupervisor,
+        id: &str,
+        phase: OperationPhase,
+        bound: Duration,
+    ) {
+        let deadline = Instant::now() + bound;
         loop {
             if s.operation(&self.token, &self.scope, id).unwrap().phase == phase {
                 return;
@@ -854,15 +879,24 @@ impl Fixture {
         .unwrap()
     }
     fn running(&self, s: &OwnedSessionSupervisor) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Start-up ends on its own budget, in Running or Unknown; the test waits
+        // for that outcome, not a wall-clock guess (hypothesis load-deadlines,
+        // P1: 27/416 start-ups under load took over 5 s and still succeeded).
+        // The deadline only stops a hung test.
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let status = s.get(&self.token, &self.scope).unwrap();
             if status.phase == SessionPhase::Running {
                 return;
             }
             assert!(
-                status.phase != SessionPhase::Unknown && Instant::now() < deadline,
-                "worker did not become running: {status:?}"
+                status.phase != SessionPhase::Unknown,
+                "worker did not become running: {:?}",
+                status.worker_failure
+            );
+            assert!(
+                Instant::now() < deadline,
+                "start-up never ended: {status:?}"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
