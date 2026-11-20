@@ -389,6 +389,13 @@ class RuntimeHttp(unittest.TestCase):
         held_then_revoked(lambda:call('endpoints.grant',{'endpoint_id':eid,'member_id':mid,'operations':[]}),403)
         call('endpoints.grant',{'endpoint_id':eid,'member_id':mid,'operations':['send','control']})
         held_then_revoked(lambda:call('members.revoke_credential',{'member_id':mid,'expected_epoch':member.get('credential_epoch',0)}),401)
+        # Time-based expiry has no revoking call: the next acquire must fence it.
+        _,invite=call('members.invite',{'roles':['manager']})
+        _,member=call('members.register',{'name':'expiring'},invite['invite_token'])
+        status,rotated=call('members.rotate_credential',{'member_id':member['id'],'expected_epoch':member.get('credential_epoch',0),'ttl_seconds':2})
+        self.assertEqual(status,200,rotated)
+        cred=rotated['credential']
+        held_then_revoked(lambda:(time.sleep(2.5),(200,'expired'))[1],401)
         call('terminal.force',{'endpoint_id':eid})
 
     def test_terminal_write_delivers_whitespace_only_keys(self):
