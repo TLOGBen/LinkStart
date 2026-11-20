@@ -365,6 +365,39 @@ class RuntimeHttp(unittest.TestCase):
         self.assertEqual(status,403,value)
         self.post(dict(request_id='obs-force',tool='terminal.force',space_id=sid,args={'endpoint_id':eid}),token)
 
+    def test_revocation_ends_held_control_and_next_operation(self):
+        token,sid,created=self.recorded_terminal('revoke',"print('REV_READY',flush=True)\nwhile True:\n    print('GOT=%r'%input(),flush=True)\n")
+        eid=created['endpoint']['id']
+        def call(tool,args,credential=token):return self.post(dict(request_id=str(time.time_ns()),tool=tool,space_id=sid,args=args),credential)
+        _,invite=call('members.invite',{'roles':['manager']})
+        _,member=call('members.register',{'name':'agent'},invite['invite_token'])
+        mid,cred=member['id'],member['credential']
+        def held_then_revoked(revoke,denied):
+            status,lease=call('terminal.acquire',{'endpoint_id':eid},cred)
+            self.assertEqual(status,200,lease)
+            self.assertEqual(call('terminal.write',dict(endpoint_id=eid,input='x\r',**lease),cred)[0],200)
+            status,value=revoke()
+            self.assertEqual(status,200,value)
+            status,value=call('terminal.write',dict(endpoint_id=eid,input='y\r',**lease),cred)
+            self.assertEqual(status,denied,value)
+            # The revoked holder's lease must not keep a human or another agent out.
+            status,mine=call('terminal.acquire',{'endpoint_id':eid})
+            self.assertEqual(status,200,mine)
+            self.assertEqual(call('terminal.release',dict(endpoint_id=eid,**mine))[0],200)
+        held_then_revoked(lambda:call('members.set_roles',{'member_id':mid,'roles':['implementer']}),403)
+        call('endpoints.grant',{'endpoint_id':eid,'member_id':mid,'operations':['send','control']})
+        held_then_revoked(lambda:call('endpoints.grant',{'endpoint_id':eid,'member_id':mid,'operations':[]}),403)
+        call('endpoints.grant',{'endpoint_id':eid,'member_id':mid,'operations':['send','control']})
+        held_then_revoked(lambda:call('members.revoke_credential',{'member_id':mid,'expected_epoch':member.get('credential_epoch',0)}),401)
+        # Time-based expiry has no revoking call: the next acquire must fence it.
+        _,invite=call('members.invite',{'roles':['manager']})
+        _,member=call('members.register',{'name':'expiring'},invite['invite_token'])
+        status,rotated=call('members.rotate_credential',{'member_id':member['id'],'expected_epoch':member.get('credential_epoch',0),'ttl_seconds':2})
+        self.assertEqual(status,200,rotated)
+        cred=rotated['credential']
+        held_then_revoked(lambda:(time.sleep(2.5),(200,'expired'))[1],401)
+        call('terminal.force',{'endpoint_id':eid})
+
     def test_terminal_write_delivers_whitespace_only_keys(self):
         script="print('KEYS_READY',flush=True)\nfor n in (1,2):\n    print('LINE%d=%r'%(n,input()),flush=True)\n"
         token,sid,created=self.recorded_terminal('keys',script)

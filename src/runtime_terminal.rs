@@ -235,6 +235,30 @@ impl TerminalManager {
             generation: s.view.generation,
         })
     }
+    /// Identity currently holding an unexpired control lease, if any.
+    pub fn holder(&self, id: &str) -> Option<String> {
+        let session = self.session(id).ok()?;
+        let s = session.lock().unwrap();
+        s.control
+            .as_ref()
+            .filter(|(_, _, expiry)| *expiry > Instant::now())
+            .map(|(identity, _, _)| identity.clone())
+    }
+    /// Ends `identity`'s lease after its authority was withdrawn; bumping the
+    /// generation fences any write already carrying the old lease.
+    pub fn revoke_control(&self, id: &str, identity: &str) {
+        let Ok(session) = self.session(id) else {
+            return;
+        };
+        let mut s = session.lock().unwrap();
+        if s.control.as_ref().is_some_and(|(i, _, _)| i == identity) {
+            s.control = None;
+            s.view.generation += 1;
+            if let Some(history) = &s.history {
+                history.status(&s.view);
+            }
+        }
+    }
     pub fn release(&self, id: &str, identity: &str, lease: &str) -> Result<(), String> {
         let session = self.session(id)?;
         let mut s = session.lock().unwrap();
