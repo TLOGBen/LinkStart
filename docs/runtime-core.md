@@ -59,6 +59,8 @@ Initialization holds an OS file lock (`v2-initialize.lock`, Rust 1.89+ `File::lo
 
 Scaling limit: forum mutations rewrite one JSON snapshot including durable dedupe receipts and history. Receipt/event retention is intentionally unbounded; heartbeat rows are one per attachment, without automatic expired-attachment garbage collection. Reads deserialize the snapshot. This foundation is not yet suitable for unbounded high-volume workloads. `history_limit` does not truncate durable forum receipts/events.
 
+What launch approvals, `--address` and terminal request receipts deliberately do not guarantee, and what an operator does about it, is in `docs/operator-limits.md`.
+
 ## Executable consumer
 
 Use a dedicated directory; the example creates durable state and prints only topic data, never credentials:
