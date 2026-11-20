@@ -859,8 +859,11 @@ mod tests {
     #[test]
     fn stop_preserves_inflight_accounting_until_bounded_source_job_finishes() {
         let mut fixture = Fixture::new();
-        fixture.config.timeout = Duration::from_millis(2500);
-        std::fs::write(fixture.dir.path().join("slow-read"), b"yes").unwrap();
+        // The read stays in flight until the test releases it, so its start-up
+        // time under load no longer races a fixed budget (hypothesis
+        // load-deadlines, P3); the timeout only bounds a stuck job.
+        fixture.config.timeout = Duration::from_secs(120);
+        std::fs::write(fixture.dir.path().join("gate-read"), b"yes").unwrap();
         let (dir, engine, admin, sid, eid) = setup();
         let config = fixture.config.clone();
         let jobs = SourceJobs::open_with_config_factory(
@@ -884,6 +887,7 @@ mod tests {
         until(|| fixture.calls().len() == 1);
         assert_eq!(manager.stop(&admin, "inflight").unwrap().status, "stopping");
         assert_eq!(manager.active_count(), 1);
+        std::fs::write(fixture.dir.path().join("release-read"), b"yes").unwrap();
         until(|| manager.active_count() == 0);
         assert_eq!(jobs.active_count(), 0);
         assert_eq!(manager.get(&admin, "inflight").unwrap().status, "stopped");

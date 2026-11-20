@@ -1050,11 +1050,17 @@ mod tests {
             if output.next_cursor > 128 {
                 assert!(output.gap, "lost history must be explicit");
                 assert!(output.bytes.len() <= 128, "history must be bounded");
-                assert!(manager
-                    .observe(&s.id, output.next_cursor)
-                    .unwrap()
-                    .bytes
-                    .is_empty());
+                // Resuming from next_cursor returns exactly what was produced
+                // since, never a repeat; the program may still be writing
+                // (hypothesis load-deadlines, P4), so the read need not be empty.
+                let next = manager.observe(&s.id, output.next_cursor).unwrap();
+                let produced = next.next_cursor - output.next_cursor;
+                assert_eq!(next.gap, produced > 128, "gap only when history was lost");
+                assert_eq!(
+                    next.bytes.len() as u64,
+                    produced.min(128),
+                    "no repeated or missing bytes"
+                );
                 break;
             }
             assert!(Instant::now() < deadline);

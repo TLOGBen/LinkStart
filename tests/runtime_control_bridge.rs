@@ -186,7 +186,9 @@ impl Fixture {
                     model: "gpt-6-luna".into(),
                     provider_version: "0.163.0".into(),
                     capability_evidence: "controlled fake provider".into(),
-                    timeout: Duration::from_secs(3),
+                    // Also bounds the fake provider's cold start; these tests do
+                    // not test timeouts (hypothesis load-deadlines, P6).
+                    timeout: Duration::from_secs(10),
                     profile: ExecutionProfile::ReadOnlyForum,
                 },
             )
@@ -249,7 +251,10 @@ impl Fixture {
         json!({"endpoint_id":self.binding.endpoint_id,"session_id":v["session_id"],"expected_generation":v["binding_generation"]})
     }
     fn running(&self, v: &Value) {
-        let until = Instant::now() + Duration::from_secs(5);
+        // Start-up ends on the plan's own budget, in Running or Unknown; wait
+        // for that outcome (hypothesis load-deadlines, P6). The deadline only
+        // stops a hung test.
+        let until = Instant::now() + Duration::from_secs(60);
         loop {
             let status = self
                 .bridge
@@ -261,7 +266,12 @@ impl Fixture {
             if status["phase"] == "Running" {
                 return;
             }
-            assert!(Instant::now() < until, "{status}");
+            assert!(
+                status["phase"] != "Unknown",
+                "worker did not become running: {}",
+                status["worker_failure"]
+            );
+            assert!(Instant::now() < until, "start-up never ended: {status}");
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -1182,7 +1192,7 @@ fn approved_workspace_write_reaches_host_without_profile_downgrade() {
                 model: "gpt-6-luna".into(),
                 provider_version: "0.163.0".into(),
                 capability_evidence: "controlled fake provider".into(),
-                timeout: Duration::from_secs(3),
+                timeout: Duration::from_secs(10),
                 profile: ExecutionProfile::WorkspaceWrite(approval),
             },
         )
