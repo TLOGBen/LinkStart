@@ -737,20 +737,41 @@ impl Drop for Session {
 /// When the daemon is started from inside such a session, an owned CLI must not
 /// inherit them: it would believe it is that session's child, and host tokens
 /// would reach every program a member launches. User configuration (for example
-/// API endpoints or provider selection) is left alone.
+/// API endpoints, provider selection, client certificates, `SKIP_*_AUTH`) is
+/// left alone, so this is an explicit list, not a prefix rule.
 fn host_agent_marker(key: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "CLAUDECODE",
+        "CLAUDE_PID",
+        "CLAUDE_EFFORT",
+        "AI_AGENT",
+        "CODEX_THREAD_ID",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_CODE_SSE_PORT",
+        "CLAUDE_CODE_ACCOUNT_UUID",
+        "CLAUDE_CODE_ORGANIZATION_UUID",
+        "CLAUDE_CODE_USER_EMAIL",
+        "CLAUDE_CODE_DESKTOP_APP_VERSION",
+        "CLAUDE_CODE_REPORT_FINDINGS",
+        "CLAUDE_CODE_TERMINAL_MCP_TOOLS",
+        "CLAUDE_CODE_STARTUP_FAILURE_RESULTS",
+    ];
+    // Session identity, host IPC and host-held auth: never meaningful to a new CLI.
+    const PREFIX: &[&str] = &[
+        "CLAUDE_AGENT_SDK_",
+        "CLAUDE_PREVIEW_",
+        "CODEX_SANDBOX",
+        "CLAUDE_CODE_SESSION_",
+        "CLAUDE_CODE_HOST_",
+        "CLAUDE_CODE_MESSAGING_",
+        "CLAUDE_CODE_OAUTH_",
+        "CLAUDE_CODE_SDK_",
+        "CLAUDE_CODE_EMIT_",
+    ];
     let key = key.to_ascii_uppercase();
-    key == "CLAUDECODE"
-        || key == "CLAUDE_PID"
-        || key == "CLAUDE_EFFORT"
-        || key.starts_with("CLAUDE_AGENT_SDK_")
-        || key.starts_with("CLAUDE_PREVIEW_")
-        || key.starts_with("CODEX_SANDBOX")
-        || key.starts_with("CODEX_THREAD_ID")
-        || (key.starts_with("CLAUDE_CODE_")
-            && !key.starts_with("CLAUDE_CODE_USE_")
-            && !key.starts_with("CLAUDE_CODE_MAX_")
-            && key != "CLAUDE_CODE_GIT_BASH_PATH")
+    EXACT.contains(&key.as_str()) || PREFIX.iter().any(|p| key.starts_with(p))
 }
 
 #[cfg(test)]
@@ -758,8 +779,10 @@ mod tests {
     use super::*;
     #[test]
     fn child_does_not_inherit_host_agent_session_markers() {
+        // Only names no other test reads; user configuration must survive.
         std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "parent-marker");
-        std::env::set_var("CLAUDECODE", "1");
+        std::env::set_var("CLAUDE_CODE_MESSAGING_TOKEN", "host-secret");
+        std::env::set_var("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "1");
         std::env::set_var("LINKSTART_ENV_KEEP_PROBE", "kept");
         let manager = TerminalManager::new();
         let (command, args) = if cfg!(windows) {
@@ -781,8 +804,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         assert!(text.contains("LINKSTART_ENV_KEEP_PROBE=kept"), "{text}");
+        assert!(text.contains("CLAUDE_CODE_SKIP_BEDROCK_AUTH=1"), "{text}");
         assert!(!text.contains("CLAUDE_CODE_CHILD_SESSION"), "{text}");
-        assert!(!text.contains("CLAUDECODE="), "{text}");
+        assert!(!text.contains("host-secret"), "{text}");
     }
     #[test]
     fn owned_terminal_starts_a_real_child() {
