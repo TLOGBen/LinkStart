@@ -168,6 +168,22 @@ fn unverified_provider_version_and_effective_sandbox_are_unsupported() {
 }
 
 #[test]
+fn owned_host_does_not_inherit_host_agent_session_markers() {
+    // Names no other test reads; user configuration must survive.
+    std::env::set_var("CLAUDE_CODE_SESSION_K13_CODEX_PROBE", "host-marker");
+    std::env::set_var("CLAUDE_CODE_HOST_K13_CODEX_PROBE", "host-marker");
+    std::env::set_var("LINKSTART_K13_CODEX_KEEP_PROBE", "kept");
+    let f = Fixture::new();
+    let mut host = f.spawn("env");
+    host.initialize().unwrap();
+    let seen: Vec<String> =
+        serde_json::from_slice(&std::fs::read(f._dir.path().join("env-probe.json")).unwrap())
+            .unwrap();
+    assert_eq!(seen, vec!["LINKSTART_K13_CODEX_KEEP_PROBE".to_string()]);
+    host.close().unwrap();
+}
+
+#[test]
 #[cfg(windows)]
 fn approved_workspace_profile_preserves_request_effective_policy_and_native_resume() {
     let f = Fixture::new();

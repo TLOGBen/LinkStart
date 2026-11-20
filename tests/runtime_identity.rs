@@ -761,3 +761,91 @@ fn transport_race_stop_cannot_shutdown_replacement_runtime() {
         "stale A-targeted stop reached B"
     );
 }
+
+fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8(head).unwrap();
+    let length = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Content-Length: "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut body = vec![0; length];
+    stream.read_exact(&mut body).unwrap();
+    (head, body)
+}
+
+// K4: a draining Runtime answers its final response with `Connection: close`;
+// the complete answer must reach the caller instead of an "outcome unknown".
+#[test]
+fn complete_tool_response_with_connection_close_is_returned() {
+    let dir = TempDir::new().unwrap();
+    let credential = "k4-fixture-credential";
+    let credential_file = dir.path().join("credential");
+    fs::write(&credential_file, credential).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let host = address.clone();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (head, body) = read_request(&mut stream);
+        assert!(head.starts_with("POST /v2/prove HTTP/1.1"));
+        let prove: Value = serde_json::from_slice(&body).unwrap();
+        let proof = linkstart::runtime_core::runtime_proof(
+            credential,
+            &host,
+            prove["nonce"].as_str().unwrap(),
+        );
+        let answer = serde_json::to_vec(&json!({ "proof": proof })).unwrap();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    answer.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        stream.write_all(&answer).unwrap();
+        let (head, _) = read_request(&mut stream);
+        assert!(head.starts_with("POST /v2/tools HTTP/1.1"));
+        let result = br#"{"status":"stopping","history":"durable"}"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    result.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        stream.write_all(result).unwrap();
+        // Dropping the stream closes the connection right after the answer.
+    });
+    let mut cmd = Command::new(bin());
+    cmd.args(["tool", "--state-dir"])
+        .arg(dir.path())
+        .arg("--credential-file")
+        .arg(&credential_file)
+        .args(["--address", &address]);
+    let request = json!({
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "tool": "runtime.confirm_shutdown",
+        "args": {"ticket": "fixture"},
+    });
+    let (result, timeout) = run(cmd, Some(serde_json::to_vec(&request).unwrap()));
+    server.join().unwrap();
+    assert!(!timeout && result.status.success(), "{result:?}");
+    let printed: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(printed["status"], "stopping");
+    assert_eq!(printed["history"], "durable");
+}
