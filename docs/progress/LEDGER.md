@@ -15,7 +15,7 @@
 
 ## 下一步
 
-A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已知問題」：K8 已在 #24 修正，接下來是 K10，其次 K2。
+A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已知問題」：K8（#24）、K10（#25）已修正，接下來是 K2。
 
 ## 驗收項目
 
@@ -44,6 +44,7 @@ A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已�
 | #22 | feature/a8-fixes | 已合併 `a1e5588` | A8 審查的 M1（Engine 鎖中毒後無法停止）與 M2（刪掉使用者的 OAuth token）；關閉中仍可撤銷憑證 |
 | #23 | docs/goal-complete | 已合併 `8407af1` | 帳本：A1–A8 全部達成 |
 | #24 | fix/k8-address-auth | 已合併 | K8：`--address` 先驗證 Runtime 身分再送憑證；HUNT-2026-005 測試修正 |
+| #25 | fix/k10-approval-recheck | 已合併 | K10：啟動核准不會比核准人的信任活得久（終端 restart 與 owned launch plan）；agent manager 不能改人類的角色與憑證 |
 
 ## 已知問題
 
@@ -53,7 +54,6 @@ A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已�
 - **K5**（#14 review）：加鎖前的空窗期如果寫入了較新的 in-memory fallback，恢復流程只合併加鎖前讀到的舊版本，最新的私有錯誤紀錄會遺失（`runtime_agent.rs`）。
 - **K6**（假說 storage-init）：`protect_if_present` 在「刪除中」時依賴約 1 秒內完成；可以改成刪除中就跳過，移除這個時間前提。其他資料庫的 `protect` 用的也是「先檢查存在再設 ACL」的寫法。
 - **K7**（假說的第二份推導）：其他程序的 SQLite 寫入交易如果超過 `busy_timeout` 的 10 秒，`Engine::open` 會以 `SQLITE_BUSY` 失敗。
-- **K10**（#17 review）：核准紀錄不會重新檢查核准人；核准人之後被撤權，agent 仍然可以重啟該終端。另外，核准一個 shell（例如 `pwsh.exe`）就等於讓有 send 權限的 agent 能在裡面執行任何指令。`LaunchPolicyStore::admin()` 接受 agent 的 manager 角色，目前沒有對外開放；將來若要開放 install，必須改成只允許人類。
 - **K11**（#18 review）：`daemon stop` 遇到一直不退出的終端時只會回 pending，需要改用 `linkstart tool` 送 `runtime.force_shutdown`，錯誤訊息沒有提示這條路。（Engine 鎖中毒的部分已在 #22 修正。）
 - **K13**（A8 review）：環境變數過濾只套用在 PTY 終端；owned Codex host（`runtime_codex_host.rs`）和 `gh`（`runtime_source.rs`）仍繼承全部環境變數。
 - **K14**（A8 review）：用同一個 request_id 重送 `members.rotate_credential` 時，會再跑一次撤權擋門，誤結束 agent 用新憑證剛取得的租約。只會讓 agent 重新 acquire，不是安全問題。
@@ -68,7 +68,14 @@ A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已�
   - `/v2/prove` 對知道 key_id 的人透露該憑證是否仍有效。
   - 伺服器只綁 `127.0.0.1`，client 用 `[::1]` 或 `127.0.0.2` 一律證明失敗，錯誤訊息不會指出這點。
 - **K20**（HUNT-2026-005 另立案）：`runtime_terminal::tests::slow_observer_gets_gap_while_other_terminal_stays_responsive`（`runtime_terminal.rs:956`）在 Linux 4 份並行壓力下約 1/100 失敗，序列模式也一樣，和負載有關，屬於 K12 同類。
-- 已修：K3（#18）、K9（#18）；A8 審查的 M1、M2 和「關閉中無法撤權」（#22）；K8（#24：`--address` 送憑證前，Runtime 先用 HMAC 證明它知道這個憑證，證明綁定它自己的位址）。
+- **K21**（#25 審查後剩下的 low 與設計邊界）：
+  - 核准一個 shell（例如 `pwsh.exe`）就等於讓有 send 權限的 agent 能在裡面執行任何指令。這是設計本身的結果，核准 shell 前要知道這點。
+  - 憑證外洩時要先 `revoke_credential` 再 `rotate`；只做 rotate 不算信任中斷，攻擊者冒用期間做的核准會留下。
+  - 升級前就發生的降級或撤銷沒有留下信任世代，被 owner 恢復後，升級前的舊核准仍算數。
+  - workspace write 核准（`approve_workspace`）記下的核准人不會再被重新檢查；要靠 install 時的安裝者檢查擋。
+  - agent manager 仍可撤銷 launch plan，最多讓 space 內的 plan 全部失效（只會減少權限）。
+  - owned launch 在 `approve()` 檢查安裝者之後、最後一次確認之前，有幾毫秒的空窗；撤銷本來就不會停掉已在跑的程序。
+- 已修：K3（#18）、K9（#18）；A8 審查的 M1、M2 和「關閉中無法撤權」（#22）；K8（#24：`--address` 送憑證前，Runtime 先用 HMAC 證明它知道這個憑證，證明綁定它自己的位址）；K10（#25：每位人類成員有一個信任世代，撤銷憑證或拿掉 `human_admin` 時加 1；終端核准與 launch plan 記下核准當下的世代，啟動時不相等就拒絕，所以重新發憑證或恢復角色都不會讓舊核准復活；agent manager 不能改人類的角色與憑證，也不能安裝 launch plan；沒有安裝者紀錄的舊 plan 必須重新安裝）。
 
 ## 紀錄
 
@@ -81,3 +88,4 @@ A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已�
 - 2026-11-20：A3（#16）、A4（#17）合併；A5（#18）完成審查修正；A6 在 TLOGBen/LinkStart 上走完一次完整迴圈；A7 的 65 分鐘閒置開始跑。`/baransu:hunt` HUNT-2026-004：`runtime_agent` 的鎖在 drop 後仍被別的執行緒 fork 出的子程序短暫握住（約 1ms），已修正測試。
 - 2026-11-20：A8 第二輪審查在 `a1e5588` 通過（#22 合併）。電腦意外關機中斷了 `a1e5588` 的 A7，重跑後閒置 3,930 秒、同一 Session 4.1 秒回答。A1–A8 全部達成。
 - 2026-11-20：K8（#24）：舊版 binary 會把憑證送給冒充者（新測試在 `a1e5588` 上失敗）。修正後，自己回應、原封轉送、改寫 Host 轉送這三種冒充者都拿不到憑證。`/baransu:hunt` HUNT-2026-005：Linux 並行下 `runtime_agent` 恢復測試 3/100 失敗，序列模式 0/100，和 HUNT-2026-004 同因；修正後並行 0/100。
+- 2026-11-20：K10（#25）：三輪獨立審查。第一輪找到 agent manager 能把被降級的人類升回去（high）與 owned launch 不重查安裝者（med）；第二輪找到撤銷後重發憑證會讓舊核准復活（med）；第三輪找到用時鐘比較會被時鐘倒退騙過（med），改成每位成員的信任世代計數。每個新測試都確認過：拿掉對應的檢查就會失敗。

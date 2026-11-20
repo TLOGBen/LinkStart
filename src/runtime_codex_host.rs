@@ -389,10 +389,12 @@ impl OwnedCodexRegistry {
             let approved_by = self
                 .engine
                 .with_endpoint_authorization(credential, space_id, endpoint_id, "manage", |auth| {
+                    // Workspace write access is a launch decision: humans only (K10).
                     if auth["identity_id"] != "owner"
-                        && !auth["identity"]["roles"].as_array().is_some_and(|roles| {
-                            roles.iter().any(|r| r == "human_admin" || r == "manager")
-                        })
+                        && !(auth["identity"]["kind"] == "human"
+                            && auth["identity"]["roles"]
+                                .as_array()
+                                .is_some_and(|roles| roles.iter().any(|r| r == "human_admin")))
                     {
                         return Err(ApiError {
                             code: "Denied".into(),

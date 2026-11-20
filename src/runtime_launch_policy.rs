@@ -164,6 +164,14 @@ struct StoredPlan {
     capability_evidence: String,
     timeout_ms: u64,
     profile: Value,
+    /// Who installed the plan ("owner" or a member id). A plan stored before this
+    /// field existed has none and is not launchable until a human reinstalls it.
+    #[serde(default)]
+    installed_by: Option<String>,
+    /// The installer's trust generation at install time; once their trust breaks
+    /// it rises, and this plan stops counting.
+    #[serde(default)]
+    installed_generation: Option<u64>,
 }
 /// No Debug/Serialize/Deserialize: contains a private worker bearer.
 pub struct ApprovedLaunch {
@@ -240,10 +248,14 @@ impl LaunchPolicyStore {
         db.busy_timeout(Duration::from_secs(5)).map_err(internal)?;
         Ok(db)
     }
+    /// `grants`: the call can add launch power (install, provision), which only a
+    /// human may do, since an agent can hold the manager role (K10). Revoking only
+    /// removes power, so a manager may still do it with no human present.
     fn admin<T>(
         &self,
         actor: &str,
         b: &WorkerBinding,
+        grants: bool,
         f: impl FnOnce() -> Result<T, ApiError>,
     ) -> Result<T, ApiError> {
         self.engine.with_endpoint_authorization(
@@ -252,12 +264,19 @@ impl LaunchPolicyStore {
             &b.endpoint_id,
             "manage",
             |auth| {
-                if auth["identity_id"] != "owner"
-                    && !auth["identity"]["roles"]
-                        .as_array()
-                        .is_some_and(|r| r.iter().any(|r| r == "manager" || r == "human_admin"))
-                {
-                    return Err(error("Denied", "trusted administrator required"));
+                let roles = auth["identity"]["roles"].as_array();
+                let human = auth["identity"]["kind"] == "human"
+                    && roles.is_some_and(|r| r.iter().any(|r| r == "human_admin"));
+                let manager = roles.is_some_and(|r| r.iter().any(|r| r == "manager"));
+                if auth["identity_id"] != "owner" && !human && (grants || !manager) {
+                    return Err(error(
+                        "Denied",
+                        if grants {
+                            "human administrator required"
+                        } else {
+                            "trusted administrator required"
+                        },
+                    ));
                 }
                 f()
             },
@@ -333,9 +352,9 @@ impl LaunchPolicyStore {
         }
         // Admit the actor before disclosing worker validation results. Keep Engine
         // checks separate: authorization callbacks must not reenter Engine.
-        self.admin(actor, &binding, || Ok(()))?;
+        self.admin(actor, &binding, true, || Ok(()))?;
         self.worker(&binding, credential)?;
-        self.admin(actor, &binding, || {
+        self.admin(actor, &binding, true, || {
             let mut db = self.db()?;
             let tx = db
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -382,7 +401,24 @@ impl LaunchPolicyStore {
         }
         // Private slot existence and preflight results require current admission.
         // The final admin callback below still fences the actual mutation.
-        self.admin(actor, &plan.binding, || Ok(()))?;
+        self.admin(actor, &plan.binding, true, || Ok(()))?;
+        let (installed_by, installed_generation) = self.engine.with_endpoint_authorization(
+            actor,
+            &plan.binding.space_id,
+            &plan.binding.endpoint_id,
+            "manage",
+            |auth| {
+                let by = auth["identity_id"]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| error("Internal", "missing identity"))?;
+                // The owner's identity view has no generation: it is always 0.
+                Ok((
+                    by,
+                    auth["identity"]["trust_generation"].as_u64().unwrap_or(0),
+                ))
+            },
+        )?;
         let worker_credential = self.slot(&plan.worker_slot, &plan.binding)?;
         let executable = plan
             .executable
@@ -409,6 +445,8 @@ impl LaunchPolicyStore {
             capability_evidence: plan.capability_evidence,
             timeout_ms: plan.timeout.as_millis() as u64,
             profile: serde_json::to_value(plan.profile).map_err(internal)?,
+            installed_by: Some(installed_by),
+            installed_generation: Some(installed_generation),
         };
         self.restore_profile(&stored)?;
         let encoded = serde_json::to_string(&stored).map_err(internal)?;
@@ -418,7 +456,7 @@ impl LaunchPolicyStore {
                 "credential must not appear in public plan or argv",
             ));
         }
-        self.admin(actor, &stored.binding, || {
+        self.admin(actor, &stored.binding, true, || {
             let document = serde_json::to_string(&stored).map_err(internal)?;
             let mut db = self.db()?;
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(internal)?;
@@ -432,6 +470,9 @@ impl LaunchPolicyStore {
                     return Err(error("Denied", "plan target is immutable"));
                 }
             }
+            // An exact replay (same installer, same trust generation) is the same plan;
+            // once the installer's trust broke, the document differs and a new
+            // revision is required, so a dead plan is never reported as installed.
             let revision = match old {
                 None if expected_previous_revision.is_none() => 1,
                 Some((rev, false, ref doc)) if expected_previous_revision.is_none() && *doc == document => return Ok(rev),
@@ -522,6 +563,20 @@ impl LaunchPolicyStore {
                 "persisted plan constraints no longer hold",
             ));
         }
+        // The plan picked an executable; it counts only while the human who
+        // installed it would still be allowed to install it (K10).
+        let trusted = match (&p.installed_by, p.installed_generation) {
+            (Some(by), Some(generation)) => {
+                self.engine.launch_approver_trusted(by, space, generation)?
+            }
+            _ => false,
+        };
+        if !trusted {
+            return Err(error(
+                "Denied",
+                "the administrator who installed this launch plan is no longer trusted, or the plan predates installer records; a current human administrator must install it again with expected_previous_revision set to the current revision",
+            ));
+        }
         let credential = self.slot(&p.worker_slot, &p.binding)?;
         let profile = self.restore_profile(&p)?;
         if document.contains(&credential) {
@@ -593,7 +648,7 @@ impl LaunchPolicyStore {
             identity_id: String::new(),
             attachment_id: String::new(),
         };
-        self.admin(actor, &b, || {
+        self.admin(actor, &b, false, || {
             let db = self.db()?;
             let row: Option<String> = db.query_row("SELECT document FROM launch_plans WHERE space_id=?1 AND endpoint_id=?2 AND id=?3", params![space,endpoint,id], |r| r.get(0))
                 .optional().map_err(internal)?;

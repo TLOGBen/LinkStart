@@ -24,6 +24,71 @@ fn exec(e: &Engine, a: &str, s: Option<&str>, t: &str, args: Value) -> Value {
     )
     .unwrap()
 }
+#[test]
+fn only_humans_change_launch_plans_even_against_an_agent_manager() {
+    // K10: an agent may hold the manager role; launch plans choose executables.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path()).unwrap();
+    let owner = std::fs::read_to_string(owner_token_path(dir.path())).unwrap();
+    let space = exec(
+        &engine,
+        &owner,
+        None,
+        "spaces.create",
+        json!({"name":"k10"}),
+    );
+    let sid = space["space"]["id"].as_str().unwrap();
+    let admin = space["administrator"]["credential"].as_str().unwrap();
+    let ep = exec(
+        &engine,
+        admin,
+        Some(sid),
+        "endpoints.register",
+        json!({"name":"owned","kind":"terminal"}),
+    );
+    let mut members = Vec::new();
+    for roles in [json!(["manager"]), json!(["implementer"])] {
+        let invite = exec(
+            &engine,
+            admin,
+            Some(sid),
+            "members.invite",
+            json!({"roles":roles}),
+        );
+        members.push(exec(
+            &engine,
+            invite["invite_token"].as_str().unwrap(),
+            Some(sid),
+            "members.register",
+            json!({"name":"agent"}),
+        ));
+    }
+    let manager = members[0]["credential"].as_str().unwrap();
+    let worker = members[1]["credential"].as_str().unwrap();
+    exec(
+        &engine,
+        admin,
+        Some(sid),
+        "endpoints.grant",
+        json!({"endpoint_id":ep["id"],"member_id":members[1]["id"],"operations":["send","observe","control"]}),
+    );
+    let hb = exec(&engine, worker, Some(sid), "members.heartbeat", json!({}));
+    let binding = WorkerBinding {
+        space_id: sid.into(),
+        endpoint_id: ep["id"].as_str().unwrap().into(),
+        identity_id: members[1]["id"].as_str().unwrap().into(),
+        attachment_id: hb["attachment_id"].as_str().unwrap().into(),
+    };
+    let registry = OwnedCodexRegistry::open(dir.path(), engine.clone()).unwrap();
+    let plans = LaunchPolicyStore::open(dir.path(), engine.clone(), registry).unwrap();
+    let denied = plans
+        .provision_worker_slot(manager, "slot", binding.clone(), worker)
+        .unwrap_err();
+    assert_eq!(denied.code, "Denied", "{denied:?}");
+    plans
+        .provision_worker_slot(admin, "slot", binding, worker)
+        .unwrap();
+}
 struct Fixture {
     dir: tempfile::TempDir,
     engine: Engine,

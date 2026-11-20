@@ -1007,3 +1007,113 @@ fn actor_may_use_explicit_manage_without_becoming_installer() {
         "Denied"
     );
 }
+
+#[test]
+fn plan_stops_launching_once_its_installer_is_no_longer_trusted() {
+    // K10: a plan picked an executable; it counts only while its installer would
+    // still be allowed to install it.
+    let f = Fixture::new();
+    let owner = std::fs::read_to_string(owner_token_path(f.dir.path())).unwrap();
+    let sid = f.binding.space_id.clone();
+    f.provision();
+    f.store.install(&f.admin, "plan", None, f.plan()).unwrap();
+    assert!(f.approve(1).is_ok(), "a trusted installer's plan launches");
+    // A plan stored before installer records existed is not launchable.
+    let db = rusqlite::Connection::open(f.dir.path().join("v2-launch-policy.sqlite")).unwrap();
+    let document: String = db
+        .query_row(
+            "SELECT document FROM launch_plans WHERE id='plan'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut legacy: Value = serde_json::from_str(&document).unwrap();
+    legacy.as_object_mut().unwrap().remove("installed_by");
+    db.execute(
+        "UPDATE launch_plans SET document=?1 WHERE id='plan'",
+        [legacy.to_string()],
+    )
+    .unwrap();
+    let denied = f.approve(1).err().unwrap();
+    assert_eq!(denied.code, "Denied", "{denied:?}");
+    db.execute(
+        "UPDATE launch_plans SET document=?1 WHERE id='plan'",
+        [document],
+    )
+    .unwrap();
+    assert!(f.approve(1).is_ok());
+    // Revoking the installer ends the plan, even for the owner, and a new
+    // credential for the same person does not bring it back.
+    let me = call(&f.e, &f.admin, Some(&sid), "identity.current", json!({}));
+    call(
+        &f.e,
+        &owner,
+        Some(&sid),
+        "members.revoke_credential",
+        json!({"member_id":me["id"],"expected_epoch":0}),
+    );
+    let mut restored = String::new();
+    for stage in ["revoked", "rotated"] {
+        if stage == "rotated" {
+            let rotated = call(
+                &f.e,
+                &owner,
+                Some(&sid),
+                "members.rotate_credential",
+                json!({"member_id":me["id"],"expected_epoch":1}),
+            );
+            restored = rotated["credential"].as_str().unwrap().into();
+        }
+        let denied = f
+            .store
+            .approve(&owner, &sid, &f.binding.endpoint_id, "plan", 1)
+            .err()
+            .unwrap();
+        assert_eq!(denied.code, "Denied", "{stage}: {denied:?}");
+        assert!(
+            denied.message.contains("no longer trusted"),
+            "{stage}: {denied:?}"
+        );
+    }
+    // Replaying the same install is not reported as success for a dead plan...
+    let replay = f
+        .store
+        .install(&restored, "plan", None, f.plan())
+        .unwrap_err();
+    assert_eq!(replay.code, "Conflict", "{replay:?}");
+    // ...while reinstalling at the current revision makes it launchable again.
+    assert_eq!(
+        f.store
+            .install(&restored, "plan", Some(1), f.plan())
+            .unwrap(),
+        2
+    );
+    assert!(f
+        .store
+        .approve(&owner, &sid, &f.binding.endpoint_id, "plan", 2)
+        .is_ok());
+    // An agent manager cannot install, but may still take a plan down.
+    let invite = call(
+        &f.e,
+        &owner,
+        Some(&sid),
+        "members.invite",
+        json!({"roles":["manager"]}),
+    );
+    let manager = call(
+        &f.e,
+        invite["invite_token"].as_str().unwrap(),
+        Some(&sid),
+        "members.register",
+        json!({"name":"agent-manager"}),
+    );
+    let manager = manager["credential"].as_str().unwrap();
+    let refused = f
+        .store
+        .install(manager, "plan", Some(2), f.plan())
+        .unwrap_err();
+    assert_eq!(refused.code, "Denied", "{refused:?}");
+    f.store
+        .revoke(manager, &sid, &f.binding.endpoint_id, "plan", 2)
+        .unwrap();
+}
