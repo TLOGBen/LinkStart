@@ -75,6 +75,14 @@ class RuntimeHttp(unittest.TestCase):
                     self.assertEqual(control,{'stopped':True})
                     self.assertFalse((pathlib.Path(self.state_dir)/'daemon.json').exists())
 
+    def kill_if_alive(self,pid):
+        # Only the stubborn terminal this test started, if RED left it running.
+        if self.pid_alive(pid):
+            if os.name=='nt':subprocess.run(['taskkill','/F','/T','/PID',str(pid)],capture_output=True)
+            else:
+                try:os.kill(pid,9)
+                except ProcessLookupError:pass
+
     @staticmethod
     def pid_alive(pid):
         if os.name=='nt':
@@ -133,6 +141,38 @@ class RuntimeHttp(unittest.TestCase):
         self.child.wait(timeout=5)
         self.assertFalse(self.pid_alive(old))
         self.assertEqual(json.loads(checkpoint.read_text())['status'],'exited')
+
+    def test_cli_stop_names_force_shutdown_when_a_terminal_never_exits(self):
+        # K11: a terminal that ignores the graceful interrupt keeps shutdown pending;
+        # the stop error must name the `linkstart tool` + runtime.force_shutdown way out.
+        script="import signal,threading\nsignal.signal(signal.SIGINT,signal.SIG_IGN)\nprint('CLI_STUBBORN_READY',flush=True)\nthreading.Event().wait()\n"
+        token,sid,created=self.recorded_terminal('cli-stubborn',script)
+        eid=created['endpoint']['id']
+        self.addCleanup(self.kill_if_alive,created['session']['process_id'])
+        for _ in range(80):
+            status,view=self.post(dict(request_id=str(time.time_ns()),tool='terminal.observe',space_id=sid,args={'endpoint_id':eid,'cursor':0}),token)
+            if status==200 and 'CLI_STUBBORN_READY' in view['text']:break
+            time.sleep(.05)
+        self.assertIn('CLI_STUBBORN_READY',view['text'])
+        old=json.loads((pathlib.Path(self.state_dir)/'daemon.json').read_text())['pid']
+        result=self.cli_control('stop')
+        self.assertNotEqual(result.returncode,0,result.stdout)
+        error=json.loads(result.stdout)['error']
+        tokenfile=pathlib.Path(self.state_dir)/'v2-owner.token'
+        for hint in ['linkstart tool','"request_id"','runtime.prepare_shutdown','runtime.force_shutdown','"ticket"','draining','--state-dir "'+self.state_dir+'"','--credential-file "'+str(tokenfile)+'"']:
+            self.assertIn(hint,error)
+        self.assertNotIn(token.strip(),result.stdout+result.stderr)
+        self.assertTrue(self.pid_alive(old))
+        # The named way out works: prepare, then force with that ticket.
+        def tool(name,args):
+            run=subprocess.run([str(BIN),'tool','--state-dir',self.state_dir,'--credential-file',str(tokenfile)],input=json.dumps({'request_id':str(time.time_ns()),'tool':name,'args':args}),text=True,capture_output=True,timeout=10)
+            self.assertEqual(run.returncode,0,run.stderr)
+            return json.loads(run.stdout)
+        prepared=tool('runtime.prepare_shutdown',{})
+        forced=tool('runtime.force_shutdown',{'ticket':prepared['ticket']})
+        self.assertEqual(forced['status'],'stopping',forced)
+        self.child.wait(timeout=8)
+        self.assertFalse(self.pid_alive(created['session']['process_id']))
 
     def test_operation_receipt_http_and_cli_share_current_identity_scope(self):
         owner=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()
