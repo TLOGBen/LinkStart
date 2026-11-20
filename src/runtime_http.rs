@@ -270,9 +270,17 @@ async fn tools(
     }
     let token = token.to_string();
     let read = read_only(&request.tool);
+    let gate = state.gate.clone();
     match tokio::task::spawn_blocking(move || gated(&state, &token, &request)).await {
         Ok(reply) => reply,
-        Err(_) => panicked(read, "dispatch failed"),
+        Err(_) => {
+            // The interrupted call marked itself uncertain before any native effect
+            // and records receipts only after success, so the gate's state stays
+            // conservative: a same-ID retry answers UnknownEffect. Keep the runtime
+            // usable (and stoppable) instead of failing every later call.
+            gate.clear_poison();
+            panicked(read, "dispatch failed")
+        }
     }
 }
 fn read_only(tool: &str) -> bool {
@@ -440,11 +448,8 @@ async fn shutdown_tools(state: HttpState, actor: String, request: ToolRequest) -
             reply(Ok(value))
         }
         Ok(Err(e)) => reply(Err(e)),
-        Err(_) => failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal",
-            "shutdown cleanup failed",
-        ),
+        // Cleanup may already have stopped terminals or cancelled work.
+        Err(_) => panicked(false, "shutdown cleanup failed"),
     }
 }
 fn shutdown_cleanup(s: &HttpState, force: bool) -> Result<Value, crate::runtime_core::ApiError> {
