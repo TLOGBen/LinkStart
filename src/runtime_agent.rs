@@ -1950,7 +1950,7 @@ mod tests {
             .error
             .clone()
             .expect("interrupted worker must retain its original error evidence");
-        runner.recover(&token, &job, "recover-1").unwrap();
+        retry_busy(|| runner.recover(&token, &job, "recover-1")).unwrap();
         wait_for_worker(&runner);
         let completed = runner.get_scoped(&token, &job).unwrap();
         assert_eq!(completed.status, "completed", "{completed:?}");
@@ -1966,7 +1966,9 @@ mod tests {
         assert_eq!(completed.topic_ids[0], before.topic_ids[0]);
         assert_eq!(completed.recovery.attempt_id.as_deref(), Some("recover-1"));
         assert_eq!(
-            runner.recover(&token, &job, "recover-1").unwrap().topic_ids,
+            retry_busy(|| runner.recover(&token, &job, "recover-1"))
+                .unwrap()
+                .topic_ids,
             completed.topic_ids
         );
         assert_eq!(
@@ -2026,7 +2028,7 @@ mod tests {
             .execute_batch("DROP TRIGGER recovery_partial")
             .unwrap();
         runner.hooks.fail_spawn.store(true, Ordering::SeqCst);
-        runner.recover(&token, &job, "failed-attempt").unwrap();
+        retry_busy(|| runner.recover(&token, &job, "failed-attempt")).unwrap();
         wait_for_worker(&runner);
         let failed = runner.get(&token, &job.job_id).unwrap();
         runner.hooks.fail_spawn.store(false, Ordering::SeqCst);
@@ -2071,7 +2073,7 @@ mod tests {
             missing.recovery.reason.as_deref(),
             Some("missing_durable_plan")
         );
-        let replay = reopened.recover(&token, &job, "failed-attempt").unwrap();
+        let replay = retry_busy(|| reopened.recover(&token, &job, "failed-attempt")).unwrap();
         assert_eq!(
             replay.recovery.generation, failed.recovery.generation,
             "an old attempt cannot observe or relaunch a newer generation"
@@ -2408,7 +2410,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        let failed = runner.recover(&token, &job, "gate-attempt").unwrap();
+        let failed = retry_busy(|| runner.recover(&token, &job, "gate-attempt")).unwrap();
         assert_eq!(failed.status, "failed");
         assert_eq!(failed.topic_ids, first);
         runner
@@ -2515,14 +2517,13 @@ mod tests {
             }
             if fault == "claim" {
                 assert_eq!(
-                    runner
-                        .recover(&token, &job, "fault-attempt")
+                    retry_busy(|| runner.recover(&token, &job, "fault-attempt"))
                         .unwrap_err()
                         .code,
                     "Internal"
                 );
             } else {
-                runner.recover(&token, &job, "fault-attempt").unwrap();
+                retry_busy(|| runner.recover(&token, &job, "fault-attempt")).unwrap();
                 wait_for_worker(&runner);
             }
             let observed = runner.get(&token, &job.job_id).unwrap();
@@ -2592,7 +2593,16 @@ mod tests {
             process.clone(),
         )
         .unwrap();
-        let observed = reopened.get(&token, &job.job_id).unwrap();
+        // get() reconciles only when it can take the job lock (HUNT-2026-005:
+        // briefly shared with another test's forked child); re-read for up to 2s.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let observed = loop {
+            let observed = reopened.get(&token, &job.job_id).unwrap();
+            if observed.topic_ids == committed || std::time::Instant::now() >= deadline {
+                break observed;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
         assert_eq!(
             observed.topic_ids, committed,
             "fresh reader must recover committed receipt evidence without creating children"
@@ -2951,6 +2961,21 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(runner.active_count(), 0, "accepted worker must exit");
+    }
+    // HUNT-2026-005 (same cause as HUNT-2026-004): a child forked by another
+    // test's thread shares a just-released job lock until its exec (~1ms), so a
+    // recovery right after may see RecoveryBusy, which callers are told to retry.
+    // A lock still busy after 2s is the defect these tests guard.
+    fn retry_busy<T>(mut call: impl FnMut() -> Result<T, ApiError>) -> Result<T, ApiError> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match call() {
+                Err(e) if e.code == "RecoveryBusy" && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                other => return other,
+            }
+        }
     }
 
     #[test]
@@ -3311,7 +3336,7 @@ mod tests {
                         .execute_batch("DROP TRIGGER reject_delivery_publication")
                         .unwrap();
                     runner.hooks.fail_spawn.store(true, Ordering::SeqCst);
-                    runner.recover(&token, &job, "delivery-recover").unwrap();
+                    retry_busy(|| runner.recover(&token, &job, "delivery-recover")).unwrap();
                     runner.hooks.fail_spawn.store(false, Ordering::SeqCst);
                     runner.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_delivery_publication BEFORE UPDATE ON agent_jobs WHEN json_array_length(json_extract(NEW.record,'$.topic_ids')) > 0 BEGIN SELECT RAISE(FAIL,'delivery publication failure'); END;").unwrap();
                     let mut record = runner.durable_record(&job.job_id).unwrap();

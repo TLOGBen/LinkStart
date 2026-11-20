@@ -15,7 +15,7 @@
 
 ## 下一步
 
-A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已知問題」：K8（`--address` 身分驗證）優先，其次 K10、K2。
+A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已知問題」：K8 已在 #24 修正，接下來是 K10，其次 K2。
 
 ## 驗收項目
 
@@ -42,6 +42,8 @@ A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已�
 | #17 | feature/a4-launch-setup | 已合併 `14039e7` | RED → GREEN；review 找到 1 項 med（前綴規則誤刪使用者設定），已改成明確清單；合進 main 之後兩個平台重跑；CI 三平台綠 |
 | #18 | feature/a5-restart-recovery | 已合併 `482a930` | K3／K9；review 找到 1 項 med（panic 把鎖毒死，連 stop 都停不掉），已修（`16b03a1`）；HUNT-2026-004 測試修正；CI 三平台綠 |
 | #22 | feature/a8-fixes | 已合併 `a1e5588` | A8 審查的 M1（Engine 鎖中毒後無法停止）與 M2（刪掉使用者的 OAuth token）；關閉中仍可撤銷憑證 |
+| #23 | docs/goal-complete | 已合併 `8407af1` | 帳本：A1–A8 全部達成 |
+| #24 | fix/k8-address-auth | 審查中 | K8：`--address` 先驗證 Runtime 身分再送憑證；HUNT-2026-005 測試修正 |
 
 ## 已知問題
 
@@ -51,7 +53,6 @@ A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已�
 - **K5**（#14 review）：加鎖前的空窗期如果寫入了較新的 in-memory fallback，恢復流程只合併加鎖前讀到的舊版本，最新的私有錯誤紀錄會遺失（`runtime_agent.rs`）。
 - **K6**（假說 storage-init）：`protect_if_present` 在「刪除中」時依賴約 1 秒內完成；可以改成刪除中就跳過，移除這個時間前提。其他資料庫的 `protect` 用的也是「先檢查存在再設 ACL」的寫法。
 - **K7**（假說的第二份推導）：其他程序的 SQLite 寫入交易如果超過 `busy_timeout` 的 10 秒，`Engine::open` 會以 `SQLITE_BUSY` 失敗。
-- **K8**（`--address`，中高嚴重度）：不驗證 Runtime 身分。舊的 port 如果被其他本機程序佔走，成員憑證會被送過去。建議在送出憑證前，讓伺服器先證明它知道這個憑證（nonce＋HMAC）。在這之前，不要讓 agent 拿真正的憑證使用 `--address`。
 - **K10**（#17 review）：核准紀錄不會重新檢查核准人；核准人之後被撤權，agent 仍然可以重啟該終端。另外，核准一個 shell（例如 `pwsh.exe`）就等於讓有 send 權限的 agent 能在裡面執行任何指令。`LaunchPolicyStore::admin()` 接受 agent 的 manager 角色，目前沒有對外開放；將來若要開放 install，必須改成只允許人類。
 - **K11**（#18 review）：`daemon stop` 遇到一直不退出的終端時只會回 pending，需要改用 `linkstart tool` 送 `runtime.force_shutdown`，錯誤訊息沒有提示這條路。（Engine 鎖中毒的部分已在 #22 修正。）
 - **K13**（A8 review）：環境變數過濾只套用在 PTY 終端；owned Codex host（`runtime_codex_host.rs`）和 `gh`（`runtime_source.rs`）仍繼承全部環境變數。
@@ -61,7 +62,13 @@ A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已�
 - **K12**（觀察）：`tests/owned_supervisor.rs` 的 `running()` 5 秒期限在人為高負載下（同時跑 4 份壓力測試）會 17/25 失敗，空閒時 25/25 通過。和 HUNT-2026-003 同一類；正常負載下若出現再開案。
 - **K17**（A8 第二輪 L1）：`gated` panic 之後清掉中毒標記，但沒有遞增 impact epoch。如果 owner 已經拿到 shutdown ticket，而 panic 的 `terminal.create` 已經 spawn 了程序，舊 ticket 仍然有效，確認時看到的影響清單會少這個程序；不過 cleanup 仍會把它結束。建議在 `clear_poison` 之後鎖一次 gate、做 `epoch += 1`。
 - **K18**（A8 第二輪 L2）：shutdown admission 的 closure 直接取 gate，在裡面 panic 時不會 `clear_poison`，gate 會一直中毒，v1／v2 health 的回報也不一致。程式碼很短，觸發機率極低。A5 寫的「dispatch 鎖中毒後會恢復」不涵蓋這條路徑。
-- 已修：K3（#18）、K9（#18）；A8 審查的 M1、M2 和「關閉中無法撤權」（#22）。
+- **K19**（#24 審查，low）：`--address` 的 Runtime 證明有幾個殘餘限制。
+  - 證明沒有綁住之後的 TCP 通道。同一使用者的程式若在 Windows 上用 SO_REUSEADDR 和真 Runtime 共用同一個 port，仍可能截走連線；不過同一使用者本來就讀得到私有狀態目錄。
+  - 持有 `credential_hash` 就能替該憑證偽造證明。目前 API 不輸出它，但不能讓它出現在 log 或備份裡。
+  - `/v2/prove` 對知道 key_id 的人透露該憑證是否仍有效。
+  - 伺服器只綁 `127.0.0.1`，client 用 `[::1]` 或 `127.0.0.2` 一律證明失敗，錯誤訊息不會指出這點。
+- **K20**（HUNT-2026-005 另立案）：`runtime_terminal::tests::slow_observer_gets_gap_while_other_terminal_stays_responsive`（`runtime_terminal.rs:956`）在 Linux 4 份並行壓力下約 1/100 失敗，序列模式也一樣，和負載有關，屬於 K12 同類。
+- 已修：K3（#18）、K9（#18）；A8 審查的 M1、M2 和「關閉中無法撤權」（#22）；K8（#24：`--address` 送憑證前，Runtime 先用 HMAC 證明它知道這個憑證，證明綁定它自己的位址）。
 
 ## 紀錄
 
@@ -73,3 +80,4 @@ A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已�
 - 2026-11-20：Claude 上一輪在合併完 #15 後停下來問使用者要不要繼續，使用者不在，空轉了 14 小時。之後改為一路做到目標完成。
 - 2026-11-20：A3（#16）、A4（#17）合併；A5（#18）完成審查修正；A6 在 TLOGBen/LinkStart 上走完一次完整迴圈；A7 的 65 分鐘閒置開始跑。`/baransu:hunt` HUNT-2026-004：`runtime_agent` 的鎖在 drop 後仍被別的執行緒 fork 出的子程序短暫握住（約 1ms），已修正測試。
 - 2026-11-20：A8 第二輪審查在 `a1e5588` 通過（#22 合併）。電腦意外關機中斷了 `a1e5588` 的 A7，重跑後閒置 3,930 秒、同一 Session 4.1 秒回答。A1–A8 全部達成。
+- 2026-11-20：K8（#24）：舊版 binary 會把憑證送給冒充者（新測試在 `a1e5588` 上失敗）。修正後，自己回應、原封轉送、改寫 Host 轉送這三種冒充者都拿不到憑證。`/baransu:hunt` HUNT-2026-005：Linux 並行下 `runtime_agent` 恢復測試 3/100 失敗，序列模式 0/100，和 HUNT-2026-004 同因；修正後並行 0/100。
