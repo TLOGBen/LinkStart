@@ -411,8 +411,10 @@ impl TerminalManager {
             c.args(args);
             c
         };
+        let hosted = std::env::var_os("CLAUDECODE").is_some()
+            || std::env::var_os("CLAUDE_CODE_ENTRYPOINT").is_some();
         for (key, _) in std::env::vars_os() {
-            if key.to_str().is_some_and(host_agent_marker) {
+            if key.to_str().is_some_and(|k| host_agent_marker(k, hosted)) {
                 cmd.env_remove(key);
             }
         }
@@ -763,7 +765,11 @@ impl Drop for Session {
 /// would reach every program a member launches. User configuration (for example
 /// API endpoints, provider selection, client certificates, `SKIP_*_AUTH`) is
 /// left alone, so this is an explicit list, not a prefix rule.
-fn host_agent_marker(key: &str) -> bool {
+///
+/// `CLAUDE_CODE_OAUTH_TOKEN` is ambiguous: a host injects it, but it is also how
+/// a user authenticates a headless Claude Code. It is removed only when `hosted`
+/// (the daemon itself runs inside an agent host session).
+fn host_agent_marker(key: &str, hosted: bool) -> bool {
     const EXACT: &[&str] = &[
         "CLAUDECODE",
         "CLAUDE_PID",
@@ -790,17 +796,30 @@ fn host_agent_marker(key: &str) -> bool {
         "CLAUDE_CODE_SESSION_",
         "CLAUDE_CODE_HOST_",
         "CLAUDE_CODE_MESSAGING_",
-        "CLAUDE_CODE_OAUTH_",
         "CLAUDE_CODE_SDK_",
         "CLAUDE_CODE_EMIT_",
     ];
     let key = key.to_ascii_uppercase();
-    EXACT.contains(&key.as_str()) || PREFIX.iter().any(|p| key.starts_with(p))
+    EXACT.contains(&key.as_str())
+        || PREFIX.iter().any(|p| key.starts_with(p))
+        || (key == "CLAUDE_CODE_OAUTH_SCOPES")
+        || (hosted && key == "CLAUDE_CODE_OAUTH_TOKEN")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn headless_user_oauth_token_survives_unless_daemon_is_hosted() {
+        // A user's own headless login must reach the CLI they launch.
+        assert!(!host_agent_marker("CLAUDE_CODE_OAUTH_TOKEN", false));
+        assert!(!host_agent_marker("claude_code_oauth_token", false));
+        // Inside an agent host the same name carries the host's session token.
+        assert!(host_agent_marker("CLAUDE_CODE_OAUTH_TOKEN", true));
+        assert!(host_agent_marker("CLAUDE_CODE_OAUTH_SCOPES", false));
+        assert!(!host_agent_marker("CLAUDE_CODE_SKIP_BEDROCK_AUTH", true));
+        assert!(!host_agent_marker("CLAUDE_CODE_CLIENT_CERT", true));
+    }
     #[test]
     fn child_does_not_inherit_host_agent_session_markers() {
         // Only names no other test reads; user configuration must survive.

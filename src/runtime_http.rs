@@ -364,7 +364,9 @@ fn gated(state: &HttpState, token: &str, request: &ToolRequest) -> Reply {
         && !request.tool.starts_with("runtime.")
         && !matches!(
             request.tool.as_str(),
-            "terminal.stop" | "terminal.force" | "terminal.release"
+            // Revoking a credential only removes authority, so it stays possible
+            // while a stuck shutdown keeps the runtime draining.
+            "terminal.stop" | "terminal.force" | "terminal.release" | "members.revoke_credential"
         )
     {
         return failure(
