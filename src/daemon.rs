@@ -324,6 +324,20 @@ pub(crate) fn stop_daemon(state_dir: &FsPath) -> Result<bool> {
             .context("runtime shutdown returned no ticket; inspect before retry")?;
         let confirmed = call("runtime.confirm_shutdown", json!({"ticket":ticket}))?;
         if confirmed["status"] != "stopping" || confirmed["history"] != "durable" {
+            // Graceful stop only interrupts terminals; one that ignores the
+            // interrupt keeps shutdown pending until the owner forces it.
+            let stuck = confirmed["remaining"].as_array().map_or(0, Vec::len);
+            // Force only kills terminals; other owned work would keep it pending.
+            let owned = &confirmed["owned_sessions"];
+            let only_terminals = owned["active_workers"].as_u64() == Some(0)
+                && owned["launch_reservations"].as_u64() == Some(0);
+            if confirmed["status"] == "pending" && stuck > 0 && only_terminals {
+                bail!(
+                    "runtime shutdown pending: {stuck} terminal(s) did not exit after interrupt; effects may already exist and the runtime is now draining; daemon was not replaced; to force-stop them, pipe {{\"request_id\":\"<new id>\",\"tool\":\"runtime.prepare_shutdown\",\"args\":{{}}}} and then {{\"request_id\":\"<new id>\",\"tool\":\"runtime.force_shutdown\",\"args\":{{\"ticket\":\"<ticket from prepare>\"}}}} into `linkstart tool --state-dir \"{}\" --credential-file \"{}\"`, then start the daemon again",
+                    state_dir.display(),
+                    linkstart::runtime_core::owner_token_path(state_dir).display()
+                )
+            }
             bail!("runtime shutdown pending or unconfirmed; effects may already exist; daemon was not replaced; inspect before retry")
         }
     }
