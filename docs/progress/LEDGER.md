@@ -43,7 +43,7 @@ A1–A8 全部達成（最終 SHA `a1e5588`）。之後的工作是處理「已�
 | #18 | feature/a5-restart-recovery | 已合併 `482a930` | K3／K9；review 找到 1 項 med（panic 把鎖毒死，連 stop 都停不掉），已修（`16b03a1`）；HUNT-2026-004 測試修正；CI 三平台綠 |
 | #22 | feature/a8-fixes | 已合併 `a1e5588` | A8 審查的 M1（Engine 鎖中毒後無法停止）與 M2（刪掉使用者的 OAuth token）；關閉中仍可撤銷憑證 |
 | #23 | docs/goal-complete | 已合併 `8407af1` | 帳本：A1–A8 全部達成 |
-| #24 | fix/k8-address-auth | 審查中 | K8：`--address` 先驗證 Runtime 身分再送憑證；HUNT-2026-005 測試修正 |
+| #24 | fix/k8-address-auth | 已合併 | K8：`--address` 先驗證 Runtime 身分再送憑證；HUNT-2026-005 測試修正 |
 
 ## 已知問題
 
