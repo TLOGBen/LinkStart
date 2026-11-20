@@ -26,6 +26,8 @@ pub(crate) struct AppState {
     store: Store,
     host: String,
     instance_id: String,
+    // Shared with the v2 runtime: true once shutdown is admitted.
+    draining: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Deserialize)]
@@ -163,13 +165,19 @@ pub(crate) async fn serve(a: StartArgs) -> Result<()> {
         if let Some(bytes) = owner.read()? {
             let record: DaemonRecord =
                 serde_json::from_slice(&bytes).context("invalid daemon discovery record")?;
-            if let crate::runtime_identity::Inspection::Reusable(_) = crate::runtime_identity::inspect(&record)? {
-                output(
-                    a.state.json,
-                    json!({"reused":true,"version":VERSION,"protocolMajor":PROTOCOL}),
-                    "相容 daemon 已在執行，安全重用",
-                );
-                return Ok(None);
+            match crate::runtime_identity::inspect(&record)? {
+                crate::runtime_identity::Inspection::Reusable(_) => {
+                    output(
+                        a.state.json,
+                        json!({"reused":true,"version":VERSION,"protocolMajor":PROTOCOL}),
+                        "相容 daemon 已在執行，安全重用",
+                    );
+                    return Ok(None);
+                }
+                crate::runtime_identity::Inspection::Draining(_) => anyhow::bail!(
+                    "runtime_draining: the recorded Runtime is shutting down; wait for it to exit or run daemon stop"
+                ),
+                crate::runtime_identity::Inspection::Stale => {}
             }
         }
         let addr: SocketAddr = format!("{}:{}", a.host, a.port).parse()?;
@@ -179,8 +187,9 @@ pub(crate) async fn serve(a: StartArgs) -> Result<()> {
         listener.set_nonblocking(true)?;
         let host = listener.local_addr()?.to_string();
         let store = Store::open(&a.state.state_dir)?;
-        let state = AppState { store, host, instance_id: Uuid::new_v4().to_string() };
-        let (v2, shutdown) = linkstart::runtime_http::router(&a.state.state_dir, &state.host)?;
+        let (v2, shutdown, draining) =
+            linkstart::runtime_http::router_with_draining(&a.state.state_dir, &host)?;
+        let state = AppState { store, host, instance_id: Uuid::new_v4().to_string(), draining };
         owner.publish(&serde_json::to_vec(
             &json!({"address":state.host,"pid":std::process::id(),"version":VERSION,"protocolMajor":PROTOCOL,"instanceId":state.instance_id}),
         )?)?;
@@ -248,7 +257,7 @@ pub(crate) async fn serve(a: StartArgs) -> Result<()> {
 }
 pub(crate) async fn health(State(s): State<AppState>) -> Json<Value> {
     Json(
-        json!({"version":VERSION,"protocolMajor":PROTOCOL,"status":"ready","pid":std::process::id(),"address":s.host,"instanceId":s.instance_id}),
+        json!({"version":VERSION,"protocolMajor":PROTOCOL,"status":if s.draining.load(std::sync::atomic::Ordering::SeqCst){"draining"}else{"ready"},"pid":std::process::id(),"address":s.host,"instanceId":s.instance_id}),
     )
 }
 pub(crate) async fn cors(

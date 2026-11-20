@@ -1847,8 +1847,22 @@ mod tests {
         assert_eq!(alias.run(&token, &job).unwrap_err().code, "RecoveryBusy");
         assert_eq!(process.calls.load(Ordering::SeqCst), 0);
         drop(held);
+        // HUNT-2026-004: flock belongs to the open file description, which a child
+        // forked by another thread (other tests spawn processes) shares until its
+        // exec closes it. Busy for ~1ms after drop is legitimate; a lock file that
+        // stays busy with no live holder is the defect this test guards.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let freed = loop {
+            if let Some(file) = alias.try_ownership(&job.job_id).unwrap() {
+                break Some(file);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         assert!(
-            alias.try_ownership(&job.job_id).unwrap().is_some(),
+            freed.is_some(),
             "existing lock file is not evidence of live ownership"
         );
     }
