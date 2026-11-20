@@ -482,17 +482,13 @@ impl OwnedCodexRegistry {
         };
         for suffix in ["", "-wal", "-shm"] {
             let p = me.dir.join(format!("v2-codex-host.sqlite{suffix}"));
-            if p.exists() {
-                crate::runtime_core::protect(&p)?;
-            }
+            crate::runtime_core::protect_if_present(&p)?;
         }
         let db = me.db()?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS owned_threads(thread TEXT PRIMARY KEY,scope TEXT NOT NULL,model TEXT NOT NULL,workspace TEXT NOT NULL,profile TEXT NOT NULL); CREATE TABLE IF NOT EXISTS host_generations(session TEXT PRIMARY KEY,generation INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS host_operations(id TEXT PRIMARY KEY,thread TEXT NOT NULL,state TEXT NOT NULL,turn TEXT);")?;
         for suffix in ["", "-wal", "-shm"] {
             let p = me.dir.join(format!("v2-codex-host.sqlite{suffix}"));
-            if p.exists() {
-                crate::runtime_core::protect(&p)?;
-            }
+            crate::runtime_core::protect_in_use(&p)?;
         }
         Ok(me)
     }

@@ -565,6 +565,10 @@ impl AgentRunner {
             self.try_ownership(&request.job_id)?
                 .ok_or_else(|| fail("RecoveryBusy", "job has an active executor"))?,
         );
+        // Every fallback write happens under job ownership, so a fallback published
+        // between the admission read above and taking ownership is only visible now.
+        let original = self.record(&request.job_id)?;
+        self.check_intent(&original, request, &who)?;
         let mut record = {
             let mut db = self.db.lock().map_err(internal)?;
             let tx = db
@@ -2298,6 +2302,55 @@ mod tests {
         let attempt: JobRecord = serde_json::from_str(&encoded).unwrap();
         assert_eq!(attempt.prior_errors, before.prior_errors);
         assert!(attempt.error.is_none());
+    }
+
+    #[test]
+    fn recovery_merges_a_fallback_published_after_admission_read_but_before_ownership() {
+        let (dir, engine, _owner, _admin, token, ids) = setup();
+        let (sid, mission) = ids.split_once('|').unwrap();
+        let process = two_task_process();
+        let runner = AgentRunner::open(dir.path(), engine, process.clone()).unwrap();
+        runner.db.lock().unwrap().execute_batch("CREATE TRIGGER k5_partial BEFORE UPDATE ON agent_jobs WHEN json_array_length(json_extract(NEW.record,'$.topic_ids')) > 0 BEGIN SELECT RAISE(FAIL,'k5 publication fault'); END;").unwrap();
+        let job = JobRequest {
+            job_id: "k5-late-fallback".into(),
+            space_id: sid.into(),
+            mission_topic_id: mission.into(),
+        };
+        runner.start(&token, &job).unwrap();
+        wait_for_worker(&runner);
+        let first = runner.unpublished(&job.job_id).unwrap();
+        let first_error = first.error.clone().expect("fixture needs a fallback error");
+        // recover() reads `first` here, then pauses before taking ownership.
+        let (arrived, release) = pause_event(&runner, "recovery_before_ownership", 1);
+        let recovering = runner.clone();
+        let (recover_token, recover_job) = (token.clone(), job.clone());
+        let recovery = std::thread::spawn(move || {
+            recovering.recover(&recover_token, &recover_job, "k5-attempt")
+        });
+        arrived.recv_timeout(Duration::from_secs(5)).unwrap();
+        // A same-generation writer publishes a newer fallback in the window (the
+        // trigger still fails the durable write, so only memory holds it).
+        let mut late = first.clone();
+        runner.settle_error(&mut late, &fail("Internal", "k5 late private outcome"));
+        let newer = runner.unpublished(&job.job_id).unwrap();
+        let newer_error = newer.error.clone().unwrap();
+        assert_ne!(newer_error, first_error);
+        assert!(newer_error.contains("k5 late private outcome"));
+        runner
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER k5_partial")
+            .unwrap();
+        release.send(()).unwrap();
+        recovery.join().unwrap().unwrap();
+        wait_for_worker(&runner);
+        let durable = runner.durable_record(&job.job_id).unwrap();
+        assert!(
+            durable.prior_errors.contains(&newer_error),
+            "the newest fallback error must survive recovery: {:?}",
+            durable.prior_errors
+        );
     }
 
     #[test]

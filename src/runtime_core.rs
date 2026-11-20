@@ -1,5 +1,5 @@
 //! Durable v2 application commands. All read/write authorization happens at dispatch.
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -205,6 +205,42 @@ mod storage_acl {
         fn GetCurrentProcess() -> *mut c_void;
         fn CloseHandle(handle: *mut c_void) -> i32;
         fn LocalFree(mem: *mut c_void) -> *mut c_void;
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut c_void,
+            disposition: u32,
+            flags: u32,
+            template: *mut c_void,
+        ) -> *mut c_void;
+    }
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn RtlGetLastNtStatus() -> i32;
+    }
+    const STATUS_DELETE_PENDING: u32 = 0xC000_0056;
+    /// Whether `path` names a file whose delete has been requested but not yet
+    /// finished. Win32 reports that state as plain ERROR_ACCESS_DENIED, so only
+    /// the thread's last NTSTATUS tells it apart from a real denial.
+    pub fn delete_pending(path: &Path) -> bool {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        unsafe {
+            let handle = CreateFileW(
+                wide.as_ptr(),
+                0,
+                0x7, // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                ptr::null_mut(),
+                3,           // OPEN_EXISTING
+                0x0200_0000, // FILE_FLAG_BACKUP_SEMANTICS
+                ptr::null_mut(),
+            );
+            if handle as isize == -1 {
+                return RtlGetLastNtStatus() as u32 == STATUS_DELETE_PENDING;
+            }
+            CloseHandle(handle);
+            false
+        }
     }
     fn last_error(what: &str) -> String {
         format!("{what}: {}", std::io::Error::last_os_error())
@@ -334,21 +370,91 @@ mod storage_acl {
         Ok(())
     }
 }
-// A previous process's SQLite close can delete -wal/-shm after this process takes
-// the init lock. A file that vanishes (or is mid-delete) needs no protection.
-fn protect_if_present(path: &Path) -> anyhow::Result<()> {
-    for attempt in 0..50 {
-        if !path.exists() {
-            return Ok(());
+// Another connection's SQLite close can delete -wal/-shm (or a journal) at any
+// moment, including between an existence check and setting the ACL. A file that
+// is gone, or delete-pending (no new handle can open it), needs no protection,
+// so this skips both instead of waiting for the delete to finish.
+pub(crate) fn protect_if_present(path: &Path) -> anyhow::Result<()> {
+    match protect(path) {
+        Ok(()) => Ok(()),
+        Err(_) if vanishing(path) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+// For a store this process now holds open: no SQLite close can delete its files,
+// so only absence is skipped. A delete-pending file here is not ours to trust
+// (its delete could be cancelled by whoever holds it), so it fails closed.
+pub(crate) fn protect_in_use(path: &Path) -> anyhow::Result<()> {
+    match protect(path) {
+        Ok(()) => Ok(()),
+        Err(_) if absent(path) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+fn absent(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+fn vanishing(path: &Path) -> bool {
+    if absent(path) {
+        return true;
+    }
+    #[cfg(windows)]
+    return storage_acl::delete_pending(path);
+    #[cfg(not(windows))]
+    false
+}
+fn initialize_schema(db: &mut Connection) -> anyhow::Result<()> {
+    db.execute_batch("PRAGMA synchronous=FULL;")?;
+    let mode: String = db.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        db.execute_batch("PRAGMA journal_mode=WAL;")?;
+    }
+    let ready: bool = db.query_row(
+        "SELECT count(*)=2 FROM sqlite_master WHERE type='table' AND name IN ('core_state','core_attachments')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !ready {
+        db.execute_batch("CREATE TABLE IF NOT EXISTS core_state (id INTEGER PRIMARY KEY CHECK(id=1), json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS core_attachments(id TEXT PRIMARY KEY,space_id TEXT NOT NULL,identity_id TEXT NOT NULL,last_seen INTEGER NOT NULL);")?;
+    }
+    let read = |db: &Connection| {
+        db.query_row("SELECT json FROM core_state WHERE id=1", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+    };
+    let legacy = match read(db)? {
+        Some(json) => json,
+        None => {
+            db.execute(
+                "INSERT OR IGNORE INTO core_state(id,json) VALUES(1,?1)",
+                [serde_json::to_string(&State::default())?],
+            )?;
+            read(db)?.ok_or_else(|| anyhow::anyhow!("core_state row missing after insert"))?
         }
-        match protect(path) {
-            Ok(()) => return Ok(()),
-            Err(_) if !path.exists() => return Ok(()),
-            Err(e) if attempt == 49 => return Err(e),
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+    };
+    let legacy: State = serde_json::from_str(&legacy)?;
+    if !legacy.attachments.is_empty() {
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for a in legacy.attachments {
+            tx.execute("INSERT OR IGNORE INTO core_attachments(id,space_id,identity_id,last_seen) VALUES(?1,?2,?3,?4)",rusqlite::params![a["id"].as_str().unwrap_or(""),a["space_id"].as_str().unwrap_or(""),a["identity_id"].as_str().unwrap_or(""),a["last_seen"].as_u64().unwrap_or(0)])?;
         }
+        tx.commit()?;
     }
     Ok(())
+}
+fn storage_busy(error: anyhow::Error) -> anyhow::Error {
+    let busy = error.downcast_ref::<rusqlite::Error>().is_some_and(|e| {
+        matches!(
+            e.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        )
+    });
+    if busy {
+        error.context("StorageBusy: another connection held a lock on v2.sqlite3 for over 10 s while this open had to initialize or migrate it; retry once that writer finishes")
+    } else {
+        error
+    }
 }
 // Only an absent DB permits recovery of an interrupted first initialization.
 // A missing/corrupt token beside any existing DB must never rotate its credentials.
@@ -704,9 +810,7 @@ impl Engine {
         protect(dir)?;
         // An OS lock releases on process death; keep it through token AND DB initialization.
         let lock_path = dir.join("v2-initialize.lock");
-        if lock_path.exists() {
-            protect(&lock_path)?;
-        }
+        protect_if_present(&lock_path)?;
         let initialize_lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -721,21 +825,16 @@ impl Engine {
         let secret = initialize_owner_token(dir)?;
         let mut db = Connection::open(dir.join("v2.sqlite3"))?;
         db.busy_timeout(std::time::Duration::from_secs(10))?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS core_state (id INTEGER PRIMARY KEY CHECK(id=1), json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS core_attachments(id TEXT PRIMARY KEY,space_id TEXT NOT NULL,identity_id TEXT NOT NULL,last_seen INTEGER NOT NULL);")?;
-        db.execute(
-            "INSERT OR IGNORE INTO core_state(id,json) VALUES(1,?1)",
-            [serde_json::to_string(&State::default())?],
-        )?;
-        let legacy: String = db.query_row("SELECT json FROM core_state WHERE id=1", [], |row| {
-            row.get(0)
-        })?;
-        let legacy: State = serde_json::from_str(&legacy)?;
-        if !legacy.attachments.is_empty() {
-            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            for a in legacy.attachments {
-                tx.execute("INSERT OR IGNORE INTO core_attachments(id,space_id,identity_id,last_seen) VALUES(?1,?2,?3,?4)",rusqlite::params![a["id"].as_str().unwrap_or(""),a["space_id"].as_str().unwrap_or(""),a["identity_id"].as_str().unwrap_or(""),a["last_seen"].as_u64().unwrap_or(0)])?;
-            }
-            tx.commit()?;
+        // Other processes may hold a write transaction for any length of time. In
+        // WAL mode reads never wait on a writer, so opening an initialized store
+        // only reads. Only first initialization, or a legacy store whose core_state
+        // still carries attachments, writes; that bounded wait ends in a named,
+        // retryable StorageBusy error.
+        initialize_schema(&mut db).map_err(storage_busy)?;
+        // The pre-open pass may have skipped a delete-pending file; the files this
+        // connection now uses are checked again and must pass.
+        for name in ["v2.sqlite3", "v2.sqlite3-wal", "v2.sqlite3-shm"] {
+            protect_in_use(&dir.join(name))?;
         }
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner { db, secret })),
@@ -2208,6 +2307,93 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         std::fs::write(&file, "still writable by owner").unwrap();
+    }
+    #[test]
+    #[cfg(windows)]
+    fn protect_if_present_skips_a_delete_pending_file_without_waiting_for_it() {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetFileInformationByHandle(
+                file: *mut std::ffi::c_void,
+                class: u32,
+                info: *const u8,
+                len: u32,
+            ) -> i32;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("v2.sqlite3-wal");
+        std::fs::write(&wal, "wal").unwrap();
+        // Classic (non-POSIX) delete disposition: the name stays until this
+        // handle closes, as when SQLite deletes -wal while another handle is open.
+        let holder = std::fs::OpenOptions::new()
+            .access_mode(0x0001_0000) // DELETE
+            .share_mode(0x7)
+            .open(&wal)
+            .unwrap();
+        let delete = [1u8]; // FILE_DISPOSITION_INFO { DeleteFile: TRUE }
+        let set =
+            unsafe { SetFileInformationByHandle(holder.as_raw_handle(), 4, delete.as_ptr(), 1) };
+        assert_ne!(set, 0, "{}", std::io::Error::last_os_error());
+        assert!(wal.exists(), "fixture must be delete-pending, not gone");
+        assert!(
+            protect(&wal).is_err(),
+            "a delete-pending file refuses opens"
+        );
+        // Must not depend on how long the delete stays pending.
+        protect_if_present(&wal).unwrap();
+        // Its delete can be cancelled by the holder, so once the store is open
+        // and using its files, a delete-pending one fails closed.
+        assert!(protect_in_use(&wal).is_err());
+        // A file that is present and not being deleted is still protected.
+        let token = dir.path().join("v2.sqlite3-shm");
+        std::fs::write(&token, "shm").unwrap();
+        protect_if_present(&token).unwrap();
+        drop(holder);
+        assert!(!wal.exists());
+        protect_if_present(&wal).unwrap();
+        protect_in_use(&wal).unwrap();
+    }
+    #[test]
+    fn open_never_waits_on_another_writer_once_storage_is_initialized() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Engine::open(dir.path()).unwrap());
+        let mut other = Connection::open(dir.path().join("v2.sqlite3")).unwrap();
+        let held = other
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        held.execute("UPDATE core_state SET json=json WHERE id=1", [])
+            .unwrap();
+        let started = std::time::Instant::now();
+        let reopened = Engine::open(dir.path());
+        let waited = started.elapsed();
+        held.rollback().unwrap();
+        reopened.expect("an initialized store must open while another process writes");
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "open waited {waited:?} on another writer"
+        );
+    }
+    #[test]
+    fn open_that_must_write_reports_a_retryable_busy_store() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Engine::open(dir.path()).unwrap());
+        let mut other = Connection::open(dir.path().join("v2.sqlite3")).unwrap();
+        other.execute("DELETE FROM core_state", []).unwrap();
+        let held = other
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        held.execute("DELETE FROM core_attachments", []).unwrap();
+        let error = Engine::open(dir.path())
+            .err()
+            .expect("initialization needs the write lock")
+            .to_string();
+        held.rollback().unwrap();
+        assert!(
+            error.contains("StorageBusy") && error.contains("v2.sqlite3"),
+            "{error}"
+        );
+        Engine::open(dir.path()).expect("retry succeeds once the writer is gone");
     }
     #[test]
     fn session_maintainer_cannot_mint_github_authority() {

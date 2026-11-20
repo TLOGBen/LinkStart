@@ -85,9 +85,7 @@ impl ParticipantService {
         let path = dir.join("v2-participants.sqlite");
         for suffix in ["", "-wal", "-shm"] {
             let file = dir.join(format!("v2-participants.sqlite{suffix}"));
-            if file.exists() {
-                crate::runtime_core::protect(&file)?;
-            }
+            crate::runtime_core::protect_if_present(&file)?;
         }
         let db = Connection::open(&path)?;
         db.busy_timeout(Duration::from_secs(5))?;
@@ -99,9 +97,7 @@ impl ParticipantService {
         )?;
         for suffix in ["", "-wal", "-shm"] {
             let file = dir.join(format!("v2-participants.sqlite{suffix}"));
-            if file.exists() {
-                crate::runtime_core::protect(&file)?;
-            }
+            crate::runtime_core::protect_in_use(&file)?;
         }
         Ok(Self { path, engine, host })
     }
