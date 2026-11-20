@@ -339,7 +339,33 @@ fn gated(state: &HttpState, token: &str, request: &ToolRequest) -> Reply {
     if result.is_ok() && !read && !request.tool.starts_with("runtime.") {
         guard.epoch += 1;
     }
+    if result.is_ok()
+        && matches!(
+            request.tool.as_str(),
+            "endpoints.grant" | "members.set_roles" | "members.revoke_credential"
+        )
+    {
+        // Still under the gate, so no acquire or write can interleave.
+        fence_revoked_holders(state);
+    }
     reply(result)
+}
+fn fence_revoked_holders(s: &HttpState) {
+    let Ok(sessions) = owned_sessions(s) else {
+        return;
+    };
+    for (eid, sid) in sessions.iter() {
+        if let Some(holder) = s.terminals.holder(sid) {
+            // An unreadable state fails closed: the holder must re-acquire.
+            if !s
+                .engine
+                .identity_permits(&holder, eid, "control")
+                .unwrap_or(false)
+            {
+                s.terminals.revoke_control(sid, &holder);
+            }
+        }
+    }
 }
 fn reply(result: Result<Value, crate::runtime_core::ApiError>) -> Reply {
     match result {
