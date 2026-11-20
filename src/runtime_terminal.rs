@@ -850,8 +850,30 @@ fn host_agent_marker(key: &str, hosted: bool) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    /// hypothesis load-deadlines-4, G2: under load a ConPTY child's output
+    /// took up to 45 s and always came (P5); waits here are for the output or
+    /// state itself, and this guard only stops a hung test.
+    pub(crate) const HANG_GUARD: Duration = Duration::from_secs(120);
+    /// hypothesis load-deadlines-4, G2: `create` answers a program that has not
+    /// finished ConPTY start-up within its documented 5 s with this error (R6,
+    /// docs/operator-limits.md). That is the product reporting a slow start,
+    /// not a failure of what these tests check, so start the program again.
+    pub(crate) fn started(mut create: impl FnMut() -> Result<SessionView, String>) -> SessionView {
+        let until = Instant::now() + HANG_GUARD;
+        loop {
+            match create() {
+                Err(e)
+                    if e == "ConPTY startup cursor handshake timed out"
+                        && Instant::now() < until =>
+                {
+                    eprintln!("create reported a slow start ({e}); starting again");
+                }
+                result => return result.unwrap(),
+            }
+        }
+    }
     #[test]
     fn one_poisoned_session_lock_does_not_cascade() {
         // K16: revocation fences and shutdown walk every session; one session
@@ -862,8 +884,8 @@ mod tests {
         } else {
             ("/bin/sh", vec!["-c".into(), "sleep 30".into()])
         };
-        let poisoned = manager.create(command.into(), args.clone(), None).unwrap();
-        let healthy = manager.create(command.into(), args, None).unwrap();
+        let poisoned = started(|| manager.create(command.into(), args.clone(), None));
+        let healthy = started(|| manager.create(command.into(), args.clone(), None));
         let session = manager.session(&poisoned.id).unwrap();
         let _ = std::thread::spawn(move || {
             let _guard = session
@@ -948,8 +970,8 @@ mod tests {
         } else {
             ("/bin/sh", vec!["-c".into(), "env; echo ENV_DONE".into()])
         };
-        let s = manager.create(command.into(), args, None).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let s = started(|| manager.create(command.into(), args.clone(), None));
+        let deadline = Instant::now() + HANG_GUARD;
         let text = loop {
             let text = manager.observe(&s.id, 0).unwrap().text;
             if text.contains("ENV_DONE") {
@@ -966,26 +988,26 @@ mod tests {
     #[test]
     fn owned_terminal_starts_a_real_child() {
         let manager = TerminalManager::new();
-        let session = manager.create(
-            if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.into(),
-            vec![],
-            None,
-        );
-        assert!(
-            session.is_ok(),
-            "Runtime must own a native PTY child: {session:?}"
-        );
-    }
-    #[test]
-    fn release_rejoin_keeps_child_and_fences_old_writer() {
-        let manager = TerminalManager::new();
-        let session = manager
-            .create(
+        // Runtime must own a native PTY child; any error other than a slow
+        // start fails here.
+        started(|| {
+            manager.create(
                 if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.into(),
                 vec![],
                 None,
             )
-            .unwrap();
+        });
+    }
+    #[test]
+    fn release_rejoin_keeps_child_and_fences_old_writer() {
+        let manager = TerminalManager::new();
+        let session = started(|| {
+            manager.create(
+                if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.into(),
+                vec![],
+                None,
+            )
+        });
         let first = manager
             .acquire(&session.id, "alice")
             .expect("controller can acquire");
@@ -1024,7 +1046,7 @@ mod tests {
                 arithmetic,
             )
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + HANG_GUARD;
         loop {
             let output = manager.observe(&session.id, 0).unwrap();
             if output.text.contains("628318") {
@@ -1041,13 +1063,13 @@ mod tests {
     #[test]
     fn slow_observer_gets_gap_while_other_terminal_stays_responsive() {
         let manager = TerminalManager::with_capacity(128);
-        let s = manager
-            .create(
+        let s = started(|| {
+            manager.create(
                 if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.into(),
                 vec![],
                 None,
             )
-            .unwrap();
+        });
         let lease = manager.acquire(&s.id, "writer").unwrap();
         let input = format!("echo {}\r\n", "x".repeat(2000));
         manager
@@ -1059,8 +1081,8 @@ mod tests {
                 input.as_bytes(),
             )
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(8);
-        loop {
+        let deadline = Instant::now() + HANG_GUARD;
+        let cursor = loop {
             let output = manager.observe(&s.id, 0).unwrap();
             if output.next_cursor > 128 {
                 assert!(output.gap, "lost history must be explicit");
@@ -1076,21 +1098,41 @@ mod tests {
                     produced.min(128),
                     "no repeated or missing bytes"
                 );
-                break;
+                break next.next_cursor;
             }
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(20));
+        };
+        // hypothesis load-deadlines-4, G2: "stays responsive" is that a slow
+        // observer's backlog never blocks another terminal, not a 2 s wall
+        // clock (a second create took 1.4-4.8 s under load). Leave far more
+        // than the retained history unread at `cursor`, then start another
+        // terminal while it is still unread.
+        manager
+            .write(
+                &s.id,
+                "writer",
+                &lease.lease,
+                lease.generation,
+                input.as_bytes(),
+            )
+            .unwrap();
+        while manager.observe(&s.id, 0).unwrap().next_cursor <= cursor + 128 {
+            assert!(Instant::now() < deadline, "second burst never produced");
+            std::thread::sleep(Duration::from_millis(20));
         }
-        let started = Instant::now();
-        let other = manager
-            .create(
+        let other = started(|| {
+            manager.create(
                 if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.into(),
                 vec![],
                 None,
             )
-            .unwrap();
+        });
         assert_ne!(s.id, other.id);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            manager.observe(&s.id, cursor).unwrap().gap,
+            "the slow observer's backlog was still unread and overflowed"
+        );
     }
     #[test]
     fn owned_tree_stop_reports_truth_and_force_cleans_descendant() {
@@ -1109,14 +1151,14 @@ mod tests {
                 "trap '' INT HUP; sleep 120 & echo DESCENDANT=$!; wait",
             ]
         };
-        let s = manager
-            .create(
+        let s = started(|| {
+            manager.create(
                 command.into(),
-                args.into_iter().map(String::from).collect(),
+                args.iter().map(|a| a.to_string()).collect(),
                 None,
             )
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        });
+        let deadline = Instant::now() + HANG_GUARD;
         let descendant;
         loop {
             let output = manager.observe(&s.id, 0).unwrap();
@@ -1224,13 +1266,13 @@ mod tests {
     #[test]
     fn heartbeat_renews_only_current_terminal_controller() {
         let manager = TerminalManager::new();
-        let s = manager
-            .create(
+        let s = started(|| {
+            manager.create(
                 if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.into(),
                 vec![],
                 None,
             )
-            .unwrap();
+        });
         let lease = manager.acquire(&s.id, "alice").unwrap();
         assert!(manager
             .renew(&s.id, "bob", &lease.lease, lease.generation)
@@ -1248,8 +1290,8 @@ mod tests {
     #[test]
     fn input_overload_is_rejected_without_preventing_bounded_cleanup() {
         let manager = TerminalManager::new();
-        let s = manager
-            .create(
+        let s = started(|| {
+            manager.create(
                 if cfg!(windows) {
                     "powershell.exe"
                 } else {
@@ -1267,7 +1309,7 @@ mod tests {
                 },
                 None,
             )
-            .unwrap();
+        });
         let lease = manager.acquire(&s.id, "alice").unwrap();
         let started = Instant::now();
         let input = vec![b'x'; 8 * 1024 * 1024];

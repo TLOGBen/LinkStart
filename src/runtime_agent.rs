@@ -2805,10 +2805,14 @@ mod tests {
             ),
         )
         .unwrap();
-        let until = std::time::Instant::now() + Duration::from_secs(10);
+        // hypothesis load-deadlines-4, G1a: wait for the sync to end, then
+        // require that it completed; the guard comes from the product's budget
+        // for its two fake gh calls and only stops a hung test.
+        let until = std::time::Instant::now() + Fixture::hang_guard(2);
         let synced = loop {
             let state = jobs.get(&admin, "sync").unwrap();
-            if state.status == "completed" {
+            if !["running", "applying"].contains(&state.status.as_str()) {
+                assert_eq!(state.status, "completed", "source sync: {state:?}");
                 break state;
             }
             assert!(std::time::Instant::now() < until, "source sync: {state:?}");

@@ -934,7 +934,7 @@ mod tests {
                     release_rx
                         .lock()
                         .unwrap()
-                        .recv_timeout(Duration::from_secs(10))
+                        .recv_timeout(Fixture::hang_guard(2))
                         .unwrap();
                 }
             }));
@@ -954,11 +954,11 @@ mod tests {
                 args,
             );
             jobs.start(&admin, &req).unwrap();
-            let expected = paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let expected = paused_rx.recv_timeout(Fixture::hang_guard(2)).unwrap();
             let blocker = Connection::open(path.join("source-jobs.sqlite3")).unwrap();
             blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
             release_tx.send(()).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Fixture::hang_guard(2);
             while jobs.active_count() != 0 {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(10));
@@ -1053,7 +1053,7 @@ mod tests {
                 release_rx
                     .lock()
                     .unwrap()
-                    .recv_timeout(Duration::from_secs(10))
+                    .recv_timeout(Fixture::hang_guard(2))
                     .unwrap();
             } else if r.snapshot.job_id == "race-reconcile" {
                 reconciled_tx.send(()).unwrap();
@@ -1066,7 +1066,7 @@ mod tests {
             json!({"endpoint_id":endpoint["id"],"number":1,"body":"ambiguous effect"}),
         );
         jobs.start(&admin, &write).unwrap();
-        paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        paused_rx.recv_timeout(Fixture::hang_guard(2)).unwrap();
         jobs.start(
             &admin,
             &request(
@@ -1085,7 +1085,7 @@ mod tests {
         }
         release_tx.send(()).unwrap();
         assert_eq!(wait(&jobs, &admin, "race-reconcile").status, "completed");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Fixture::hang_guard(2);
         while jobs.active_count() != 0 {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
@@ -1383,7 +1383,13 @@ mod tests {
         )
     }
     fn wait(jobs: &SourceJobs, credential: &str, id: &str) -> SourceJobSnapshot {
-        let until = Instant::now() + Duration::from_secs(10);
+        // hypothesis load-deadlines-4, G1a: wait for the job to leave
+        // running/applying; under load a sync took up to 13.9 s and still
+        // ended as it does when idle. The guard comes from the product's own
+        // budget for the job's fake gh calls (issues + pulls) and only stops a
+        // hung test. The same guard bounds this module's other waits for a job
+        // or its first fake gh call.
+        let until = Instant::now() + Fixture::hang_guard(2);
         loop {
             let snapshot = jobs.get(credential, id).unwrap();
             if !["running", "applying"].contains(&snapshot.status.as_str()) {
@@ -1972,7 +1978,7 @@ mod tests {
             json!({"endpoint_id":eid}),
         );
         jobs.start(credential, &req).unwrap();
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + Fixture::hang_guard(2);
         while fixture.calls().is_empty() {
             assert!(Instant::now() < until);
             std::thread::sleep(Duration::from_millis(10));
@@ -2105,7 +2111,7 @@ mod tests {
             json!({"endpoint_id":eid}),
         );
         jobs.start(&admin, &req).unwrap();
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + Fixture::hang_guard(2);
         while fixture.calls().is_empty() {
             assert!(Instant::now() < until);
             std::thread::sleep(Duration::from_millis(10));
@@ -2175,7 +2181,7 @@ mod tests {
         drop(jobs);
         // The adapter executable is now unavailable; recovery must use the
         // persisted source checkpoint and projection receipts, not re-fetch.
-        std::fs::remove_file(fixture.dir.path().join("fake-gh.ps1")).unwrap();
+        std::fs::remove_file(fixture.dir.path().join("fake-gh.exe")).unwrap();
         let reopened =
             SourceJobs::open_with_config_factory(&path, engine.clone(), factory).unwrap();
         reopened

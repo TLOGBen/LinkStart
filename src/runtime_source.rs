@@ -658,6 +658,148 @@ pub(crate) mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    // hypothesis load-deadlines-4, G1b: the fake gh used to be a pwsh script, and
+    // pwsh's .NET cold start under load (p50 15 s, max 29.9 s) used up the
+    // product's own 30 s process budget before the script reached its first
+    // line, so tests of import, dedupe and write-back failed with the product's
+    // correct `Timeout` (R2). The fixture's process cost is the test's choice:
+    // the same fake is now a std-only executable compiled once per test binary
+    // (like `fake-codex.rs`), so the default budget only has to cover
+    // `CreateProcess`, and only the hung-process test exercises the timeout.
+    const FAKE_GH: &str = r##"
+use std::{fs, io::{Read, Write}, path::Path, time::Duration};
+#[link(name = "kernel32")]
+extern "system" {
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut u8;
+    fn WaitForSingleObject(handle: *mut u8, milliseconds: u32) -> u32;
+}
+fn quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+fn append(path: &Path, text: &str) {
+    fs::OpenOptions::new().create(true).append(true).open(path).unwrap().write_all(text.as_bytes()).unwrap();
+}
+fn main() {
+    let mut argv = std::env::args().skip(1);
+    let base = std::path::PathBuf::from(argv.next().unwrap());
+    let parent_pid: u32 = argv.next().unwrap().parse().unwrap();
+    let args: Vec<String> = argv.collect();
+    // SYNCHRONIZE handle to the test process, held for the whole run so a reused
+    // PID can never look alive. A test binary that is aborted runs no Drop, so
+    // nobody would ever write `release-read`; the gate leaves on its own then.
+    let parent = unsafe { OpenProcess(0x0010_0000, 0, parent_pid) };
+    let parent_alive = || !parent.is_null() && unsafe { WaitForSingleObject(parent, 0) } == 0x102;
+    let entry: Vec<String> = args.iter().map(|a| quote(a)).collect();
+    append(&base.join("calls.jsonl"), &format!("[{}]\n", entry.join(",")));
+    let endpoint = args[1].clone();
+    if base.join("gate-read").exists() {
+        append(&base.join("gate-entered"), "x\n");
+        while base.join("gate-read").exists() && !base.join("release-read").exists() {
+            if !parent_alive() {
+                std::process::exit(3);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        append(&base.join("gate-left"), "x\n");
+    }
+    if base.join("slow-read").exists() {
+        std::thread::sleep(Duration::from_millis(2000));
+        append(&base.join("after-slow-read"), "x\n");
+    }
+    let mut out = std::io::stdout();
+    if endpoint.contains("/comments") {
+        let remote = base.join("remote-comment.json");
+        let method = args.iter().position(|a| a == "--method").map(|i| args[i + 1].as_str());
+        if method == Some("POST") {
+            let mut payload = String::new();
+            std::io::stdin().read_to_string(&mut payload).unwrap();
+            let body = payload
+                .trim()
+                .strip_prefix("{\"body\":")
+                .and_then(|rest| rest.strip_suffix('}'))
+                .expect("POST payload is {\"body\":...}");
+            let url = fs::read_to_string(base.join("comment-url"))
+                .unwrap_or_else(|_| "https://github.com/acme/project/issues/1#issuecomment-901".into());
+            let raw = format!(
+                "{{\"id\":901,\"node_id\":\"IC_REMOTE\",\"html_url\":{},\"body\":{body},\"user\":{{\"id\":22,\"login\":\"writer\",\"node_id\":\"U_WRITER\"}}}}",
+                quote(&url)
+            );
+            fs::write(&remote, &raw).unwrap();
+            if base.join("fail-after-write").exists() {
+                std::process::exit(9);
+            }
+            out.write_all(raw.as_bytes()).unwrap();
+        } else if let Ok(raw) = fs::read_to_string(&remote) {
+            write!(out, "[[{raw}]]").unwrap();
+        } else {
+            out.write_all(b"[[]]").unwrap();
+        }
+        return;
+    }
+    let file = if endpoint.contains("/issues?") {
+        "issues.json"
+    } else if endpoint.contains("/pulls?") {
+        "pulls.json"
+    } else {
+        eprintln!("unexpected fake endpoint {endpoint}");
+        std::process::exit(1);
+    };
+    out.write_all(&fs::read(base.join(file)).unwrap()).unwrap();
+}
+"##;
+    /// Compiles `FAKE_GH` once per test binary into a content-named file beside
+    /// it; parallel copies of the binary race only on an atomic rename.
+    fn fake_gh_binary() -> PathBuf {
+        static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        BUILT
+            .get_or_init(|| {
+                use std::hash::{Hash, Hasher};
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                FAKE_GH.hash(&mut hash);
+                let dir = std::env::current_exe()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("linkstart-test-fake-gh");
+                let binary = dir.join(format!("fake-gh-{:016x}.exe", hash.finish()));
+                if binary.is_file() {
+                    return binary;
+                }
+                let staging = dir.join(format!("build-{}", std::process::id()));
+                std::fs::create_dir_all(&staging).unwrap();
+                let source = staging.join("fake_gh.rs");
+                std::fs::write(&source, FAKE_GH).unwrap();
+                let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+                let built = Command::new(compiler)
+                    .args(["--edition=2021", "--crate-name", "linkstart_fake_gh"])
+                    .arg(&source)
+                    .arg("-o")
+                    .arg(staging.join("fake-gh.exe"))
+                    .output()
+                    .unwrap();
+                assert!(
+                    built.status.success(),
+                    "fake gh fixture compilation failed: {}",
+                    String::from_utf8_lossy(&built.stderr)
+                );
+                if std::fs::rename(staging.join("fake-gh.exe"), &binary).is_err() {
+                    assert!(binary.is_file(), "fake gh fixture could not be placed");
+                }
+                let _ = std::fs::remove_dir_all(&staging);
+                binary
+            })
+            .clone()
+    }
     pub(crate) struct Fixture {
         pub(crate) dir: TempDir,
         pub(crate) config: SourceConfig,
@@ -665,38 +807,6 @@ pub(crate) mod tests {
     impl Fixture {
         pub(crate) fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let script = dir.path().join("fake-gh.ps1");
-            let base = dir.path().to_string_lossy().replace('\'', "''");
-            std::fs::write(&script,format!(r#"
-$ErrorActionPreference='Stop'
-$base='{base}'
-[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false)
-[Console]::InputEncoding=New-Object System.Text.UTF8Encoding($false)
-$entry=ConvertTo-Json -Compress -InputObject @($args)
-[IO.File]::AppendAllText((Join-Path $base 'calls.jsonl'),$entry+"`n",(New-Object System.Text.UTF8Encoding($false)))
-$endpoint=$args[1]
-if(Test-Path (Join-Path $base 'gate-read')){{[IO.File]::AppendAllText((Join-Path $base 'gate-entered'),"x`n");while((Test-Path (Join-Path $base 'gate-read')) -and -not (Test-Path (Join-Path $base 'release-read'))){{Start-Sleep -Milliseconds 20}};[IO.File]::AppendAllText((Join-Path $base 'gate-left'),"x`n")}}
-if(Test-Path (Join-Path $base 'slow-read')){{Start-Sleep -Milliseconds 2000}}
-if($endpoint -match '/comments'){{
-    $methodIndex=[Array]::IndexOf($args,'--method')
-    $method=$args[$methodIndex+1]
-    if($method -eq 'POST'){{
-        $payload=ConvertFrom-Json ([Console]::In.ReadToEnd())
-        $comment=@{{id=901;node_id='IC_REMOTE';html_url='https://github.com/acme/project/issues/1#issuecomment-901';body=$payload.body;user=@{{id=22;login='writer';node_id='U_WRITER'}}}}
-        $raw=ConvertTo-Json -Compress -Depth 10 $comment
-        [IO.File]::WriteAllText((Join-Path $base 'remote-comment.json'),$raw,(New-Object System.Text.UTF8Encoding($false)))
-        if(Test-Path (Join-Path $base 'fail-after-write')){{exit 9}}
-        [Console]::Out.Write($raw)
-    }}else{{
-        if(Test-Path (Join-Path $base 'remote-comment.json')){{[Console]::Out.Write('[['+[IO.File]::ReadAllText((Join-Path $base 'remote-comment.json'))+']]')}}else{{[Console]::Out.Write('[[]]')}}
-    }}
-    exit 0
-}}
-if($endpoint -match '/issues\?'){{$file='issues.json'}}
-elseif($endpoint -match '/pulls\?'){{$file='pulls.json'}}
-else{{throw ('unexpected fake endpoint '+$endpoint)}}
-[Console]::Out.Write([IO.File]::ReadAllText((Join-Path $base $file)))
-"#)).unwrap();
             let item = |node: &str, n: u64, title: &str| json!({"node_id":node,"number":n,"title":title,"body":"Original text","state":"open","html_url":format!("https://github.com/acme/project/issues/{n}"),"user":{"id":11,"login":"author","node_id":"U_AUTHOR"},"created_at":"2026-10-20T00:00:00Z","updated_at":"2026-10-21T00:00:00Z"});
             let issue = item("I_STABLE", 1, "Issue snapshot");
             let mut issue_pr = item("I_PR_WRONG_NODE", 2, "PR through issue listing");
@@ -717,14 +827,26 @@ else{{throw ('unexpected fake endpoint '+$endpoint)}}
                 repository: "acme/project".into(),
                 allow_write_back: false,
             }];
-            config.gh_program = "pwsh.exe".into();
+            // A per-fixture link, so a test can take the adapter away by deleting it.
+            let program = dir.path().join("fake-gh.exe");
+            let shared = fake_gh_binary();
+            if std::fs::hard_link(&shared, &program).is_err() {
+                std::fs::copy(&shared, &program).unwrap();
+            }
+            config.gh_program = program;
             config.gh_prefix_args = vec![
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-File".into(),
-                script.to_string_lossy().into_owned(),
+                dir.path().to_string_lossy().into_owned(),
+                std::process::id().to_string(),
             ];
             Self { dir, config }
+        }
+        /// hypothesis load-deadlines-4, G1a: how long a test may wait for work
+        /// that runs `calls` fake gh processes before calling it hung. Each one
+        /// is bounded by the product's own `SourceConfig.timeout` (R2), so a
+        /// busy machine only means "not yet"; the margin covers the job's local
+        /// work (SQLite, Engine publication).
+        pub(crate) fn hang_guard(calls: u32) -> Duration {
+            SourceConfig::new(PathBuf::new()).timeout * calls + Duration::from_secs(30)
         }
         pub(crate) fn calls(&self) -> Vec<Vec<String>> {
             std::fs::read_to_string(self.dir.path().join("calls.jsonl"))
@@ -897,12 +1019,7 @@ else{{throw ('unexpected fake endpoint '+$endpoint)}}
             let mut fixture = Fixture::new();
             fixture.config.repositories[0].repository = "Acme/Project".into();
             fixture.config.repositories[0].allow_write_back = true;
-            let script = fixture.dir.path().join("fake-gh.ps1");
-            let text = std::fs::read_to_string(&script).unwrap().replace(
-                "https://github.com/acme/project/issues/1#issuecomment-901",
-                locator,
-            );
-            std::fs::write(script, text).unwrap();
+            std::fs::write(fixture.dir.path().join("comment-url"), locator).unwrap();
             let adapter = SourceAdapter::new(fixture.config.clone()).unwrap();
             let receipt = adapter
                 .post_comment("ACME/PROJECT", 1, "foreign-locator", "approved content")
@@ -992,15 +1109,19 @@ else{{throw ('unexpected fake endpoint '+$endpoint)}}
         fixture.config.timeout = Duration::from_millis(150);
         std::fs::write(fixture.dir.path().join("slow-read"), b"yes").unwrap();
         let adapter = SourceAdapter::new(fixture.config.clone()).unwrap();
-        let start = std::time::Instant::now();
         let result = adapter.ingest_repository("acme/project");
+        // hypothesis load-deadlines-4, G1c: assert the mechanism, not the
+        // caller's wall clock. The budget starts before `CreateProcess`, which
+        // alone took up to 2.5 s under load and no budget can cover; what the
+        // product promises is a `Timeout` that stops the child instead of
+        // waiting for it (R2). The fake records the line after its 2 s sleep,
+        // so give a child that was not stopped the time to reach it.
+        let error = result.expect_err("hung gh must fail within the configured process budget");
+        assert!(error.contains("Timeout"), "{error}");
+        std::thread::sleep(Duration::from_millis(2500));
         assert!(
-            result.is_err(),
-            "hung gh must fail within the configured process budget"
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "timeout must bound caller wait"
+            !fixture.dir.path().join("after-slow-read").exists(),
+            "the hung child must be stopped, not waited for"
         );
         assert!(
             adapter.snapshots("acme/project").unwrap().is_empty(),

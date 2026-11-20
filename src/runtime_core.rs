@@ -2279,21 +2279,33 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn protect_is_fast_and_leaves_protected_owner_only_dacl() {
-        use std::time::{Duration, Instant};
+        // hypothesis load-deadlines-4, G5: "fast" is the mechanism, a native
+        // call instead of a PowerShell per call (~0.5 s, R8), not a 200 ms wall
+        // clock that load alone exceeded (205 ms, 359 ms). A child copy of this
+        // binary runs `protect` inside its own job object, which counts every
+        // process ever started in it.
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("state 空間");
         std::fs::create_dir(&sub).unwrap();
         let file = sub.join("secret.token");
         std::fs::write(&file, "x").unwrap();
-        for path in [&sub, &file] {
-            let started = Instant::now();
-            protect(path).unwrap();
-            assert!(
-                started.elapsed() < Duration::from_millis(200),
-                "protect took {:?}",
-                started.elapsed()
-            );
-        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime_core::tests::protect_in_own_job",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("LINKSTART_PROTECT_JOB_DIR", &sub)
+            .output()
+            .unwrap();
+        let report = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && report.contains("1 passed"),
+            "{report}{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
         let script = "$ErrorActionPreference='Stop'; $u=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; foreach($p in @($env:ACL_TEST_PATH,(Join-Path $env:ACL_TEST_PATH 'secret.token'))) { $a=Get-Acl -LiteralPath $p; if(!$a.AreAccessRulesProtected){throw 'inheriting DACL'}; $own=@($a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | ? { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -eq $u -and ($_.FileSystemRights -band 'FullControl') -eq 'FullControl' }); if($own.Count -lt 1){throw 'owner FullControl missing'}; foreach($r in $a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])) { if($r.AccessControlType -eq 'Allow' -and $r.IdentityReference.Value -notin @($u,'S-1-5-18')){throw 'untrusted SID'} } }";
         let out = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -2307,6 +2319,68 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         std::fs::write(&file, "still writable by owner").unwrap();
+    }
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "subprocess helper; run by protect_is_fast_and_leaves_protected_owner_only_dacl"]
+    fn protect_in_own_job() {
+        use std::ffi::c_void;
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct Accounting {
+            times: [i64; 4],
+            faults: u32,
+            total: u32,
+            active: u32,
+            terminated: u32,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> *mut c_void;
+            fn GetCurrentProcess() -> *mut c_void;
+            fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+            fn QueryInformationJobObject(
+                job: *mut c_void,
+                class: u32,
+                data: *mut c_void,
+                len: u32,
+                result: *mut u32,
+            ) -> i32;
+        }
+        let Some(sub) = std::env::var_os("LINKSTART_PROTECT_JOB_DIR") else {
+            return;
+        };
+        let sub = std::path::PathBuf::from(sub);
+        let mut accounting: Accounting = unsafe { std::mem::zeroed() };
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+            assert!(!job.is_null(), "{}", std::io::Error::last_os_error());
+            assert_ne!(
+                AssignProcessToJobObject(job, GetCurrentProcess()),
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            for path in [sub.clone(), sub.join("secret.token")] {
+                protect(&path).unwrap();
+            }
+            assert_ne!(
+                QueryInformationJobObject(
+                    job,
+                    1, // JobObjectBasicAccountingInformation
+                    &mut accounting as *mut _ as *mut c_void,
+                    std::mem::size_of::<Accounting>() as u32,
+                    std::ptr::null_mut(),
+                ),
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+        }
+        assert_eq!(
+            accounting.total, 1,
+            "protect must not start a process; the job holds only this test"
+        );
     }
     #[test]
     #[cfg(windows)]
