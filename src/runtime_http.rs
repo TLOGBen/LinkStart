@@ -499,6 +499,14 @@ fn gated(state: &HttpState, token: &str, request: &ToolRequest) -> Reply {
             "runtime is draining; new mutations disabled",
         );
     }
+    // A resent rotation only replays its reply: the lease the member took since
+    // with the new credential must not be fenced as if it were the old one (K14).
+    // An unreadable state fails toward fencing.
+    let replayed_rotation = request.tool == "members.rotate_credential"
+        && state
+            .engine
+            .has_receipt(token, &request.request_id)
+            .unwrap_or(false);
     let result = dispatch(state, &mut guard, token, request);
     if result.is_ok() && !read && !request.tool.starts_with("runtime.") {
         guard.epoch += 1;
@@ -514,7 +522,7 @@ fn gated(state: &HttpState, token: &str, request: &ToolRequest) -> Reply {
     {
         // Still under the gate, so no acquire or write can interleave. A
         // rotation cuts off the old credential, so the member's leases end too.
-        let rotated = (request.tool == "members.rotate_credential")
+        let rotated = (request.tool == "members.rotate_credential" && !replayed_rotation)
             .then(|| request.args["member_id"].as_str())
             .flatten();
         fence_revoked_holders(state, None, rotated);

@@ -742,6 +742,37 @@ impl Engine {
             clock,
         })
     }
+    /// Whether the caller behind `credential` already has a receipt for
+    /// `request_id`, i.e. sending it again only replays the stored reply.
+    /// Lets an adapter skip side effects of its own on a replay (K14).
+    /// Correct only for tools that always store a receipt and resolve the caller
+    /// as owner or member: not for invitation registration, a heartbeat renewal
+    /// (re-executed despite its receipt) or read-only tools (no receipt).
+    pub(crate) fn has_receipt(&self, credential: &str, request_id: &str) -> Result<bool, ApiError> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let encoded: String = inner
+            .db
+            .query_row("SELECT json FROM core_state WHERE id=1", [], |r| r.get(0))
+            .map_err(internal)?;
+        let s: State = serde_json::from_str(&encoded).map_err(internal)?;
+        let time = (self.clock)();
+        let identity = if hash(credential) == hash(&inner.secret) {
+            Some(Value::from("owner"))
+        } else {
+            s.members
+                .iter()
+                .find(|m| m["credential_hash"] == hash(credential) && credential_active(m, time))
+                .map(|m| m["id"].clone())
+        };
+        Ok(identity.is_some_and(|identity| {
+            s.receipts
+                .iter()
+                .any(|x| x["identity"] == identity && x["request_id"] == request_id)
+        }))
+    }
     // A panic while holding `inner` unwinds through the open rusqlite Transaction,
     // whose drop rolls it back, and never mutates `secret`; so a poisoned lock
     // guards consistent state. Recovering it keeps the owner able to stop the

@@ -462,6 +462,38 @@ class RuntimeHttp(unittest.TestCase):
         held_then_revoked(lambda:(time.sleep(2.5),(200,'expired'))[1],401)
         call('terminal.force',{'endpoint_id':eid})
 
+    def test_resent_rotation_keeps_the_lease_taken_with_the_new_credential(self):
+        # K14: replaying a rotation must not fence the lease its new credential took.
+        token,sid,created=self.recorded_terminal('rotate-replay',"print('READY',flush=True)\nwhile True:\n    print('GOT=%r'%input(),flush=True)\n")
+        eid=created['endpoint']['id']
+        def call(tool,args,credential=token,rid=None):return self.post(dict(request_id=rid or str(time.time_ns()),tool=tool,space_id=sid,args=args),credential)
+        _,invite=call('members.invite',{'roles':['manager']})
+        _,member=call('members.register',{'name':'agent'},invite['invite_token'])
+        rotate={'member_id':member['id'],'expected_epoch':member.get('credential_epoch',0)}
+        status,old_lease=call('terminal.acquire',{'endpoint_id':eid},member['credential'])
+        self.assertEqual(status,200,old_lease)
+        status,rotated=call('members.rotate_credential',rotate,rid='k14-rotate')
+        self.assertEqual(status,200,rotated)
+        cred=rotated['credential']
+        # The first rotation still ends the old credential's lease at once.
+        status,mine=call('terminal.acquire',{'endpoint_id':eid})
+        self.assertEqual(status,200,mine)
+        self.assertEqual(call('terminal.release',dict(endpoint_id=eid,**mine))[0],200)
+        status,lease=call('terminal.acquire',{'endpoint_id':eid},cred)
+        self.assertEqual(status,200,lease)
+        status,again=call('members.rotate_credential',rotate,rid='k14-rotate')
+        self.assertEqual(status,200,again)
+        self.assertEqual(again['credential'],cred)
+        status,value=call('terminal.write',dict(endpoint_id=eid,input='still mine\r',**lease),cred)
+        self.assertEqual(status,200,value)
+        # A real rotation later, under a new request_id, still ends that lease.
+        status,again=call('members.rotate_credential',{'member_id':member['id'],'expected_epoch':rotated['credential_epoch']},rid='k14-rotate-2')
+        self.assertEqual(status,200,again)
+        status,mine=call('terminal.acquire',{'endpoint_id':eid})
+        self.assertEqual(status,200,mine)
+        self.assertEqual(call('terminal.release',dict(endpoint_id=eid,**mine))[0],200)
+        call('terminal.force',{'endpoint_id':eid})
+
     def test_terminal_request_id_is_bounded(self):
         # K2: every receipt keeps its request_id, so its size must be bounded.
         owner,sid,created=self.recorded_terminal('bounded-id','import time; time.sleep(5)')
