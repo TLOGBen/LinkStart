@@ -702,11 +702,16 @@ impl Engine {
             clock,
         })
     }
+    // A panic while holding `inner` unwinds through the open rusqlite Transaction,
+    // whose drop rolls it back, and never mutates `secret`; so a poisoned lock
+    // guards consistent state. Recovering it keeps the owner able to stop the
+    // runtime instead of every later call failing.
     pub fn is_owner(&self, credential: &str) -> bool {
-        self.inner
+        let inner = self
+            .inner
             .lock()
-            .map(|i| hash(credential) == hash(&i.secret))
-            .unwrap_or(false)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hash(credential) == hash(&inner.secret)
     }
     /// Whether `identity` (a member id or "owner") may still perform `operation`
     /// on `endpoint_id` under the committed state; used to fence held leases.
@@ -722,7 +727,7 @@ impl Engine {
         let inner = self
             .inner
             .lock()
-            .map_err(|_| err("Internal", "runtime lock poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let encoded: String = inner
             .db
             .query_row("SELECT json FROM core_state WHERE id=1", [], |r| r.get(0))
@@ -745,7 +750,7 @@ impl Engine {
         let inner = self
             .inner
             .lock()
-            .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = inner
             .db
             .path()
@@ -788,7 +793,7 @@ impl Engine {
         let mut inner = self
             .inner
             .lock()
-            .map_err(|_| err("Internal", "runtime lock poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let owner = hash(credential) == hash(&inner.secret);
         // Deferred WAL readers do not fence another connection's revocation commit.
         let tx = inner
@@ -873,7 +878,7 @@ impl Engine {
         let mut inner = self
             .inner
             .lock()
-            .map_err(|_| err("Internal", "runtime lock poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let owner = hash(credential) == hash(&inner.secret);
         let tx = inner
             .db
@@ -999,7 +1004,7 @@ impl Engine {
         let mut inner = self
             .inner
             .lock()
-            .map_err(|_| err("Internal", "runtime lock poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tx = inner
             .db
             .transaction_with_behavior(TransactionBehavior::Deferred)
@@ -1131,7 +1136,7 @@ impl Engine {
         let mut inner = self
             .inner
             .lock()
-            .map_err(|_| err("Internal", "runtime lock poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let secret = inner.secret.clone();
         let tx = inner
             .db
@@ -1943,6 +1948,39 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn panic_mid_transaction_leaves_engine_usable_and_owner_recognized() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::open(dir.path()).unwrap();
+        let owner = std::fs::read_to_string(owner_token_path(dir.path())).unwrap();
+        let inner = e.inner.clone();
+        // Poison the lock exactly as a panic inside execute would: mid-write.
+        let _ = std::thread::spawn(move || {
+            let mut guard = inner.lock().unwrap();
+            let tx = guard.db.transaction().unwrap();
+            tx.execute("UPDATE core_state SET json='{}' WHERE id=1", [])
+                .unwrap();
+            panic!("simulated panic inside a core write");
+        })
+        .join();
+        assert!(e.inner.is_poisoned());
+        assert!(
+            e.is_owner(&owner),
+            "owner must still be able to stop the runtime"
+        );
+        let created = e
+            .execute(
+                &owner,
+                &req(
+                    "after-panic",
+                    "spaces.create",
+                    None,
+                    json!({"name":"after"}),
+                ),
+            )
+            .expect("the rolled-back write must leave state readable and writable");
+        assert!(created["space"]["id"].is_string());
+    }
     #[test]
     #[cfg(windows)]
     fn protect_is_fast_and_leaves_protected_owner_only_dacl() {
