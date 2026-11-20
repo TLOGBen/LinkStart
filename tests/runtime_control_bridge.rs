@@ -682,7 +682,22 @@ fn launch_without_get_recovers_exact_durable_thread_metadata_after_restart() {
     // Observe the real host durable boundary directly, without populating the
     // bridge status cache through get/list or the running helper.
     let host = rusqlite::Connection::open(f.dir.path().join("v2-codex-host.sqlite")).unwrap();
-    let until = Instant::now() + Duration::from_secs(4);
+    // The row is written once start-up admits the thread, which took up to
+    // 7.3 s under load; wait for the row, or fail at once if the supervisor
+    // says start-up ended Unknown. The supervisor is asked directly so the
+    // bridge status cache stays empty. The deadline only stops a hung test
+    // (hypothesis load-deadlines-2, A3).
+    let encoded_scope: String =
+        rusqlite::Connection::open(f.dir.path().join("v2-owned-control.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT scope FROM sessions WHERE id=?1",
+                [launch["session_id"].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+    let scope: HostScope = serde_json::from_str(&encoded_scope).unwrap();
+    let until = Instant::now() + Duration::from_secs(60);
     let expected: String = loop {
         use rusqlite::OptionalExtension;
         let found: Option<String> = host
@@ -696,7 +711,13 @@ fn launch_without_get_recovers_exact_durable_thread_metadata_after_restart() {
         if let Some(thread) = found {
             break thread;
         }
-        assert!(Instant::now() < until);
+        let status = f.supervisor.get_as(&f.admin, &scope).unwrap();
+        assert!(
+            status.phase != SessionPhase::Unknown,
+            "start-up ended Unknown: {:?}",
+            status.worker_failure
+        );
+        assert!(Instant::now() < until, "start-up never ended: {status:?}");
         std::thread::sleep(Duration::from_millis(5));
     };
     let bridge_db =
@@ -938,7 +959,24 @@ fn f5_get_first_terminal(outcome: &str) {
     assert_eq!(f5_durable_body(&f, &turn), first);
     args["wait_ms"] = json!(1000);
     let reconcile = f.request("f5-reconcile", "owned.operation.reconcile", args);
-    let observed = f.bridge.execute(&f.admin, &reconcile).unwrap();
+    // wait_ms is capped at 1000 ms. A provider read that misses it is Pending,
+    // and the bridge keeps returning the retained first envelope (no
+    // observation, durable body unchanged); that is the promise, so check it on
+    // every such reply and reconcile again until the read is answered. The
+    // deadline only stops a hung test (hypothesis load-deadlines-2, A6).
+    let until = Instant::now() + Duration::from_secs(60);
+    let observed = loop {
+        let reply = f.bridge.execute(&f.admin, &reconcile).unwrap();
+        if reply.get("observation").is_some() {
+            break reply;
+        }
+        assert_eq!(
+            reply, first,
+            "unanswered read must return retained evidence"
+        );
+        assert_eq!(f5_durable_body(&f, &turn), first);
+        assert!(Instant::now() < until, "provider read never answered");
+    };
     eprintln!("F5 {outcome} get-first={first}; reconcile={observed}");
     assert_eq!(
         observed["observation"]["outcome"], outcome,
@@ -970,10 +1008,25 @@ fn f5_get_first_terminal(outcome: &str) {
     // A real exact provider read can contradict its prior terminal report. Do
     // not turn that incoming positive evidence into an admitted typed response.
     std::fs::write(f.dir.path().join("contradictory-read"), "").unwrap();
-    assert_eq!(
-        f.bridge.execute(&f.admin, &reconcile).unwrap_err().code,
-        "Conflict"
-    );
+    // A read that misses wait_ms is not evidence: reconcile returns the
+    // admitted observation unchanged. Retry until the contradiction arrives in
+    // time and is refused, checking the retained evidence each time. The
+    // deadline only stops a hung test (hypothesis load-deadlines-2, A7).
+    let until = Instant::now() + Duration::from_secs(60);
+    let refused = loop {
+        match f.bridge.execute(&f.admin, &reconcile) {
+            Ok(reply) => {
+                assert_eq!(
+                    reply, observed,
+                    "unanswered read must return retained evidence"
+                );
+                assert_eq!(f5_durable_body(&f, &turn), observed);
+                assert!(Instant::now() < until, "provider read never answered");
+            }
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(refused.code, "Conflict");
     assert_eq!(f5_durable_body(&f, &turn), observed);
     assert_eq!(f.bridge.execute(&f.admin, &get).unwrap(), observed);
     std::fs::remove_file(f.dir.path().join("contradictory-read")).unwrap();
@@ -1216,6 +1269,38 @@ async fn http(
     request: Option<ToolRequest>,
 ) -> (u16, Value) {
     tokio::task::spawn_blocking(move||{use std::io::{Read,Write};let mut stream=std::net::TcpStream::connect(addr).unwrap();stream.set_read_timeout(Some(Duration::from_secs(4))).unwrap();let body=request.as_ref().map(|r|serde_json::to_string(r).unwrap()).unwrap_or_default();let path=if request.is_some(){"/v2/tools"}else{"/v2/health"};let method=if request.is_some(){"POST"}else{"GET"};write!(stream,"{method} {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {actor}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();let mut response=String::new();stream.read_to_string(&mut response).unwrap();let (headers,body)=response.split_once("\r\n\r\n").unwrap();let status=headers.split_whitespace().nth(1).unwrap().parse().unwrap();(status,serde_json::from_str(body).unwrap())}).await.unwrap()
+}
+
+/// The terminal's interpreter cold start took 1.3-6.5 s under load, so wait for
+/// its `terminal-ready` file, failing at once with the terminal's output if it
+/// is no longer live. The deadline only stops a hung test
+/// (hypothesis load-deadlines-2, A4).
+async fn await_terminal_ready(
+    f: &Fixture,
+    addr: std::net::SocketAddr,
+    host: &str,
+    endpoint: &Value,
+) {
+    let until = Instant::now() + Duration::from_secs(60);
+    while !f.dir.path().join("terminal-ready").exists() {
+        let (_, observed) = http(
+            addr,
+            host.into(),
+            f.admin.clone(),
+            Some(f.request(
+                "ready-observe",
+                "terminal.observe",
+                json!({ "endpoint_id": endpoint }),
+            )),
+        )
+        .await;
+        assert_eq!(
+            observed["status"], "live",
+            "terminal ended before terminal-ready: {observed}"
+        );
+        assert!(Instant::now() < until, "missing terminal-ready: {observed}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1606,9 +1691,9 @@ async fn posix_shutdown_terminal_wait_releases_global_http_gate() {
         .output()
         .unwrap();
     let script="import signal,time,pathlib\nsignal.signal(signal.SIGINT,lambda *_:pathlib.Path('shutdown-entered').touch())\npathlib.Path('terminal-ready').touch()\nwhile not pathlib.Path('terminal-release').exists():time.sleep(0.01)";
-    let (status,_)=http(addr,host.clone(),f.admin.clone(),Some(f.request("terminal","terminal.create",json!({"command":String::from_utf8(python.stdout).unwrap().trim(),"args":["-u","-c",script],"cwd":f.dir.path()})))).await;
+    let (status,created)=http(addr,host.clone(),f.admin.clone(),Some(f.request("terminal","terminal.create",json!({"command":String::from_utf8(python.stdout).unwrap().trim(),"args":["-u","-c",script],"cwd":f.dir.path()})))).await;
     assert_eq!(status, 200);
-    f.await_file("terminal-ready");
+    await_terminal_ready(&f, addr, &host, &created["endpoint"]["id"]).await;
     let owner = std::fs::read_to_string(owner_token_path(f.dir.path())).unwrap();
     let other = exec(
         &f.engine,
@@ -1722,7 +1807,7 @@ print('windows-native-final-tail',flush=True)
 "#;
     let (status, created) = http(addr, host.clone(), f.admin.clone(), Some(f.request("u1-terminal", "terminal.create", json!({"command":String::from_utf8(python.stdout).unwrap().trim(),"args":["-u","-c",script],"cwd":f.dir.path()})))).await;
     assert_eq!(status, 200, "{created}");
-    f.await_file("terminal-ready");
+    await_terminal_ready(&f, addr, &host, &created["endpoint"]["id"]).await;
     let owner = std::fs::read_to_string(owner_token_path(f.dir.path())).unwrap();
     let other = exec(
         &f.engine,
@@ -1833,23 +1918,40 @@ print('windows-native-final-tail',flush=True)
         assert!(Instant::now() < until, "{observed}");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let (_, prepared) = http(
-        addr,
-        host.clone(),
-        owner.clone(),
-        Some(shutdown_request("runtime.prepare_shutdown", json!({}))),
-    )
-    .await;
-    let (_, final_shutdown) = http(
-        addr,
-        host,
-        owner,
-        Some(shutdown_request(
-            "runtime.confirm_shutdown",
-            json!({"ticket":prepared["ticket"]}),
-        )),
-    )
-    .await;
+    // The history barrier has its own 750 ms budget and, under load, a confirm
+    // can return pending with nothing left to stop and `history flush pending`;
+    // that is the promise, so prepare and confirm again until `stopping`. Any
+    // other pending reason fails at once. The deadline only stops a hung test
+    // (hypothesis load-deadlines-2, A5).
+    let until = Instant::now() + Duration::from_secs(60);
+    let final_shutdown = loop {
+        let (_, prepared) = http(
+            addr,
+            host.clone(),
+            owner.clone(),
+            Some(shutdown_request("runtime.prepare_shutdown", json!({}))),
+        )
+        .await;
+        let (_, final_shutdown) = http(
+            addr,
+            host.clone(),
+            owner.clone(),
+            Some(shutdown_request(
+                "runtime.confirm_shutdown",
+                json!({"ticket":prepared["ticket"]}),
+            )),
+        )
+        .await;
+        let history_pending = final_shutdown["status"] == "pending"
+            && final_shutdown["remaining"] == json!([])
+            && final_shutdown["history_error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("history flush pending"));
+        if !history_pending {
+            break final_shutdown;
+        }
+        assert!(Instant::now() < until, "{final_shutdown}");
+    };
     assert_eq!(final_shutdown["status"], "stopping", "{final_shutdown}");
     assert_eq!(final_shutdown["history"], "durable");
     eprintln!("U1 Windows actual exit and history EOF/flush: {final_shutdown}");
