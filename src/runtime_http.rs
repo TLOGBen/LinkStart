@@ -339,7 +339,50 @@ fn gated(state: &HttpState, token: &str, request: &ToolRequest) -> Reply {
     if result.is_ok() && !read && !request.tool.starts_with("runtime.") {
         guard.epoch += 1;
     }
+    if result.is_ok()
+        && matches!(
+            request.tool.as_str(),
+            "endpoints.grant"
+                | "members.set_roles"
+                | "members.revoke_credential"
+                | "members.rotate_credential"
+        )
+    {
+        // Still under the gate, so no acquire or write can interleave. A
+        // rotation cuts off the old credential, so the member's leases end too.
+        let rotated = (request.tool == "members.rotate_credential")
+            .then(|| request.args["member_id"].as_str())
+            .flatten();
+        fence_revoked_holders(state, None, rotated);
+    }
     reply(result)
+}
+/// Ends every held lease whose holder no longer permits control (or is `rotated`).
+/// `only` limits the check to one endpoint (the lazy fence at acquire, which also
+/// covers time-based credential expiry).
+fn fence_revoked_holders(s: &HttpState, only: Option<&str>, rotated: Option<&str>) {
+    // Copy the map so observe's fast path is not held behind state reads.
+    let sessions: Vec<(String, String)> = match owned_sessions(s) {
+        Ok(map) => map
+            .iter()
+            .filter(|(eid, _)| only.is_none_or(|o| o == eid.as_str()))
+            .map(|(e, sid)| (e.clone(), sid.clone()))
+            .collect(),
+        Err(_) => return,
+    };
+    for (eid, sid) in sessions {
+        if let Some(holder) = s.terminals.holder(&sid) {
+            // An unreadable state fails closed: the holder must re-acquire.
+            if rotated == Some(holder.as_str())
+                || !s
+                    .engine
+                    .identity_permits(&holder, &eid, "control")
+                    .unwrap_or(false)
+            {
+                s.terminals.revoke_control(&sid, &holder);
+            }
+        }
+    }
 }
 fn reply(result: Result<Value, crate::runtime_core::ApiError>) -> Reply {
     match result {
@@ -876,7 +919,10 @@ fn dispatch(
             .terminals
             .observe(sid, r.args["cursor"].as_u64().unwrap_or(0))
             .map_err(native)?),
-        "terminal.acquire" => json!(s.terminals.acquire(sid, identity).map_err(native)?),
+        "terminal.acquire" => {
+            fence_revoked_holders(s, Some(eid), None);
+            json!(s.terminals.acquire(sid, identity).map_err(native)?)
+        }
         "terminal.renew" => json!(s
             .terminals
             .renew(sid, identity, field(&r.args, "lease")?, generation()?)

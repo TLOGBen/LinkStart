@@ -708,6 +708,39 @@ impl Engine {
             .map(|i| hash(credential) == hash(&i.secret))
             .unwrap_or(false)
     }
+    /// Whether `identity` (a member id or "owner") may still perform `operation`
+    /// on `endpoint_id` under the committed state; used to fence held leases.
+    pub fn identity_permits(
+        &self,
+        identity: &str,
+        endpoint_id: &str,
+        operation: &str,
+    ) -> Result<bool, ApiError> {
+        if identity == "owner" {
+            return Ok(true);
+        }
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| err("Internal", "runtime lock poisoned"))?;
+        let encoded: String = inner
+            .db
+            .query_row("SELECT json FROM core_state WHERE id=1", [], |r| r.get(0))
+            .map_err(internal)?;
+        let s: State = serde_json::from_str(&encoded).map_err(internal)?;
+        let Some(member) = s.members.iter().find(|m| m["id"] == identity) else {
+            return Ok(false);
+        };
+        let Some(endpoint) = s.endpoints.iter().find(|e| e["id"] == endpoint_id) else {
+            return Ok(false);
+        };
+        Ok(credential_active(member, (self.clock)())
+            && member["space_id"] == endpoint["space_id"]
+            && (admin(&member["roles"])
+                || endpoint["grants"][identity]
+                    .as_array()
+                    .is_some_and(|ops| ops.iter().any(|op| op == operation))))
+    }
     pub(crate) fn private_storage_directory(&self) -> anyhow::Result<PathBuf> {
         let inner = self
             .inner
