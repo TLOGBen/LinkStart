@@ -387,6 +387,11 @@ impl TerminalManager {
             c.args(args);
             c
         };
+        for (key, _) in std::env::vars_os() {
+            if key.to_str().is_some_and(host_agent_marker) {
+                cmd.env_remove(key);
+            }
+        }
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         }
@@ -728,9 +733,57 @@ impl Drop for Session {
     }
 }
 
+/// Variables an agent host injects to mark (and authenticate) its own session.
+/// When the daemon is started from inside such a session, an owned CLI must not
+/// inherit them: it would believe it is that session's child, and host tokens
+/// would reach every program a member launches. User configuration (for example
+/// API endpoints or provider selection) is left alone.
+fn host_agent_marker(key: &str) -> bool {
+    let key = key.to_ascii_uppercase();
+    key == "CLAUDECODE"
+        || key == "CLAUDE_PID"
+        || key == "CLAUDE_EFFORT"
+        || key.starts_with("CLAUDE_AGENT_SDK_")
+        || key.starts_with("CLAUDE_PREVIEW_")
+        || key.starts_with("CODEX_SANDBOX")
+        || key.starts_with("CODEX_THREAD_ID")
+        || (key.starts_with("CLAUDE_CODE_")
+            && !key.starts_with("CLAUDE_CODE_USE_")
+            && !key.starts_with("CLAUDE_CODE_MAX_")
+            && key != "CLAUDE_CODE_GIT_BASH_PATH")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn child_does_not_inherit_host_agent_session_markers() {
+        std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "parent-marker");
+        std::env::set_var("CLAUDECODE", "1");
+        std::env::set_var("LINKSTART_ENV_KEEP_PROBE", "kept");
+        let manager = TerminalManager::new();
+        let (command, args) = if cfg!(windows) {
+            (
+                "cmd.exe",
+                vec!["/Q".into(), "/C".into(), "set & echo ENV_DONE".into()],
+            )
+        } else {
+            ("/bin/sh", vec!["-c".into(), "env; echo ENV_DONE".into()])
+        };
+        let s = manager.create(command.into(), args, None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let text = loop {
+            let text = manager.observe(&s.id, 0).unwrap().text;
+            if text.contains("ENV_DONE") {
+                break text;
+            }
+            assert!(Instant::now() < deadline, "env never printed: {text}");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(text.contains("LINKSTART_ENV_KEEP_PROBE=kept"), "{text}");
+        assert!(!text.contains("CLAUDE_CODE_CHILD_SESSION"), "{text}");
+        assert!(!text.contains("CLAUDECODE="), "{text}");
+    }
     #[test]
     fn owned_terminal_starts_a_real_child() {
         let manager = TerminalManager::new();

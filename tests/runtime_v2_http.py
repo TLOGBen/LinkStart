@@ -568,4 +568,30 @@ class RuntimeHttp(unittest.TestCase):
         self.assertEqual(status,403,value)
         self.assertEqual(value['error']['code'],'Denied')
 
+    def test_agents_launch_only_human_approved_terminals(self):
+        token=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()
+        _,space=self.post(dict(request_id='launch-space',tool='spaces.create',args={'name':'launch'}),token)
+        sid=space['space']['id']; human=space['administrator']['credential']
+        def call(tool,args,credential,rid=None):return self.post(dict(request_id=rid or str(time.time_ns()),tool=tool,space_id=sid,args=args),credential)
+        _,invite=call('members.invite',{'roles':['session_maintainer','manager']},token)
+        _,agent=call('members.register',{'name':'agent'},invite['invite_token'])
+        launch=dict(shell_once('echo APPROVED_LAUNCH'),name='approved')
+        # An agent, even a manager, cannot choose an executable, arguments or workspace.
+        status,value=call('terminal.create',launch,agent['credential'])
+        self.assertEqual(status,403,value)
+        status,value=call('endpoints.register',{'name':'smuggled','kind':'terminal','config':{'command':launch['command'],'args':launch['args'],'cwd':None}},agent['credential'])
+        self.assertEqual(status,403,value)
+        # A human administrator approves it by creating it; the agent may then relaunch exactly that.
+        status,created=call('terminal.create',launch,human)
+        self.assertEqual(status,200,created)
+        eid=created['endpoint']['id']; old=created['session']['id']
+        self.assertEqual(created['endpoint']['launch_approval']['approved_by'],space['administrator']['id'])
+        for _ in range(100):
+            _,listing=call('endpoints.list',{},human)
+            if next(e for e in listing['items'] if e['id']==eid)['status']=='exited':break
+            time.sleep(.05)
+        status,restarted=call('terminal.restart',{'endpoint_id':eid,'expected_session_id':old},agent['credential'])
+        self.assertEqual(status,200,restarted)
+        self.assertNotEqual(restarted['session']['id'],old)
+
 if __name__=='__main__':unittest.main()
