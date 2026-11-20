@@ -25,8 +25,12 @@ pub(crate) struct VerifiedPeer {
     pub(crate) stream: TcpStream,
 }
 
-/// Read exactly one bounded, persistent HTTP response without consuming any
-/// following response or waiting for EOF. Ambiguous framing fails closed.
+/// Read exactly one bounded HTTP/1.1 response, framed only by Content-Length,
+/// without consuming any following response or waiting for EOF. Ambiguous
+/// framing fails closed. A `Connection: close` response is still returned once
+/// its body is complete (a draining Runtime closes after its final answer);
+/// the stream is then spent, so any later read on it fails as incomplete and
+/// the caller never reconnects.
 pub(crate) fn response(
     stream: &mut TcpStream,
     deadline: Instant,
@@ -82,13 +86,6 @@ pub(crate) fn response(
         let value = value.trim();
         if name.eq_ignore_ascii_case("transfer-encoding") {
             bail!("Transfer-Encoding is unsupported")
-        }
-        if name.eq_ignore_ascii_case("connection")
-            && value
-                .split(',')
-                .any(|v| v.trim().eq_ignore_ascii_case("close"))
-        {
-            bail!("peer cannot preserve the verified connection")
         }
         if name.eq_ignore_ascii_case("content-length") {
             if length.is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
@@ -214,7 +211,8 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 999999999999999999999999\r\n\r\n",
             "HTTP/1.1 200 OK\r\nContent-Length: 2000\r\n\r\n",
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n{}",
-            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive, close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive, close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}",
             "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n{}",
             "HTTP/1.1 20 OK\r\nContent-Length: 2\r\n\r\n{}",
             "HTTP/1.1 200 OK\r\n Content-Length: 2\r\n\r\n{}",
@@ -227,6 +225,29 @@ mod tests {
                 response(&mut client, Instant::now() + Duration::from_secs(1), 1024).is_err(),
                 "accepted ambiguous response: {raw}"
             );
+        }
+    }
+
+    #[test]
+    fn complete_final_response_survives_connection_close() {
+        for close in ["close", "keep-alive, Close"] {
+            let (mut client, mut server) = connected();
+            server
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nConnection: {close}\r\nContent-Length: 2\r\n\r\n{{}}"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            drop(server);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            assert_eq!(
+                response(&mut client, deadline, 1024).unwrap(),
+                (200, b"{}".to_vec())
+            );
+            // The closed connection is final: nothing further reads from it.
+            assert!(response(&mut client, deadline, 1024).is_err());
         }
     }
 
