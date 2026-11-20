@@ -691,4 +691,77 @@ class RuntimeHttp(unittest.TestCase):
         self.assertEqual(status,200,restarted)
         self.assertNotEqual(restarted['session']['id'],old)
 
+    def test_restart_needs_an_approver_who_is_still_trusted(self):
+        # K10: an approval is only as good as its approver today.
+        token=(pathlib.Path(self.state_dir)/'v2-owner.token').read_text()
+        def setup(name):
+            # Each space has exactly one human administrator, made with the space.
+            _,space=self.post(dict(request_id=name+'-space',tool='spaces.create',args={'name':name}),token)
+            sid=space['space']['id']; admin=space['administrator']
+            def call(tool,args,credential):return self.post(dict(request_id=str(time.time_ns()),tool=tool,space_id=sid,args=args),credential)
+            _,invite=call('members.invite',{'roles':['session_maintainer','manager']},token)
+            _,agent=call('members.register',{'name':'agent'},invite['invite_token'])
+            def launch(credential):
+                status,created=call('terminal.create',dict(shell_once('echo K10'),name=name),credential)
+                self.assertEqual(status,200,created)
+                eid=created['endpoint']['id']
+                for _ in range(100):
+                    _,listing=call('endpoints.list',{},token)
+                    if next(e for e in listing['items'] if e['id']==eid)['status']=='exited':break
+                    time.sleep(.05)
+                return eid,created['session']['id']
+            def restart(eid,old):return call('terminal.restart',{'endpoint_id':eid,'expected_session_id':old},agent['credential'])
+            return call,admin,agent,launch,restart
+        def denied(status,value):
+            self.assertEqual((status,value['error']['code']),(403,'Denied'),value)
+            self.assertIn('no longer trusted',value['error']['message'])
+        # Approver's credential revoked.
+        call,admin,agent,launch,restart=setup('k10-revoked')
+        eid,old=launch(admin['credential'])
+        status,value=call('members.revoke_credential',{'member_id':admin['id'],'expected_epoch':0},token)
+        self.assertEqual(status,200,value)
+        denied(*restart(eid,old))
+        # A new credential restores the person, not what the revoked one approved
+        # (a leaked credential's launches must not come back).
+        status,value=call('members.rotate_credential',{'member_id':admin['id'],'expected_epoch':1},token)
+        self.assertEqual(status,200,value)
+        denied(*restart(eid,old))
+        # What the person approves with the new credential counts.
+        eid,old=launch(value['credential'])
+        status,value=restart(eid,old)
+        self.assertEqual(status,200,value)
+        # The owner's approval stays valid in the same space.
+        eid,old=launch(token)
+        status,value=restart(eid,old)
+        self.assertEqual(status,200,value)
+        # Approver demoted to an agent role.
+        call,admin,agent,launch,restart=setup('k10-demoted')
+        eid,old=launch(admin['credential'])
+        # Routine rotation is not a break of trust: the approval still counts.
+        status,value=call('members.rotate_credential',{'member_id':admin['id'],'expected_epoch':0},token)
+        self.assertEqual(status,200,value)
+        admin['credential']=value['credential']
+        status,value=restart(eid,old)
+        self.assertEqual(status,200,value)
+        old=value['session']['id']
+        for _ in range(100):
+            _,listing=call('endpoints.list',{},token)
+            if next(e for e in listing['items'] if e['id']==eid)['status']=='exited':break
+            time.sleep(.05)
+        status,value=call('members.set_roles',{'member_id':admin['id'],'roles':['observer']},token)
+        self.assertEqual(status,200,value)
+        denied(*restart(eid,old))
+        # The agent, a manager, cannot promote the human back to restore the approval.
+        status,value=call('members.set_roles',{'member_id':admin['id'],'roles':['human_admin']},agent['credential'])
+        self.assertEqual((status,value['error']['code']),(403,'Denied'),value)
+        denied(*restart(eid,old))
+        # Only an owner can restore the human; the old approval still does not count,
+        # but what the restored human approves now does.
+        status,value=call('members.set_roles',{'member_id':admin['id'],'roles':['human_admin']},token)
+        self.assertEqual(status,200,value)
+        denied(*restart(eid,old))
+        eid,old=launch(admin['credential'])
+        status,value=restart(eid,old)
+        self.assertEqual(status,200,value)
+
 if __name__=='__main__':unittest.main()

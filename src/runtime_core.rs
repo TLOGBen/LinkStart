@@ -401,6 +401,13 @@ fn member_credential(secret: &str, key: &str, epoch: u64) -> String {
         derive(secret, "member-generation", &format!("{key}\0{epoch}"))
     }
 }
+/// How many times this member has lost launch trust; approvals record it (K10).
+pub(crate) fn trust_generation(member: &Value) -> u64 {
+    member["trust_generation"].as_u64().unwrap_or(0)
+}
+fn break_trust(member: &mut Value) {
+    member["trust_generation"] = json!(trust_generation(member).saturating_add(1));
+}
 fn credential_active(member: &Value, time: u64) -> bool {
     member["credential_revoked"] != true
         && member["credential_expires_at"]
@@ -623,7 +630,7 @@ fn credential_target<'a>(
     {
         return Err(err(
             "Denied",
-            "human credentials require a verified human administrator or owner",
+            "a human member's credentials and roles require a verified human administrator or owner",
         ));
     }
     Ok(target)
@@ -776,6 +783,41 @@ impl Engine {
                 || endpoint["grants"][identity]
                     .as_array()
                     .is_some_and(|ops| ops.iter().any(|op| op == operation))))
+    }
+    /// Whether the human who approved a terminal launch would still be allowed to
+    /// approve it now: the owner, or a human administrator of that space whose
+    /// credential is active and whose trust generation is still the one recorded
+    /// with the approval. The generation rises when trust breaks (a revoked
+    /// credential or a removed human_admin role; routine rotation and expiry are
+    /// not a break), so a counter rather than a clock decides. An approval does
+    /// not outlive its approver's trust.
+    pub fn launch_approver_trusted(
+        &self,
+        approved_by: &str,
+        space_id: &str,
+        approved_generation: u64,
+    ) -> Result<bool, ApiError> {
+        if approved_by == "owner" {
+            return Ok(true);
+        }
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let encoded: String = inner
+            .db
+            .query_row("SELECT json FROM core_state WHERE id=1", [], |r| r.get(0))
+            .map_err(internal)?;
+        let s: State = serde_json::from_str(&encoded).map_err(internal)?;
+        let time = (self.clock)();
+        Ok(s.members.iter().any(|m| {
+            m["id"] == approved_by
+                && m["space_id"] == space_id
+                && m["kind"] == "human"
+                && has(&m["roles"], "human_admin")
+                && credential_active(m, time)
+                && trust_generation(m) == approved_generation
+        }))
     }
     /// The proof for the usable credential named by `key_id`, or None when this
     /// Runtime knows no such credential (owner, active member, unused invite).
@@ -1259,9 +1301,11 @@ impl Engine {
         if invitation.is_none() {
             permission(owner, member.as_ref(), request)?;
         }
+        // A human's credential and roles are a human administrator's call: an
+        // agent manager must not restore a demoted approver's launches (K10).
         if matches!(
             request.tool.as_str(),
-            "members.rotate_credential" | "members.revoke_credential"
+            "members.rotate_credential" | "members.revoke_credential" | "members.set_roles"
         ) {
             credential_target(&s, owner, member.as_ref(), request)?;
         }
@@ -1628,7 +1672,8 @@ fn dispatch(
                         "launching a program requires a human administrator's approval; relaunch an approved terminal with terminal.restart",
                     ));
                 }
-                ep["launch_approval"] = json!({"approved_by":author,"approved_at":now()});
+                let generation = member.map_or(0, trust_generation);
+                ep["launch_approval"] = json!({"approved_by":author,"approved_at":now(),"approver_generation":generation});
             }
             s.endpoints.push(ep.clone());
             Ok(ep)
@@ -1789,6 +1834,11 @@ fn dispatch(
             }
             let mid = target["id"].clone();
             let target = s.members.iter_mut().find(|m| m["id"] == mid).unwrap();
+            if revoke && target["kind"] == "human" {
+                // A later rotation restores the person, not what was approved
+                // with the credential that had to be revoked (K10).
+                break_trust(target);
+            }
             target["credential_epoch"] = json!(next_epoch);
             target["credential_revoked"] = json!(revoke);
             target["credential_expires_at"] = json!(expires_at);
@@ -1830,6 +1880,10 @@ fn dispatch(
                 .iter_mut()
                 .find(|m| m["space_id"] == sid && m["id"] == mid)
                 .ok_or_else(|| err("NotFound", "member not found"))?;
+            if has(&m["roles"], "human_admin") && !has(&r.args["roles"], "human_admin") {
+                // Re-promotion later does not revive approvals made before (K10).
+                break_trust(m);
+            }
             m["roles"] = r.args["roles"].clone();
             Ok(public_member(m))
         }

@@ -938,10 +938,31 @@ fn dispatch(
         if authorization["endpoint"]["kind"] != "terminal" {
             return Err(error("Invalid", "endpoint is not terminal"));
         }
-        if !authorization["endpoint"]["launch_approval"]["approved_by"].is_string() {
+        let Some(approver) = authorization["endpoint"]["launch_approval"]["approved_by"].as_str()
+        else {
             return Err(error(
                 "Denied",
                 "terminal launch lacks a human administrator's approval",
+            ));
+        };
+        let space = authorization["endpoint"]["space_id"]
+            .as_str()
+            .unwrap_or_default();
+        // Approvals made before generations were recorded count as generation 0.
+        let generation = authorization["endpoint"]["launch_approval"]["approver_generation"]
+            .as_u64()
+            .unwrap_or(0);
+        // For terminal.restart only: HTTP revocations are serialized behind the
+        // same gate, so none lands between this check and the spawn; only a
+        // writer outside this Runtime could, within milliseconds, and revocation
+        // never stops a live process. (Owned launches recheck in approve().)
+        if !s
+            .engine
+            .launch_approver_trusted(approver, space, generation)?
+        {
+            return Err(error(
+                "Denied",
+                "the administrator who approved this launch is no longer trusted; a current human administrator must create it again",
             ));
         }
         let command = field(config, "command")?.to_string();
