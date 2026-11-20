@@ -675,7 +675,7 @@ $base='{base}'
 $entry=ConvertTo-Json -Compress -InputObject @($args)
 [IO.File]::AppendAllText((Join-Path $base 'calls.jsonl'),$entry+"`n",(New-Object System.Text.UTF8Encoding($false)))
 $endpoint=$args[1]
-if(Test-Path (Join-Path $base 'gate-read')){{while(-not (Test-Path (Join-Path $base 'release-read'))){{Start-Sleep -Milliseconds 20}}}}
+if(Test-Path (Join-Path $base 'gate-read')){{[IO.File]::AppendAllText((Join-Path $base 'gate-entered'),"x`n");while((Test-Path (Join-Path $base 'gate-read')) -and -not (Test-Path (Join-Path $base 'release-read'))){{Start-Sleep -Milliseconds 20}};[IO.File]::AppendAllText((Join-Path $base 'gate-left'),"x`n")}}
 if(Test-Path (Join-Path $base 'slow-read')){{Start-Sleep -Milliseconds 2000}}
 if($endpoint -match '/comments'){{
     $methodIndex=[Array]::IndexOf($args,'--method')
@@ -732,6 +732,32 @@ else{{throw ('unexpected fake endpoint '+$endpoint)}}
                 .lines()
                 .map(|s| serde_json::from_str(s).unwrap())
                 .collect()
+        }
+    }
+    impl Drop for Fixture {
+        // A fake gh waits for `release-read` while `gate-read` exists; once the
+        // temp dir is gone it can never see it and is orphaned. Release the
+        // gate on every exit path, panics included, and let every gated call
+        // leave before the temp dir is removed; a call that only reaches the
+        // gate while the dir is being removed leaves once `gate-read` is gone.
+        // The deadline only bounds a stuck child; a drop must not panic
+        // (hypothesis load-deadlines-3, item 4, Q8).
+        fn drop(&mut self) {
+            let base = self.dir.path();
+            if !base.join("gate-read").exists() {
+                return;
+            }
+            let _ = std::fs::write(base.join("release-read"), b"yes");
+            let count = |name: &str| {
+                std::fs::read_to_string(base.join(name))
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+            };
+            let until = std::time::Instant::now() + Duration::from_secs(60);
+            while count("gate-left") < count("gate-entered") && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
     }
     #[test]

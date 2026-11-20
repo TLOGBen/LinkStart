@@ -889,8 +889,23 @@ mod tests {
                 .status,
             "exited"
         );
-        // Shutdown walks every session, the poisoned one included.
-        assert!(manager.shutdown(Duration::from_secs(5)).is_empty());
+        // Shutdown walks every session, the poisoned one included, and reports
+        // the ones still running after the shared graceful budget; it does not
+        // promise they end in time (an interactive cmd.exe at its prompt
+        // swallows Ctrl-C), and force is a separate, explicit step
+        // (hypothesis load-deadlines-3, item 3, P5-P7).
+        let left = manager.shutdown(Duration::from_secs(5));
+        assert!(left.iter().all(|view| view.id != poisoned.id), "{left:?}");
+        assert!(
+            left.iter().all(|view| view.status == "stop_pending"),
+            "{left:?}"
+        );
+        // The deadline only stops a hung test.
+        for view in &left {
+            manager
+                .force_owned(&view.id, Duration::from_secs(60))
+                .unwrap();
+        }
         assert!(manager.list().iter().all(|view| view.status == "exited"));
     }
     #[test]
