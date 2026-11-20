@@ -14,6 +14,10 @@ if mode=='startup-descendant':
  assert kernel.GetProcessTimes(wintypes.HANDLE(int(child._handle)),*[ctypes.byref(t) for t in times])
  created=(times[0].dwHighDateTime<<32)|times[0].dwLowDateTime
  pathlib.Path('startup-child.json').write_text(json.dumps({'pid':child.pid,'creation_time':created,'root_pid':os.getpid()}),encoding='utf-8')
+if mode=='env':
+ # Names only, never values.
+ import os,pathlib
+ pathlib.Path('env-probe.json').write_text(json.dumps(sorted(k for k in os.environ if 'K13_CODEX' in k.upper())),encoding='utf-8')
 def send(v):
  print(json.dumps(v),flush=True)
 for line in sys.stdin:
