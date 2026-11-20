@@ -1546,6 +1546,19 @@ fn dispatch(
             if kind == "github" {
                 ep["source_authority"] = json!({"approved_by":author,"space_id":sid,"approved_at":now()});
             }
+            // A terminal that names a program is a launch: executable, arguments
+            // and workspace are chosen by a human, never by an agent.
+            if kind == "terminal" && !ep["config"]["command"].is_null() {
+                let human = owner
+                    || member.is_some_and(|m| m["kind"] == "human" && has(&m["roles"], "human_admin"));
+                if !human {
+                    return Err(err(
+                        "Denied",
+                        "launching a program requires a human administrator's approval; relaunch an approved terminal with terminal.restart",
+                    ));
+                }
+                ep["launch_approval"] = json!({"approved_by":author,"approved_at":now()});
+            }
             s.endpoints.push(ep.clone());
             Ok(ep)
         }

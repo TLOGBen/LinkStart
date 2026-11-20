@@ -867,6 +867,12 @@ fn dispatch(
         if authorization["endpoint"]["kind"] != "terminal" {
             return Err(error("Invalid", "endpoint is not terminal"));
         }
+        if !authorization["endpoint"]["launch_approval"]["approved_by"].is_string() {
+            return Err(error(
+                "Denied",
+                "terminal launch lacks a human administrator's approval",
+            ));
+        }
         let command = field(config, "command")?.to_string();
         let args: Vec<String> =
             serde_json::from_value(config["args"].clone()).map_err(|e| error("Invalid", e))?;
