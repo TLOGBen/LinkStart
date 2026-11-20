@@ -1280,8 +1280,9 @@ mod durable_projection_tests {
             )
             .unwrap()
     }
+    // Fields drop in declaration order: everything holding the store must go
+    // before the directory, or Windows cannot delete the open v2.sqlite3.
     struct Fixture {
-        dir: tempfile::TempDir,
         engine: Engine,
         admin: String,
         observer: String,
@@ -1290,6 +1291,7 @@ mod durable_projection_tests {
         plans: Arc<LaunchPolicyStore>,
         supervisor: Arc<OwnedSessionSupervisor>,
         bridge: Arc<OwnedControlBridge>,
+        dir: tempfile::TempDir,
     }
     impl Fixture {
         fn new() -> Self {

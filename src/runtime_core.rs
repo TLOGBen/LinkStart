@@ -3799,22 +3799,22 @@ mod tests {
         // SQLite is the system boundary. Inject writer contention; assert only public API behavior.
         let writer = Connection::open(dir.path().join("v2.sqlite3")).unwrap();
         writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        // The promise is checked by order, not a wall clock: the read answers,
+        // successfully, while the other connection still holds the reservation.
+        // A read that requested the writer lock cannot: it waits the store's
+        // busy_timeout and ends in "database is locked".
         let (tx, rx) = std::sync::mpsc::channel();
         let reader = e.clone();
         let worker = std::thread::spawn(move || {
             let _ = tx.send(reader.execute(&owner, &req("read", "spaces.list", None, json!({}))));
         });
-        let early = rx.recv_timeout(std::time::Duration::from_millis(300));
+        let answered_while_held = rx.recv().expect("reader thread ended without answering");
         writer.execute_batch("ROLLBACK").unwrap();
         worker.join().unwrap();
-        assert!(
-            early.is_ok(),
-            "read-only tool must finish while another connection holds the writer reservation"
+        let listed = answered_while_held.expect(
+            "read-only tool must succeed while another connection holds the writer reservation",
         );
-        assert_eq!(
-            early.unwrap().unwrap()["items"].as_array().unwrap().len(),
-            1
-        );
+        assert_eq!(listed["items"].as_array().unwrap().len(), 1);
     }
 
     #[test]
