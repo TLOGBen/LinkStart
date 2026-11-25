@@ -1280,8 +1280,9 @@ mod durable_projection_tests {
             )
             .unwrap()
     }
+    // Fields drop in declaration order: everything holding the store must go
+    // before the directory, or Windows cannot delete the open v2.sqlite3.
     struct Fixture {
-        dir: tempfile::TempDir,
         engine: Engine,
         admin: String,
         observer: String,
@@ -1290,6 +1291,7 @@ mod durable_projection_tests {
         plans: Arc<LaunchPolicyStore>,
         supervisor: Arc<OwnedSessionSupervisor>,
         bridge: Arc<OwnedControlBridge>,
+        dir: tempfile::TempDir,
     }
     impl Fixture {
         fn new() -> Self {
@@ -1405,7 +1407,7 @@ mod durable_projection_tests {
                         model: "gpt-6-luna".into(),
                         provider_version: "0.163.0".into(),
                         capability_evidence: "controlled protocol provider".into(),
-                        timeout: Duration::from_secs(3),
+                        timeout: PLAN_TIMEOUT,
                         profile: ExecutionProfile::ReadOnlyForum,
                     },
                 )
@@ -1466,21 +1468,72 @@ mod durable_projection_tests {
             }
         }
         fn wait(&self, condition: impl Fn() -> bool) {
-            let until = Instant::now() + Duration::from_secs(5);
+            let until = Instant::now() + hang_guard();
             while !condition() {
-                assert!(Instant::now() < until);
+                assert!(Instant::now() < until, "hang guard");
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
-        fn shutdown(&self) {
+        // hypothesis load-deadlines-4, G4: start-up ends on the plan's own
+        // budget, in Running or Unknown; wait for that outcome, as
+        // tests/runtime_control_bridge.rs `Fixture::running` does (6/30
+        // start-ups under load reached Running after 5 s).
+        fn running(&self, scope: &HostScope) {
+            let until = Instant::now() + hang_guard();
+            loop {
+                let status = self.supervisor.get_as(&self.admin, scope).unwrap();
+                if status.phase == crate::runtime_supervisor::SessionPhase::Running {
+                    return;
+                }
+                assert!(
+                    status.phase == crate::runtime_supervisor::SessionPhase::Starting,
+                    "worker did not become running: {:?} {:?}",
+                    status.phase,
+                    status.worker_failure
+                );
+                assert!(Instant::now() < until, "start-up never ended: {status:?}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        /// Whether every session left within the hang guard; never panics.
+        fn drain(&self) -> bool {
             self.supervisor.request_shutdown();
-            self.wait(|| self.supervisor.active_count() == 0);
+            let until = Instant::now() + hang_guard();
+            while self.supervisor.active_count() != 0 {
+                if Instant::now() >= until {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            true
+        }
+        fn shutdown(&self) {
+            assert!(self.drain(), "supervisor sessions did not drain");
         }
     }
+    // hypothesis load-deadlines-4, G4: also bounds the fake provider's python
+    // cold start. This test does not test timeouts; with 3 s, `initialize`
+    // under load ran out in 17/47 start-ups and the product rightly answered
+    // Unknown (P8), as with the 10 s plans in tests/ (load-deadlines, P6).
+    const PLAN_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Every wait here is for at most one provider request plus its shutdown,
+    /// both bounded by the plan's budget; the guard only stops a hung test.
+    fn hang_guard() -> Duration {
+        PLAN_TIMEOUT * 2 + Duration::from_secs(30)
+    }
     impl Drop for Fixture {
+        // hypothesis load-deadlines-4, G6: a drop runs while a failed test
+        // unwinds, and a second panic there aborts the whole test binary
+        // (0xC0000409), leaving every other test without a result and its
+        // gated fake gh orphaned. Report, never assert, here.
         fn drop(&mut self) {
             let _ = std::fs::write(self.dir.path().join("interrupt-release"), "");
-            self.shutdown();
+            if !self.drain() {
+                eprintln!(
+                    "durable_projection_tests: {} supervisor sessions still active after the hang guard",
+                    self.supervisor.active_count()
+                );
+            }
         }
     }
 
@@ -1490,10 +1543,7 @@ mod durable_projection_tests {
             let f = Fixture::new();
             let launch=f.bridge.execute(&f.admin,&f.request("launch","owned.launch",json!({"endpoint_id":f.binding.endpoint_id,"plan_id":"plan","expected_plan_revision":1}))).unwrap();
             let scope = f.scope(&launch);
-            f.wait(|| {
-                f.supervisor.get_as(&f.admin, &scope).unwrap().phase
-                    == crate::runtime_supervisor::SessionPhase::Running
-            });
+            f.running(&scope);
             let mut args = f.target(&launch);
             args["text"] = json!("active");
             let turn = f
@@ -1547,7 +1597,7 @@ mod durable_projection_tests {
                 .name("stale-get".into())
                 .spawn(move || bridge.execute(&actor, &g1request))
                 .unwrap();
-            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            entered_rx.recv_timeout(hang_guard()).unwrap();
             std::fs::write(f.dir.path().join("interrupt-release"), "").unwrap();
             f.wait(|| {
                 f.supervisor

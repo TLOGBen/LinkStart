@@ -366,7 +366,10 @@ fn queued_turn_and_read_delivery_keep_original_actor_authority() {
         v
     });
     let credential = actor.clone();
-    let read = std::thread::spawn(move || bridge.execute(&credential, &request));
+    let read = std::thread::spawn(move || {
+        let result = bridge.execute(&credential, &request);
+        (result, Instant::now())
+    });
     f.await_file("read-entered");
     let mut args = f.target(&launched);
     args["text"] = json!("must never send");
@@ -375,8 +378,23 @@ fn queued_turn_and_read_delivery_keep_original_actor_authority() {
         .execute(&actor, &f.request("queued", "owned.turn", args))
         .unwrap();
     f.grants(&id, &[]);
+    let revoked = Instant::now();
     std::fs::write(f.dir.path().join("read-release"), "").unwrap();
-    assert_eq!(read.join().unwrap().unwrap_err().code, "Denied");
+    // The read's own 1000 ms budget may end before the revocation commits;
+    // the product then answers Pending, checked against authority that was
+    // still current, and carries no provider data. An Ok is only possible
+    // before the revoking call returns (hypothesis load-deadlines-3, item 1, P1).
+    let (result, read_returned) = read.join().unwrap();
+    match result {
+        Err(e) => assert_eq!(e.code, "Denied"),
+        Ok(v) => {
+            assert_eq!(v, json!({"state":"pending"}));
+            assert!(
+                read_returned <= revoked,
+                "read answered Ok after the revocation committed"
+            );
+        }
+    }
     let until = Instant::now() + Duration::from_secs(3);
     loop {
         let mut args = f.target(&launched);
@@ -682,7 +700,22 @@ fn launch_without_get_recovers_exact_durable_thread_metadata_after_restart() {
     // Observe the real host durable boundary directly, without populating the
     // bridge status cache through get/list or the running helper.
     let host = rusqlite::Connection::open(f.dir.path().join("v2-codex-host.sqlite")).unwrap();
-    let until = Instant::now() + Duration::from_secs(4);
+    // The row is written once start-up admits the thread, which took up to
+    // 7.3 s under load; wait for the row, or fail at once if the supervisor
+    // says start-up ended Unknown. The supervisor is asked directly so the
+    // bridge status cache stays empty. The deadline only stops a hung test
+    // (hypothesis load-deadlines-2, A3).
+    let encoded_scope: String =
+        rusqlite::Connection::open(f.dir.path().join("v2-owned-control.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT scope FROM sessions WHERE id=?1",
+                [launch["session_id"].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+    let scope: HostScope = serde_json::from_str(&encoded_scope).unwrap();
+    let until = Instant::now() + Duration::from_secs(60);
     let expected: String = loop {
         use rusqlite::OptionalExtension;
         let found: Option<String> = host
@@ -696,7 +729,13 @@ fn launch_without_get_recovers_exact_durable_thread_metadata_after_restart() {
         if let Some(thread) = found {
             break thread;
         }
-        assert!(Instant::now() < until);
+        let status = f.supervisor.get_as(&f.admin, &scope).unwrap();
+        assert!(
+            status.phase != SessionPhase::Unknown,
+            "start-up ended Unknown: {:?}",
+            status.worker_failure
+        );
+        assert!(Instant::now() < until, "start-up never ended: {status:?}");
         std::thread::sleep(Duration::from_millis(5));
     };
     let bridge_db =
@@ -938,7 +977,24 @@ fn f5_get_first_terminal(outcome: &str) {
     assert_eq!(f5_durable_body(&f, &turn), first);
     args["wait_ms"] = json!(1000);
     let reconcile = f.request("f5-reconcile", "owned.operation.reconcile", args);
-    let observed = f.bridge.execute(&f.admin, &reconcile).unwrap();
+    // wait_ms is capped at 1000 ms. A provider read that misses it is Pending,
+    // and the bridge keeps returning the retained first envelope (no
+    // observation, durable body unchanged); that is the promise, so check it on
+    // every such reply and reconcile again until the read is answered. The
+    // deadline only stops a hung test (hypothesis load-deadlines-2, A6).
+    let until = Instant::now() + Duration::from_secs(60);
+    let observed = loop {
+        let reply = f.bridge.execute(&f.admin, &reconcile).unwrap();
+        if reply.get("observation").is_some() {
+            break reply;
+        }
+        assert_eq!(
+            reply, first,
+            "unanswered read must return retained evidence"
+        );
+        assert_eq!(f5_durable_body(&f, &turn), first);
+        assert!(Instant::now() < until, "provider read never answered");
+    };
     eprintln!("F5 {outcome} get-first={first}; reconcile={observed}");
     assert_eq!(
         observed["observation"]["outcome"], outcome,
@@ -970,10 +1026,25 @@ fn f5_get_first_terminal(outcome: &str) {
     // A real exact provider read can contradict its prior terminal report. Do
     // not turn that incoming positive evidence into an admitted typed response.
     std::fs::write(f.dir.path().join("contradictory-read"), "").unwrap();
-    assert_eq!(
-        f.bridge.execute(&f.admin, &reconcile).unwrap_err().code,
-        "Conflict"
-    );
+    // A read that misses wait_ms is not evidence: reconcile returns the
+    // admitted observation unchanged. Retry until the contradiction arrives in
+    // time and is refused, checking the retained evidence each time. The
+    // deadline only stops a hung test (hypothesis load-deadlines-2, A7).
+    let until = Instant::now() + Duration::from_secs(60);
+    let refused = loop {
+        match f.bridge.execute(&f.admin, &reconcile) {
+            Ok(reply) => {
+                assert_eq!(
+                    reply, observed,
+                    "unanswered read must return retained evidence"
+                );
+                assert_eq!(f5_durable_body(&f, &turn), observed);
+                assert!(Instant::now() < until, "provider read never answered");
+            }
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(refused.code, "Conflict");
     assert_eq!(f5_durable_body(&f, &turn), observed);
     assert_eq!(f.bridge.execute(&f.admin, &get).unwrap(), observed);
     std::fs::remove_file(f.dir.path().join("contradictory-read")).unwrap();
@@ -1216,6 +1287,38 @@ async fn http(
     request: Option<ToolRequest>,
 ) -> (u16, Value) {
     tokio::task::spawn_blocking(move||{use std::io::{Read,Write};let mut stream=std::net::TcpStream::connect(addr).unwrap();stream.set_read_timeout(Some(Duration::from_secs(4))).unwrap();let body=request.as_ref().map(|r|serde_json::to_string(r).unwrap()).unwrap_or_default();let path=if request.is_some(){"/v2/tools"}else{"/v2/health"};let method=if request.is_some(){"POST"}else{"GET"};write!(stream,"{method} {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {actor}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();let mut response=String::new();stream.read_to_string(&mut response).unwrap();let (headers,body)=response.split_once("\r\n\r\n").unwrap();let status=headers.split_whitespace().nth(1).unwrap().parse().unwrap();(status,serde_json::from_str(body).unwrap())}).await.unwrap()
+}
+
+/// The terminal's interpreter cold start took 1.3-6.5 s under load, so wait for
+/// its `terminal-ready` file, failing at once with the terminal's output if it
+/// is no longer live. The deadline only stops a hung test
+/// (hypothesis load-deadlines-2, A4).
+async fn await_terminal_ready(
+    f: &Fixture,
+    addr: std::net::SocketAddr,
+    host: &str,
+    endpoint: &Value,
+) {
+    let until = Instant::now() + Duration::from_secs(60);
+    while !f.dir.path().join("terminal-ready").exists() {
+        let (_, observed) = http(
+            addr,
+            host.into(),
+            f.admin.clone(),
+            Some(f.request(
+                "ready-observe",
+                "terminal.observe",
+                json!({ "endpoint_id": endpoint }),
+            )),
+        )
+        .await;
+        assert_eq!(
+            observed["status"], "live",
+            "terminal ended before terminal-ready: {observed}"
+        );
+        assert!(Instant::now() < until, "missing terminal-ready: {observed}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1606,9 +1709,9 @@ async fn posix_shutdown_terminal_wait_releases_global_http_gate() {
         .output()
         .unwrap();
     let script="import signal,time,pathlib\nsignal.signal(signal.SIGINT,lambda *_:pathlib.Path('shutdown-entered').touch())\npathlib.Path('terminal-ready').touch()\nwhile not pathlib.Path('terminal-release').exists():time.sleep(0.01)";
-    let (status,_)=http(addr,host.clone(),f.admin.clone(),Some(f.request("terminal","terminal.create",json!({"command":String::from_utf8(python.stdout).unwrap().trim(),"args":["-u","-c",script],"cwd":f.dir.path()})))).await;
+    let (status,created)=http(addr,host.clone(),f.admin.clone(),Some(f.request("terminal","terminal.create",json!({"command":String::from_utf8(python.stdout).unwrap().trim(),"args":["-u","-c",script],"cwd":f.dir.path()})))).await;
     assert_eq!(status, 200);
-    f.await_file("terminal-ready");
+    await_terminal_ready(&f, addr, &host, &created["endpoint"]["id"]).await;
     let owner = std::fs::read_to_string(owner_token_path(f.dir.path())).unwrap();
     let other = exec(
         &f.engine,
@@ -1722,7 +1825,7 @@ print('windows-native-final-tail',flush=True)
 "#;
     let (status, created) = http(addr, host.clone(), f.admin.clone(), Some(f.request("u1-terminal", "terminal.create", json!({"command":String::from_utf8(python.stdout).unwrap().trim(),"args":["-u","-c",script],"cwd":f.dir.path()})))).await;
     assert_eq!(status, 200, "{created}");
-    f.await_file("terminal-ready");
+    await_terminal_ready(&f, addr, &host, &created["endpoint"]["id"]).await;
     let owner = std::fs::read_to_string(owner_token_path(f.dir.path())).unwrap();
     let other = exec(
         &f.engine,
@@ -1737,82 +1840,110 @@ print('windows-native-final-tail',flush=True)
         space_id: None,
         args,
     };
-    let (_, prepared) = http(
-        addr,
-        host.clone(),
-        owner.clone(),
-        Some(shutdown_request("runtime.prepare_shutdown", json!({}))),
-    )
-    .await;
-    let shutdown = tokio::spawn(http(
-        addr,
-        host.clone(),
-        owner.clone(),
-        Some(shutdown_request(
-            "runtime.confirm_shutdown",
-            json!({"ticket":prepared["ticket"]}),
-        )),
-    ));
-    f.await_file("shutdown-entered");
-    assert_eq!(
-        std::fs::read_to_string(f.dir.path().join("shutdown-entered")).unwrap(),
-        "0",
-        "actual Windows CTRL_C_EVENT required"
-    );
-    assert!(
-        !shutdown.is_finished(),
-        "native cleanup must still be waiting"
-    );
-    let forum_request = ToolRequest {
-        request_id: "u1-other-forum".into(),
-        tool: "topics.list".into(),
-        space_id: Some(other["space"]["id"].as_str().unwrap().into()),
-        args: json!({}),
-    };
-    let began = Instant::now();
-    let (health, forum) = tokio::join!(
-        tokio::time::timeout(
-            Duration::from_millis(200),
-            http(addr, host.clone(), f.admin.clone(), None)
-        ),
-        tokio::time::timeout(
-            Duration::from_millis(200),
-            http(
-                addr,
-                host.clone(),
-                other["administrator"]["credential"]
-                    .as_str()
-                    .unwrap()
-                    .into(),
-                Some(forum_request)
-            )
+    let entered = f.dir.path().join("shutdown-entered");
+    // Order, not wall clock: under the global HTTP gate, health and the other
+    // space's forum could not complete before the confirm response, so both
+    // completing first is the evidence. The 500 ms cleanup budget starts when
+    // the product sends Ctrl-C, and seeing the handler's file can eat that
+    // window; the child swallows Ctrl-C, so a confirm that answered first with
+    // `stop_pending` is the event to prepare, confirm and send health/forum
+    // again. The deadline only stops a hung test
+    // (hypothesis load-deadlines-3, item 2a, P3 and P4).
+    let until = Instant::now() + Duration::from_secs(60);
+    let mut attempt = 0;
+    let (health, forum, pending, began) = loop {
+        attempt += 1;
+        let (_, prepared) = http(
+            addr,
+            host.clone(),
+            owner.clone(),
+            Some(shutdown_request("runtime.prepare_shutdown", json!({}))),
         )
-    );
-    let overlapped = !shutdown.is_finished();
-    // Keep the real child alive through the entire native 500ms cleanup budget.
-    let pending = tokio::time::timeout(Duration::from_secs(3), shutdown)
-        .await
-        .unwrap()
-        .unwrap();
+        .await;
+        let confirm = http(
+            addr,
+            host.clone(),
+            owner.clone(),
+            Some(shutdown_request(
+                "runtime.confirm_shutdown",
+                json!({"ticket":prepared["ticket"]}),
+            )),
+        );
+        let shutdown = tokio::spawn(async move { (confirm.await, Instant::now()) });
+        // The handler's write_text creates the file before it writes "0"; wait
+        // for the content, not the file (hypothesis load-deadlines-3, item 2b, P2).
+        let content = loop {
+            match std::fs::read_to_string(&entered) {
+                Ok(content) if !content.is_empty() => break content,
+                _ => {}
+            }
+            assert!(
+                Instant::now() < until,
+                "Ctrl-C handler never wrote {entered:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(content, "0", "actual Windows CTRL_C_EVENT required");
+        let forum_request = ToolRequest {
+            request_id: format!("u1-other-forum-{attempt}"),
+            tool: "topics.list".into(),
+            space_id: Some(other["space"]["id"].as_str().unwrap().into()),
+            args: json!({}),
+        };
+        let began = Instant::now();
+        let (health, forum) = tokio::join!(
+            async {
+                let r = http(addr, host.clone(), f.admin.clone(), None).await;
+                (r, Instant::now())
+            },
+            async {
+                let r = http(
+                    addr,
+                    host.clone(),
+                    other["administrator"]["credential"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                    Some(forum_request),
+                )
+                .await;
+                (r, Instant::now())
+            }
+        );
+        let (pending, answered) = tokio::time::timeout(Duration::from_secs(60), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        // Every confirm keeps the real child alive through the whole native
+        // 500 ms cleanup budget and answers `stop_pending`.
+        assert_eq!(pending.0, 200);
+        assert_eq!(pending.1["status"], "pending", "{}", pending.1);
+        assert_eq!(
+            pending.1["remaining"][0]["status"], "stop_pending",
+            "{}",
+            pending.1
+        );
+        if health.1 < answered && forum.1 < answered {
+            break (health.0, forum.0, pending, began);
+        }
+        assert!(
+            Instant::now() < until,
+            "health/forum never completed before the confirm response: blocked on Windows native cleanup"
+        );
+        // The previous handler may still hold the file open; retry until gone.
+        while let Err(e) = std::fs::remove_file(&entered) {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                break;
+            }
+            assert!(Instant::now() < until, "{e}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
     std::fs::write(f.dir.path().join("terminal-release"), "").unwrap();
-    assert!(
-        overlapped,
-        "health/forum must complete during native cleanup wait"
-    );
-    assert!(health.is_ok(), "health blocked on Windows native cleanup");
-    assert!(
-        forum.is_ok(),
-        "other-space forum blocked on Windows native cleanup"
-    );
-    let health = health.unwrap();
-    let forum = forum.unwrap();
     assert_eq!(health.0, 200);
     assert_eq!(health.1["status"], "draining");
     assert_eq!(forum.0, 200);
-    assert_eq!(pending.0, 200);
-    assert_eq!(pending.1["status"], "pending");
-    assert_eq!(pending.1["remaining"][0]["status"], "stop_pending");
-    eprintln!("U1 Windows native CTRL_C_EVENT pid={} concurrent_health={} concurrent_forum={} elapsed_ms={} first_shutdown={}", std::fs::read_to_string(f.dir.path().join("terminal-ready")).unwrap(),health.0,forum.0,began.elapsed().as_millis(),pending.1);
+    eprintln!("U1 Windows native CTRL_C_EVENT pid={} concurrent_health={} concurrent_forum={} elapsed_ms={} attempts={attempt} first_shutdown={}", std::fs::read_to_string(f.dir.path().join("terminal-ready")).unwrap(),health.0,forum.0,began.elapsed().as_millis(),pending.1);
     // Observe the actual owned exit, then retry shutdown until tail/EOF is durable.
     let until = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1833,23 +1964,40 @@ print('windows-native-final-tail',flush=True)
         assert!(Instant::now() < until, "{observed}");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let (_, prepared) = http(
-        addr,
-        host.clone(),
-        owner.clone(),
-        Some(shutdown_request("runtime.prepare_shutdown", json!({}))),
-    )
-    .await;
-    let (_, final_shutdown) = http(
-        addr,
-        host,
-        owner,
-        Some(shutdown_request(
-            "runtime.confirm_shutdown",
-            json!({"ticket":prepared["ticket"]}),
-        )),
-    )
-    .await;
+    // The history barrier has its own 750 ms budget and, under load, a confirm
+    // can return pending with nothing left to stop and `history flush pending`;
+    // that is the promise, so prepare and confirm again until `stopping`. Any
+    // other pending reason fails at once. The deadline only stops a hung test
+    // (hypothesis load-deadlines-2, A5).
+    let until = Instant::now() + Duration::from_secs(60);
+    let final_shutdown = loop {
+        let (_, prepared) = http(
+            addr,
+            host.clone(),
+            owner.clone(),
+            Some(shutdown_request("runtime.prepare_shutdown", json!({}))),
+        )
+        .await;
+        let (_, final_shutdown) = http(
+            addr,
+            host.clone(),
+            owner.clone(),
+            Some(shutdown_request(
+                "runtime.confirm_shutdown",
+                json!({"ticket":prepared["ticket"]}),
+            )),
+        )
+        .await;
+        let history_pending = final_shutdown["status"] == "pending"
+            && final_shutdown["remaining"] == json!([])
+            && final_shutdown["history_error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("history flush pending"));
+        if !history_pending {
+            break final_shutdown;
+        }
+        assert!(Instant::now() < until, "{final_shutdown}");
+    };
     assert_eq!(final_shutdown["status"], "stopping", "{final_shutdown}");
     assert_eq!(final_shutdown["history"], "durable");
     eprintln!("U1 Windows actual exit and history EOF/flush: {final_shutdown}");
