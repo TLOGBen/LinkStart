@@ -16,6 +16,15 @@ pub(crate) struct Owner {
     _file: File,
 }
 
+// A child another thread forks shares this handle's flock until its exec;
+// unlocking releases it for every copy, closing alone may not (see
+// `linkstart::file_lock`, hypothesis load-deadlines-2, P1).
+impl Drop for Owner {
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+
 impl Owner {
     pub(crate) fn acquire(state_dir: &Path) -> io::Result<Self> {
         Self::acquire_impl(state_dir, || {})
