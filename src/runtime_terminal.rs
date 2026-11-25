@@ -971,19 +971,43 @@ pub(crate) mod tests {
             ("/bin/sh", vec!["-c".into(), "env; echo ENV_DONE".into()])
         };
         let s = started(|| manager.create(command.into(), args.clone(), None));
+        // A failure reports variable names only: the child's environment is the
+        // test runner's, so its values may hold real tokens.
+        let names = |text: &str| {
+            text.lines()
+                .filter_map(|line| line.split_once('=').map(|(name, _)| name.trim()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let deadline = Instant::now() + HANG_GUARD;
         let text = loop {
             let text = manager.observe(&s.id, 0).unwrap().text;
             if text.contains("ENV_DONE") {
                 break text;
             }
-            assert!(Instant::now() < deadline, "env never printed: {text}");
+            assert!(
+                Instant::now() < deadline,
+                "env never printed; names so far: {}",
+                names(&text)
+            );
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert!(text.contains("LINKSTART_ENV_KEEP_PROBE=kept"), "{text}");
-        assert!(text.contains("CLAUDE_CODE_SKIP_BEDROCK_AUTH=1"), "{text}");
-        assert!(!text.contains("CLAUDE_CODE_CHILD_SESSION"), "{text}");
-        assert!(!text.contains("host-secret"), "{text}");
+        assert!(
+            text.contains("LINKSTART_ENV_KEEP_PROBE=kept"),
+            "{}",
+            names(&text)
+        );
+        assert!(
+            text.contains("CLAUDE_CODE_SKIP_BEDROCK_AUTH=1"),
+            "{}",
+            names(&text)
+        );
+        assert!(
+            !text.contains("CLAUDE_CODE_CHILD_SESSION"),
+            "{}",
+            names(&text)
+        );
+        assert!(!text.contains("host-secret"), "{}", names(&text));
     }
     #[test]
     fn owned_terminal_starts_a_real_child() {
