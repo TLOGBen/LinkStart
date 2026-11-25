@@ -33,9 +33,15 @@ class RuntimeHttp(unittest.TestCase):
                 release=pathlib.Path(self.tmp.name)/('release-'+action)
                 tail_time=pathlib.Path(self.tmp.name)/('tail-time-'+action)
                 marker='CLI_FINAL_TAIL_'+action
-                script="import pathlib,time\np=pathlib.Path("+repr(str(release))+")\nprint('CLI_ACTIVE_READY',flush=True)\ntry:\n while not p.exists():time.sleep(.01)\nexcept KeyboardInterrupt:pass\nprint("+repr(marker)+",flush=True)\npathlib.Path("+repr(str(tail_time))+").write_text(str(time.time_ns()))\n"
+                # Once out of the wait loop the child ignores Ctrl-C: under load the
+                # shutdown interrupt can land after release, while the tail is being
+                # written, and cut it (hypothesis load-deadlines-2, B-1: 34/236).
+                script="import pathlib,signal,time\np=pathlib.Path("+repr(str(release))+")\nprint('CLI_ACTIVE_READY',flush=True)\ntry:\n while not p.exists():time.sleep(.01)\n signal.signal(signal.SIGINT,signal.SIG_IGN)\nexcept KeyboardInterrupt:signal.signal(signal.SIGINT,signal.SIG_IGN)\nprint("+repr(marker)+",flush=True)\npathlib.Path("+repr(str(tail_time))+").write_text(str(time.time_ns()))\n"
                 token,sid,created=self.recorded_terminal('cli-'+action,script)
                 eid=created['endpoint']['id']; session=created['session']['id']
+                # (pid, creation time), so a live PID at the check can be told apart
+                # from a reused one (hypothesis load-deadlines-2, B).
+                terminal_identity=self.process_identity(created['session']['process_id'])
                 def call(tool,args):return self.post(dict(request_id=str(time.time_ns()),tool=tool,space_id=sid,args=args),token)
                 for _ in range(80):
                     status,view=call('terminal.observe',{'endpoint_id':eid,'cursor':0})
@@ -49,11 +55,28 @@ class RuntimeHttp(unittest.TestCase):
                 result=self.cli_control(action)
                 cli_returned=time.time_ns()
                 timer.join()
+                if result.returncode!=0 and 'did not exit after interrupt' in result.stderr:
+                    # The runtime gives terminals 500 ms after the interrupt and
+                    # otherwise reports this pending and stays draining; wait for the
+                    # terminal to exit, then ask again (hypothesis load-deadlines-2, B-2).
+                    until=time.time()+60
+                    while True:
+                        status,view=call('terminal.observe',{'endpoint_id':eid,'cursor':0})
+                        self.assertEqual(status,200,view)
+                        if view['status']=='exited':break
+                        self.assertLess(time.time(),until,view)
+                        time.sleep(.05)
+                    result=self.cli_control(action)
+                    cli_returned=time.time_ns()
                 self.assertEqual(result.returncode,0,result.stderr+' '+result.stdout)
                 control=json.loads(result.stdout)
                 if self.child.pid==before['pid']:self.child.wait(timeout=5)
                 self.assertFalse(self.pid_alive(before['pid']))
-                self.assertFalse(self.pid_alive(created['session']['process_id']))
+                at_check=self.process_identity(created['session']['process_id'])
+                self.assertFalse(at_check is not None and at_check==terminal_identity,
+                    'terminal process still alive after daemon '+action+': '+json.dumps({'created':terminal_identity,'at_check':at_check,'daemon':result.stdout+' '+result.stderr}))
+                if at_check is not None:
+                    print(json.dumps({'evidence':'terminal-pid-reused','action':action,'created':terminal_identity,'at_check':at_check}),flush=True)
                 root=pathlib.Path(self.state_dir)/'connections'/eid/'sessions'/session
                 saved=json.loads((root/'checkpoint.json').read_text())
                 self.assertEqual(saved['status'],'exited',saved)
@@ -82,6 +105,26 @@ class RuntimeHttp(unittest.TestCase):
             else:
                 try:os.kill(pid,9)
                 except ProcessLookupError:pass
+
+    @classmethod
+    def process_identity(cls,pid):
+        # (pid, creation time) of a live process, or None if pid is not alive.
+        if not cls.pid_alive(pid):return None
+        if os.name=='nt':
+            import ctypes
+            from ctypes import wintypes
+            kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+            kernel.OpenProcess.restype=ctypes.c_void_p
+            kernel.GetProcessTimes.argtypes=[ctypes.c_void_p]+[ctypes.POINTER(wintypes.FILETIME)]*4
+            kernel.CloseHandle.argtypes=[ctypes.c_void_p]
+            handle=kernel.OpenProcess(0x1000,False,pid)
+            if not handle:return None
+            times=[wintypes.FILETIME() for _ in range(4)]
+            ok=kernel.GetProcessTimes(handle,*[ctypes.byref(t) for t in times]);kernel.CloseHandle(handle)
+            return [pid,(times[0].dwHighDateTime<<32)|times[0].dwLowDateTime] if ok else None
+        try:stat=pathlib.Path('/proc/%d/stat'%pid).read_text()
+        except OSError:return None
+        return [pid,int(stat.rsplit(')',1)[1].split()[19])]
 
     @staticmethod
     def pid_alive(pid):

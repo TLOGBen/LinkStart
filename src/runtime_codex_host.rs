@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    fs::File,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
@@ -626,8 +625,11 @@ impl OwnedCodexRegistry {
             .write(true)
             .open(&lock_path)
             .map_err(io)?;
-        lock.try_lock()
-            .map_err(|_| denied("owned session already has a live host"))?;
+        // Unlocked on drop, so a child forked meanwhile cannot hold it (P1).
+        let lock = crate::file_lock::FileLock::try_acquire(lock)
+            .ok()
+            .flatten()
+            .ok_or_else(|| denied("owned session already has a live host"))?;
         crate::runtime_core::protect(&lock_path).map_err(io)?;
         let db = self.db()?;
         let generation:u64=db.query_row("INSERT INTO host_generations(session,generation) VALUES(?1,1) ON CONFLICT(session) DO UPDATE SET generation=generation+1 RETURNING generation",[&scope.session_id],|r|r.get(0)).map_err(io)?;
@@ -778,8 +780,8 @@ pub struct OwnedCodexHost {
     alive: Arc<AtomicBool>,
     instance: String,
     generation: u64,
-    _lock: File,
-    thread_lock: Option<File>,
+    _lock: crate::file_lock::FileLock,
+    thread_lock: Option<crate::file_lock::FileLock>,
     next_id: u64,
     thread: Option<String>,
     turn: Option<String>,
@@ -826,8 +828,10 @@ impl OwnedCodexHost {
             .write(true)
             .open(&path)
             .map_err(io)?;
-        lock.try_lock()
-            .map_err(|_| denied("exact owned thread already has a live host"))?;
+        let lock = crate::file_lock::FileLock::try_acquire(lock)
+            .ok()
+            .flatten()
+            .ok_or_else(|| denied("exact owned thread already has a live host"))?;
         crate::runtime_core::protect(&path).map_err(io)?;
         self.thread_lock = Some(lock);
         Ok(())

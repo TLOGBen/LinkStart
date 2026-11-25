@@ -348,9 +348,13 @@ fn repair_grant_matrix_admits_only_each_command_authority() {
             .unwrap();
         f.wait_operation(&s, "active-matrix", OperationPhase::Accepted);
         f.grants(&grants);
-        let read = s
-            .read_exact_thread(&f.token, &f.scope, Duration::from_millis(300))
-            .is_ok();
+        // Only Denied is a refusal: a command admitted but not answered within
+        // its wait is Pending, which says nothing about authority
+        // (hypothesis load-deadlines-2, owned_supervisor.rs:378 matrix note).
+        let read = !matches!(
+            s.read_exact_thread(&f.token, &f.scope, Duration::from_millis(300)),
+            Err(SupervisorError::Denied)
+        );
         let reconcile_allowed = !matches!(
             s.reconcile(
                 &f.token,
@@ -360,20 +364,21 @@ fn repair_grant_matrix_admits_only_each_command_authority() {
             ),
             Err(SupervisorError::Denied)
         );
-        let interrupt = s
-            .interrupt(&f.token, &f.scope, Duration::from_millis(300))
-            .is_ok();
-        let turn = s
-            .start_turn(&f.token, &f.scope, "new-matrix".into(), "queued".into())
-            .is_ok();
-        let stopped = s.stop(&f.token, &f.scope, Duration::from_secs(3)).is_ok();
+        let interrupt = !matches!(
+            s.interrupt(&f.token, &f.scope, Duration::from_millis(300)),
+            Err(SupervisorError::Denied)
+        );
+        let turn = !matches!(
+            s.start_turn(&f.token, &f.scope, "new-matrix".into(), "queued".into()),
+            Err(SupervisorError::Denied)
+        );
+        let stopped = !matches!(
+            s.stop(&f.token, &f.scope, Duration::from_secs(3)),
+            Err(SupervisorError::Denied)
+        );
         observed.push((grants[0], read, reconcile_allowed, interrupt, turn, stopped));
         s.request_shutdown();
-        let deadline = Instant::now() + Duration::from_secs(4);
-        while s.active_count() > 0 {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        f.worker_exited(&s);
     }
     assert_eq!(
         observed,
@@ -582,11 +587,7 @@ fn repair_initialization_and_exact_resume_failure_clean_up_and_join() {
             admission,
         )
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while s.active_count() > 0 {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        f.worker_exited(&s);
         let stopped = s.stop(&f.token, &f.scope, Duration::ZERO).unwrap();
         assert!(stopped.worker_exited);
         assert_eq!(stopped.phase, SessionPhase::Unknown);
@@ -642,6 +643,7 @@ fn repair_startup_deadline_reports_unknown_initialize_and_cleans_up() {
     let s = f.supervisor();
     let mut config = f.config(false);
     config.timeout = Duration::from_millis(150);
+    let startup_budget = config.timeout;
     let script=std::fs::read_to_string(&config.args[0]).unwrap().replace("if method=='initialize': send(","if method=='initialize':\n  import time\n  open('startup-trace.txt','a').write('initialize_received '+str(time.time())+'\\n')\n  time.sleep(0.3)\n  send(");
     std::fs::write(&config.args[0], script).unwrap();
     s.start(
@@ -651,10 +653,29 @@ fn repair_startup_deadline_reports_unknown_initialize_and_cleans_up() {
         ThreadAdmission::New,
     )
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Spawn has no budget of its own and took 2.2-3.6 s under load, so "cleans
+    // up quickly" is timed from the first poll that sees the worker past Spawn:
+    // the 150 ms initialize budget plus OwnedCodexHost::close's 2 s wait for the
+    // child, plus margin (hypothesis load-deadlines-2, A2). Waiting for the exit
+    // itself only has the hang guard.
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    let mut past_spawn: Option<Instant> = None;
     while s.active_count() > 0 {
-        assert!(Instant::now() < deadline);
+        if past_spawn.is_none()
+            && s.get(&f.token, &f.scope).unwrap().worker_stage != WorkerStage::Spawn
+        {
+            past_spawn = Some(Instant::now());
+        }
+        assert!(Instant::now() < hang_guard, "worker never exited");
         std::thread::sleep(Duration::from_millis(10));
+    }
+    if let Some(entered) = past_spawn {
+        let cleanup_bound = startup_budget + Duration::from_secs(2) + Duration::from_secs(3);
+        assert!(
+            entered.elapsed() < cleanup_bound,
+            "exit took {:?} after Initialize began (bound {cleanup_bound:?})",
+            entered.elapsed()
+        );
     }
     let status = s.get(&f.token, &f.scope).unwrap();
     let failure = status.worker_failure.as_ref().unwrap();
@@ -877,6 +898,17 @@ impl Fixture {
             SupervisorOptions::default(),
         )
         .unwrap()
+    }
+    fn worker_exited(&self, s: &OwnedSessionSupervisor) {
+        // A failed start-up ends on its own (Spawn, then the provider's cold
+        // start up to 4.9 s under load, then Cleanup); the test waits for the
+        // worker to exit, not a wall-clock guess (hypothesis load-deadlines-2,
+        // A1: 7.3 s observed). The deadline only stops a hung test.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while s.active_count() > 0 {
+            assert!(Instant::now() < deadline, "worker never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     fn running(&self, s: &OwnedSessionSupervisor) {
         // Start-up ends on its own budget, in Running or Unknown; the test waits

@@ -616,7 +616,11 @@ mod tests {
         )
     }
     fn until(mut condition: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // hypothesis load-deadlines-4, G1a: a condition here waits for at most
+        // two watch rounds of fake gh calls (the one in flight and the next);
+        // the guard comes from the product's budget for those four calls and
+        // only stops a hung test, it is not a promise about speed.
+        let deadline = Instant::now() + Fixture::hang_guard(4);
         while !condition() {
             assert!(Instant::now() < deadline, "watch condition timed out");
             std::thread::sleep(Duration::from_millis(20));

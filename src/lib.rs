@@ -1,3 +1,4 @@
+pub mod file_lock;
 pub mod runtime_agent;
 pub mod runtime_codex_host;
 pub mod runtime_control_bridge;

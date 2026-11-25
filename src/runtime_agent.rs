@@ -481,9 +481,12 @@ impl AgentRunner {
                 let ownership = worker_ownership;
                 #[cfg(test)]
                 runner.test_event("before_worker");
-                if let Err(error) =
-                    runner.run_with_count(&worker_credential, &request, true, Some(&ownership))
-                {
+                if let Err(error) = runner.run_with_count(
+                    &worker_credential,
+                    &request,
+                    true,
+                    Some(ownership.as_ref()),
+                ) {
                     // Covers errors before execution owns its local record (e.g. revocation
                     // between admission and the worker's initial authorization).
                     let mut record = runner.record(&request.job_id).unwrap_or(accepted);
@@ -844,7 +847,10 @@ impl AgentRunner {
         }
         Ok(())
     }
-    fn try_ownership(&self, job_id: &str) -> Result<Option<std::fs::File>, ApiError> {
+    /// The job lock is released by unlocking, so a child forked meanwhile by
+    /// another thread cannot keep it held past the job (hypothesis
+    /// load-deadlines-2, P1).
+    fn try_ownership(&self, job_id: &str) -> Result<Option<crate::file_lock::FileLock>, ApiError> {
         let locks = self.dir.join("agent-locks");
         std::fs::create_dir_all(&locks).map_err(internal)?;
         let file = std::fs::OpenOptions::new()
@@ -854,11 +860,7 @@ impl AgentRunner {
             .truncate(false)
             .open(locks.join(format!("{}.lock", digest(job_id))))
             .map_err(internal)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(file)),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => Err(internal(e)),
-        }
+        crate::file_lock::FileLock::try_acquire(file).map_err(internal)
     }
     fn observe_busy(&self, credential: &str, job_id: &str) -> Result<JobSnapshot, ApiError> {
         match self.record(job_id) {
@@ -1169,7 +1171,7 @@ impl AgentRunner {
         credential: &str,
         request: &JobRequest,
         counted: bool,
-        ownership: Option<&std::fs::File>,
+        ownership: Option<&crate::file_lock::FileLock>,
     ) -> Result<JobSnapshot, ApiError> {
         if self.cancel.load(Ordering::SeqCst) {
             return Err(fail("ShuttingDown", "runner no longer accepts jobs"));
@@ -2805,10 +2807,14 @@ mod tests {
             ),
         )
         .unwrap();
-        let until = std::time::Instant::now() + Duration::from_secs(10);
+        // hypothesis load-deadlines-4, G1a: wait for the sync to end, then
+        // require that it completed; the guard comes from the product's budget
+        // for its two fake gh calls and only stops a hung test.
+        let until = std::time::Instant::now() + Fixture::hang_guard(2);
         let synced = loop {
             let state = jobs.get(&admin, "sync").unwrap();
-            if state.status == "completed" {
+            if !["running", "applying"].contains(&state.status.as_str()) {
+                assert_eq!(state.status, "completed", "source sync: {state:?}");
                 break state;
             }
             assert!(std::time::Instant::now() < until, "source sync: {state:?}");
