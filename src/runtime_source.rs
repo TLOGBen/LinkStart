@@ -675,6 +675,7 @@ $base='{base}'
 $entry=ConvertTo-Json -Compress -InputObject @($args)
 [IO.File]::AppendAllText((Join-Path $base 'calls.jsonl'),$entry+"`n",(New-Object System.Text.UTF8Encoding($false)))
 $endpoint=$args[1]
+if(Test-Path (Join-Path $base 'gate-read')){{while(-not (Test-Path (Join-Path $base 'release-read'))){{Start-Sleep -Milliseconds 20}}}}
 if(Test-Path (Join-Path $base 'slow-read')){{Start-Sleep -Milliseconds 2000}}
 if($endpoint -match '/comments'){{
     $methodIndex=[Array]::IndexOf($args,'--method')
